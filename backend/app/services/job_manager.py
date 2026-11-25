@@ -1,0 +1,1453 @@
+import os
+import sys
+import json
+import time
+import shutil
+import asyncio
+import logging
+import threading
+import traceback
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+
+from sqlmodel import Session, select
+import app.database as app_db
+from app.config import settings
+from app.database import engine
+from app.models import Project, ViralClip
+from app.services.proxy import probe_video, create_gemini_proxy, get_ffmpeg_cmd, detect_hardware_encoder
+from app.services.renderer import render_clip_ultra
+
+_DEFAULT_ENGINE = engine
+from app.services.transcriber import transcribe_clip, extract_audio_segment, transcribe_audio_full
+from app.services.gemini_clipper import (
+    extract_viral_clips,
+    GeminiAuthError,
+    GeminiUnavailableError,
+    verify_gemini_api_key
+)
+from app.services.offline_clipper import extract_viral_clips_offline
+from app.services.ollama_clipper import extract_viral_clips_ollama
+from app.services.hardware import detect_hardware_specs
+from app.services.face_tracker import snap_clip_boundaries_to_scenes
+
+logger = logging.getLogger("clipship_jobs")
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
+
+
+def _parse_utc_iso(val: Optional[str]) -> Optional[datetime]:
+    if not val or not isinstance(val, str):
+        return None
+    try:
+        s = val.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _compute_elapsed_seconds(job: Dict[str, Any]) -> int:
+    acc = float(job.get("accumulated_seconds") or 0.0)
+    status = job.get("status")
+    active_iso = job.get("active_started_at")
+    if status == "processing":
+        anchor = _parse_utc_iso(active_iso) or _parse_utc_iso(job.get("started_at"))
+        if anchor:
+            delta = max(0.0, (utc_now() - anchor).total_seconds())
+            return max(0, int(round(acc + delta)))
+    elif active_iso:
+        anchor = _parse_utc_iso(active_iso)
+        end_dt = _parse_utc_iso(job.get("updated_at")) or utc_now()
+        if anchor:
+            return max(0, int(round(acc + max(0.0, (end_dt - anchor).total_seconds()))))
+    if acc > 0:
+        return max(0, int(round(acc)))
+    # Legacy fallback for historical project.json files without accumulated_seconds
+    start_dt = _parse_utc_iso(job.get("started_at"))
+    if not start_dt:
+        return 0
+    end_dt = utc_now() if status == "processing" else (_parse_utc_iso(job.get("updated_at")) or utc_now())
+    return max(0, int(round((end_dt - start_dt).total_seconds())))
+
+
+def _freeze_timer(job: Dict[str, Any]):
+    acc = float(job.get("accumulated_seconds") or 0.0)
+    active_dt = _parse_utc_iso(job.get("active_started_at"))
+    if active_dt:
+        acc += max(0.0, (utc_now() - active_dt).total_seconds())
+    job["accumulated_seconds"] = round(acc, 3)
+    job["active_started_at"] = None
+    job["elapsed_seconds"] = max(0, int(round(acc)))
+
+def _atomic_write_json(target_path: Path, data: Dict[str, Any]) -> None:
+    """Write JSON atomically via a temp file + os.replace to prevent torn/corrupt settings files."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, target_path)
+
+
+def _legacy_clipship_settings_path() -> Optional[Path]:
+    """Return legacy %APPDATA%\\ClipShip\\settings.json path when APPDATA is defined."""
+    appdata = os.environ.get("APPDATA", "").strip()
+    if not appdata:
+        return None
+    return Path(appdata) / "ClipShip" / "settings.json"
+
+
+def _is_valid_api_key(val: Any) -> bool:
+    s = str(val or "").strip()
+    return bool(s and s != "your_gemini_api_key_here")
+
+
+def get_persisted_settings() -> Dict[str, Any]:
+    """
+    Read settings.json from STORAGE_DIR (LOST_HEAVEN_DATA_DIR/storage), migrating
+    any non-empty gemini_api_key from legacy %APPDATA%\\ClipShip\\settings.json if missing/empty.
+    """
+    from app.config import DEFAULT_STORAGE_DIR
+
+    primary_path = Path(settings.STORAGE_DIR) / "settings.json"
+    is_default_storage = Path(settings.STORAGE_DIR).resolve() == Path(DEFAULT_STORAGE_DIR).resolve()
+
+    search_paths = [primary_path]
+    if is_default_storage:
+        search_paths.extend([Path("storage/settings.json"), Path("backend/storage/settings.json")])
+
+    data: Dict[str, Any] = {}
+    for p in search_paths:
+        if p.exists():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    data = loaded
+                    break
+            except Exception:
+                pass
+
+    # Migrate legacy API key from %APPDATA%\ClipShip\settings.json if primary has empty/missing key
+    if not _is_valid_api_key(data.get("gemini_api_key")):
+        legacy_path = _legacy_clipship_settings_path()
+        if legacy_path and legacy_path.exists():
+            try:
+                with open(legacy_path, "r", encoding="utf-8") as lf:
+                    legacy_data = json.load(lf)
+                if isinstance(legacy_data, dict) and _is_valid_api_key(legacy_data.get("gemini_api_key")):
+                    data["gemini_api_key"] = str(legacy_data["gemini_api_key"]).strip()
+                    for opt_key in ("gemini_model", "gemini_analysis_mode", "auto_fallback_offline", "ai_provider"):
+                        if opt_key not in data and opt_key in legacy_data:
+                            data[opt_key] = legacy_data[opt_key]
+                    try:
+                        _atomic_write_json(primary_path, data)
+                    except Exception as mig_err:
+                        logger.warning(f"Legacy key migration save warning: {mig_err}")
+            except Exception as leg_err:
+                logger.warning(f"Failed reading legacy ClipShip settings for migration: {leg_err}")
+
+    return data
+
+
+def save_persisted_settings(data: Dict[str, Any]):
+    """Atomically save settings to STORAGE_DIR/settings.json (and default mirror when not isolated)."""
+    from app.config import DEFAULT_STORAGE_DIR
+
+    current = get_persisted_settings()
+    current.update(data)
+    primary_path = Path(settings.STORAGE_DIR) / "settings.json"
+    paths = [primary_path]
+    if Path(settings.STORAGE_DIR).resolve() == Path(DEFAULT_STORAGE_DIR).resolve():
+        for extra in (Path("storage/settings.json"), Path("backend/storage/settings.json")):
+            if extra.resolve() != primary_path.resolve():
+                paths.append(extra)
+
+    for p in paths:
+        try:
+            _atomic_write_json(p, current)
+        except Exception as e:
+            logger.warning(f"Failed to save settings to {p}: {e}")
+
+STAGES_CONFIG = [
+    {"id": "ingest", "name": "Media Prep", "desc": "Probing video stream & FFprobe metadata", "min": 0, "max": 15},
+    {"id": "audio", "name": "Voice Extraction", "desc": "Extracting 16kHz WAV & 480p proxy", "min": 15, "max": 30},
+    {"id": "transcribe", "name": "Voice Recognition", "desc": "Recognizing speech with faster-whisper VAD", "min": 30, "max": 65},
+    {"id": "gemini", "name": "AI Viral Detection", "desc": "Analyzing virality with Gemini multimodal API", "min": 65, "max": 90},
+    {"id": "ready", "name": "Caption Sync & Finalize", "desc": "Generating timeline & saving clips", "min": 90, "max": 100},
+]
+
+class JobManager:
+    """
+    Central background job manager:
+    - Tracks job progress in memory & persists to /backend/storage/projects/{id}/project.json
+    - Broadcasts live progress & timestamped logs to SSE subscribers
+    - Supports cancellation
+    - Executes multi-step pipeline with real voice recognition & Gemini AI
+    """
+    def __init__(self):
+        self._jobs: Dict[int, Dict[str, Any]] = {}
+        self._cancel_flags: Dict[int, threading.Event] = {}
+        self._lock = threading.RLock()
+        self._broadcast_callback = None
+
+    def set_broadcast_callback(self, cb):
+        self._broadcast_callback = cb
+
+    def _get_project_dir(self, project_id: int) -> Path:
+        p_dir = Path(settings.STORAGE_DIR) / "projects" / str(project_id)
+        p_dir.mkdir(parents=True, exist_ok=True)
+        return p_dir
+
+    def _get_project_json_path(self, project_id: int) -> Path:
+        return self._get_project_dir(project_id) / "project.json"
+
+    def _save_project_json(self, project_id: int, data: Dict[str, Any]):
+        try:
+            path = self._get_project_json_path(project_id)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"Could not persist project.json for {project_id}: {e}")
+
+    def create_job(
+        self,
+        project_id: int,
+        title: str,
+        source_path: str,
+        source_filename: Optional[str] = None,
+        duration_preset: str = "Auto",
+        aspect_ratio: str = "9:16",
+        clip_count: int = 5,
+        caption_language: str = "As spoken",
+        topic_focus: Optional[str] = None,
+        hardware_mode: str = "gpu"
+    ) -> Dict[str, Any]:
+        with self._lock:
+            cancel_event = threading.Event()
+            self._cancel_flags[project_id] = cancel_event
+
+            file_size = 0
+            if source_path and os.path.exists(source_path):
+                try:
+                    file_size = os.path.getsize(source_path)
+                except Exception:
+                    pass
+
+            def format_size(b: int) -> str:
+                if b < 1024**2:
+                    return f"{b / 1024:.1f} KB"
+                elif b < 1024**3:
+                    return f"{b / (1024**2):.1f} MB"
+                return f"{b / (1024**3):.2f} GB"
+
+            encoder = detect_hardware_encoder()
+            specs = detect_hardware_specs()
+            gpu_name = specs.get("gpu_name")
+            if gpu_name and gpu_name != "None" and "nvenc" in encoder:
+                hw_badge = f"{gpu_name} (NVENC)"
+            elif "videotoolbox" in encoder:
+                hw_badge = "Apple Silicon (VideoToolbox)"
+            else:
+                hw_badge = "CPU Multi-Core (libx264)"
+
+            stages = [
+                {
+                    "id": s["id"],
+                    "name": s["name"],
+                    "desc": s["desc"],
+                    "status": "running" if i == 0 else "pending",
+                    "percent": 0
+                }
+                for i, s in enumerate(STAGES_CONFIG)
+            ]
+
+            now_iso = utc_now_iso()
+            job_state = {
+                "project_id": project_id,
+                "title": title,
+                "status": "processing",
+                "current_stage": "ingest",
+                "stage_label": "Media Prep & Video Ingestion",
+                "percent": 5,
+                "started_at": now_iso,
+                "active_started_at": now_iso,
+                "accumulated_seconds": 0.0,
+                "elapsed_seconds": 0,
+                "updated_at": now_iso,
+                "eta_seconds": 45,
+                "source_path": source_path,
+                "source_filename": source_filename or os.path.basename(source_path),
+                "file_size_bytes": file_size,
+                "file_size_formatted": format_size(file_size),
+                "hardware_badge": hw_badge,
+                "duration_preset": duration_preset,
+                "aspect_ratio": aspect_ratio,
+                "clip_count": clip_count,
+                "caption_language": caption_language,
+                "topic_focus": topic_focus,
+                "hardware_mode": hardware_mode,
+                "stages": stages,
+                "logs": [
+                    {
+                        "timestamp": now_iso,
+                        "stage": "INGEST",
+                        "level": "INFO",
+                        "message": f"Job initialized for '{title}'. Hardware acceleration: {hw_badge}."
+                    }
+                ],
+                "error_detail": None,
+                "clips_count": 0
+            }
+
+            self._jobs[project_id] = job_state
+            self._save_project_json(project_id, job_state)
+            return job_state
+
+    def update_progress(
+        self,
+        project_id: int,
+        percent: int,
+        stage: str,
+        stage_label: str,
+        message: Optional[str] = None,
+        level: str = "INFO",
+        eta_seconds: Optional[int] = None
+    ):
+        with self._lock:
+            job = self._jobs.get(project_id)
+            if not job:
+                # Try loading from disk
+                job = self.get_progress(project_id)
+                if not job:
+                    return
+
+            job["percent"] = max(0, min(100, percent))
+            job["current_stage"] = stage
+            job["stage_label"] = stage_label
+            job["updated_at"] = utc_now_iso()
+            job["elapsed_seconds"] = _compute_elapsed_seconds(job)
+            if eta_seconds is not None:
+                job["eta_seconds"] = max(0, eta_seconds)
+
+            # Update stages status
+            stage_order = [s["id"] for s in STAGES_CONFIG]
+            current_idx = stage_order.index(stage) if stage in stage_order else 0
+
+            for i, st in enumerate(job.get("stages", [])):
+                if i < current_idx:
+                    st["status"] = "done"
+                    st["percent"] = 100
+                elif i == current_idx:
+                    st["status"] = "running"
+                    st["percent"] = percent
+                else:
+                    st["status"] = "pending"
+                    st["percent"] = 0
+
+            if message:
+                log_entry = {
+                    "timestamp": utc_now_iso(),
+                    "stage": stage.upper(),
+                    "level": level,
+                    "message": message
+                }
+                job.setdefault("logs", []).append(log_entry)
+
+            self._jobs[project_id] = job
+            self._save_project_json(project_id, job)
+
+        if self._broadcast_callback:
+            try:
+                self._broadcast_callback("progress", job)
+            except Exception:
+                pass
+
+        return job
+
+    def fail_job(self, project_id: int, error_message: str, error_detail: Optional[str] = None):
+        with self._lock:
+            job = self._jobs.get(project_id) or self.get_progress(project_id)
+            if not job:
+                return
+
+            job["status"] = "error"
+            job["stage_label"] = "Processing failed"
+            job["error_detail"] = error_detail or error_message
+            job["updated_at"] = utc_now_iso()
+            _freeze_timer(job)
+
+            # Mark current stage as failed
+            for st in job.get("stages", []):
+                if st["status"] == "running":
+                    st["status"] = "failed"
+
+            log_entry = {
+                "timestamp": utc_now_iso(),
+                "stage": "ERROR",
+                "level": "ERROR",
+                "message": f"Pipeline failure: {error_message}"
+            }
+            job.setdefault("logs", []).append(log_entry)
+
+            self._jobs[project_id] = job
+            self._save_project_json(project_id, job)
+
+            # Also update SQLite DB record
+            try:
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.status = "error"
+                        p.error_message = error_message
+                        session.add(p)
+                        session.commit()
+            except Exception as e:
+                logger.error(f"Failed to update db project status to error: {e}")
+
+        if self._broadcast_callback:
+            try:
+                self._broadcast_callback("progress", job)
+            except Exception:
+                pass
+
+        return job
+
+    def finish_job(self, project_id: int, clips_count: int = 0):
+        with self._lock:
+            job = self._jobs.get(project_id) or self.get_progress(project_id)
+            if not job:
+                return
+
+            job["status"] = "finished"
+            job["current_stage"] = "ready"
+            job["stage_label"] = "Clips Ready & Synchronized"
+            job["percent"] = 100
+            job["eta_seconds"] = 0
+            job["clips_count"] = clips_count
+            job["updated_at"] = utc_now_iso()
+            _freeze_timer(job)
+
+            for st in job.get("stages", []):
+                st["status"] = "done"
+                st["percent"] = 100
+
+            log_entry = {
+                "timestamp": utc_now_iso(),
+                "stage": "READY",
+                "level": "SUCCESS",
+                "message": f"Pipeline completed successfully! {clips_count} viral clips ready for editing."
+            }
+            job.setdefault("logs", []).append(log_entry)
+
+            self._jobs[project_id] = job
+            self._save_project_json(project_id, job)
+
+            # Update DB
+            try:
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.status = "analyzed"
+                        session.add(p)
+                        session.commit()
+            except Exception as e:
+                logger.error(f"Failed to update db project status to analyzed: {e}")
+
+        if self._broadcast_callback:
+            try:
+                self._broadcast_callback("progress", job)
+            except Exception:
+                pass
+
+        return job
+
+    def cancel_job(self, project_id: int):
+        with self._lock:
+            evt = self._cancel_flags.get(project_id)
+            if evt:
+                evt.set()
+
+            job = self._jobs.get(project_id) or self.get_progress(project_id)
+            if job:
+                job["status"] = "cancelled"
+                job["stage_label"] = "Processing cancelled by user"
+                job["updated_at"] = utc_now_iso()
+                _freeze_timer(job)
+                job.setdefault("logs", []).append({
+                    "timestamp": utc_now_iso(),
+                    "stage": "CANCEL",
+                    "level": "WARN",
+                    "message": "Job cancelled by user request."
+                })
+                self._jobs[project_id] = job
+                self._save_project_json(project_id, job)
+
+            # ALWAYS update project status in SQLite to "cancelled"
+            try:
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.status = "cancelled"
+                        p.error_message = "Processing cancelled by user"
+                        session.add(p)
+                        session.commit()
+            except Exception as dbe:
+                logger.error(f"Failed to update project status in DB on cancel: {dbe}")
+
+        if self._broadcast_callback:
+            try:
+                self._broadcast_callback("progress", job)
+            except Exception:
+                pass
+
+    def cleanup_orphan_jobs(self):
+        """
+        On server startup, scan SQLite for any projects stuck in status='processing'
+        (which have no running worker thread after a server restart) and mark them status='error'
+        with clear recovery instructions.
+        """
+        try:
+            with Session(engine) as session:
+                stuck_projects = session.exec(
+                    select(Project).where(Project.status == "processing")
+                ).all()
+                for p in stuck_projects:
+                    p.status = "error"
+                    p.error_message = "Server restarted while job was running. Click Retry Job to resume from saved checkpoints."
+                    session.add(p)
+
+                    job = self.get_progress(p.id)
+                    if job:
+                        job["status"] = "error"
+                        job["stage_label"] = "Interrupted by server restart"
+                        job["error_detail"] = "Server restarted while job was running. Click Retry Job to resume from saved checkpoints."
+                        job["updated_at"] = utc_now_iso()
+                        _freeze_timer(job)
+                        job.setdefault("logs", []).append({
+                            "timestamp": utc_now_iso(),
+                            "stage": "SYSTEM",
+                            "level": "WARN",
+                            "message": "Server restarted while job was running. Click 'Retry Job' to resume from saved checkpoints."
+                        })
+                        self._jobs[p.id] = job
+                        self._save_project_json(p.id, job)
+                session.commit()
+                if stuck_projects:
+                    logger.info(f"Cleaned up {len(stuck_projects)} orphan jobs on startup.")
+        except Exception as e:
+            logger.error(f"Failed to clean up orphan jobs: {e}")
+
+    def pause_job_for_api_key(self, project_id: int, reason: str = "missing", message: str = ""):
+        """
+        Transition job to awaiting_api_key pause state without losing checkpoints.
+        Allows user to provide a valid API key or switch to 100% offline mode.
+        """
+        with self._lock:
+            job = self._jobs.get(project_id) or self.get_progress(project_id)
+            if not job:
+                return
+
+            clean_msg = message or (
+                "Google Gemini API Key is required for AI Boost analysis. Paste your API key to continue, or switch to 100% Offline Mode."
+                if reason == "missing"
+                else "The provided Gemini API Key was rejected by Google AI Studio. Paste a valid key to continue, or switch to 100% Offline Mode."
+            )
+
+            job["status"] = "awaiting_api_key"
+            job["current_stage"] = "gemini"
+            job["stage_label"] = "Gemini API Key Required" if reason == "missing" else "Gemini API Key Not Recognized"
+            job["api_key_reason"] = reason
+            job["api_key_message"] = clean_msg
+            job["updated_at"] = utc_now_iso()
+            _freeze_timer(job)
+
+            # Mark gemini stage as action_required
+            for st in job.get("stages", []):
+                if st["id"] == "gemini":
+                    st["status"] = "action_required"
+                    st["percent"] = 68
+
+            log_entry = {
+                "timestamp": utc_now_iso(),
+                "stage": "PAUSE",
+                "level": "WARN",
+                "message": f"Paused at Stage 4 — {clean_msg}"
+            }
+            job.setdefault("logs", []).append(log_entry)
+
+            self._jobs[project_id] = job
+            self._save_project_json(project_id, job)
+
+            try:
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.status = "awaiting_api_key"
+                        session.add(p)
+                        session.commit()
+            except Exception as e:
+                logger.error(f"Failed to update db project status to awaiting_api_key: {e}")
+
+        if self._broadcast_callback:
+            try:
+                self._broadcast_callback("progress", job)
+            except Exception:
+                pass
+
+        return job
+
+    def retry_pipeline(self, project_id: int, background_tasks: Optional[Any] = None, force_offline: bool = False) -> Dict[str, Any]:
+        """
+        Retry a failed, cancelled, or paused pipeline job.
+        Checks for existing intermediate artifacts and resumes directly at the failed stage:
+        - If force_offline is True: skips Gemini entirely and uses extract_viral_clips_offline.
+        - If transcript.json exists: resume at stage 'gemini' (68%)
+        - Elif proxy_480p.mp4 exists: resume at stage 'transcribe' (35%)
+        - Elif audio_16k.wav exists: resume at stage 'audio' (20%)
+        - Else: resume at stage 'ingest' (5%)
+        """
+        with self._lock:
+            cancel_event = threading.Event()
+            self._cancel_flags[project_id] = cancel_event
+
+            job = self._jobs.get(project_id) or self.get_progress(project_id)
+            p_dir = self._get_project_dir(project_id)
+            audio_path = p_dir / "audio_16k.wav"
+            proxy_path = p_dir / "proxy_480p.mp4"
+            transcript_path = p_dir / "transcript.json"
+
+            if force_offline:
+                job["force_offline"] = True
+                job["api_key_reason"] = None
+                job["api_key_message"] = None
+
+            start_stage = "ingest"
+            start_percent = 5
+            stage_label = "Restarting pipeline from Media Prep"
+            cached_words_count = 0
+
+            if transcript_path.exists() and transcript_path.stat().st_size > 50:
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as tf:
+                        _cw = json.load(tf)
+                        if isinstance(_cw, list):
+                            cached_words_count = len(_cw)
+                except Exception:
+                    pass
+                start_stage = "gemini"
+                start_percent = 68
+                stage_label = f"Resuming in 100% Offline Mode ({cached_words_count:,} words)" if force_offline else f"Resuming from cached transcript ({cached_words_count:,} words)"
+            elif proxy_path.exists() and proxy_path.stat().st_size > 1000:
+                start_stage = "transcribe"
+                start_percent = 35
+                stage_label = "Resuming from cached proxy (Voice Recognition)"
+            elif audio_path.exists() and audio_path.stat().st_size > 1000:
+                start_stage = "audio"
+                start_percent = 20
+                stage_label = "Resuming from cached audio extraction"
+
+            job["status"] = "processing"
+            job["current_stage"] = start_stage
+            job["stage_label"] = stage_label
+            job["percent"] = start_percent
+            job["error_detail"] = None
+            if not force_offline and job.get("status") != "awaiting_api_key":
+                job["api_key_reason"] = None
+                job["api_key_message"] = None
+
+            # Reset timer anchors cleanly on retry
+            now_iso = utc_now_iso()
+            job["started_at"] = now_iso
+            job["active_started_at"] = now_iso
+            job["accumulated_seconds"] = 0.0
+            job["elapsed_seconds"] = 0
+            job["updated_at"] = now_iso
+
+            stage_order = [s["id"] for s in STAGES_CONFIG]
+            current_idx = stage_order.index(start_stage) if start_stage in stage_order else 0
+            for i, st in enumerate(job.get("stages", [])):
+                if i < current_idx:
+                    st["status"] = "done"
+                    st["percent"] = 100
+                elif i == current_idx:
+                    st["status"] = "running"
+                    st["percent"] = start_percent
+                else:
+                    st["status"] = "pending"
+                    st["percent"] = 0
+
+            offline_note = " in 100% Offline Mode" if force_offline else ""
+            words_msg = f" Loaded {cached_words_count:,} cached words from transcript.json." if cached_words_count > 0 else ""
+            log_entry = {
+                "timestamp": now_iso,
+                "stage": "RETRY",
+                "level": "INFO",
+                "message": f"Retry initiated{offline_note}. Checkpoints detected: resuming from stage '{start_stage.upper()}' at {start_percent}%.{words_msg}"
+            }
+            job.setdefault("logs", []).append(log_entry)
+
+            self._jobs[project_id] = job
+            self._save_project_json(project_id, job)
+
+            # Update DB
+            try:
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.status = "processing"
+                        p.error_message = None
+                        session.add(p)
+                        session.commit()
+            except Exception as e:
+                logger.error(f"Failed to update db project status on retry: {e}")
+
+        if self._broadcast_callback:
+            try:
+                self._broadcast_callback("progress", job)
+            except Exception:
+                pass
+
+        if background_tasks:
+            background_tasks.add_task(self.run_pipeline, project_id, force_offline)
+        else:
+            t = threading.Thread(target=self.run_pipeline, args=(project_id, force_offline), daemon=True)
+            t.start()
+
+        return job
+
+    def is_cancelled(self, project_id: int) -> bool:
+        evt = self._cancel_flags.get(project_id)
+        return evt.is_set() if evt else False
+
+    def get_progress(self, project_id: int) -> Dict[str, Any]:
+        with self._lock:
+            if project_id in self._jobs:
+                job = self._jobs[project_id]
+                job["elapsed_seconds"] = _compute_elapsed_seconds(job)
+                return job
+
+        # Check disk
+        path = self._get_project_json_path(project_id)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    data["elapsed_seconds"] = _compute_elapsed_seconds(data)
+                    with self._lock:
+                        self._jobs[project_id] = data
+                    return data
+            except Exception as e:
+                logger.warning(f"Error reading {path}: {e}")
+
+        # Fallback to DB
+        try:
+            with Session(engine) as session:
+                project = session.get(Project, project_id)
+                if not project:
+                    return {
+                        "project_id": project_id,
+                        "status": "not_found",
+                        "percent": 0,
+                        "stages": [],
+                        "logs": []
+                    }
+                clips = session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
+                status = "finished" if project.status in ["analyzed", "ready"] else project.status
+                return {
+                    "project_id": project.id,
+                    "title": project.title,
+                    "status": status,
+                    "current_stage": "ready" if status == "finished" else "ingest",
+                    "stage_label": "Ready" if status == "finished" else "Created",
+                    "percent": 100 if status == "finished" else 10,
+                    "started_at": project.created_at,
+                    "updated_at": project.created_at,
+                    "elapsed_seconds": 0,
+                    "eta_seconds": 0,
+                    "source_path": project.source_path,
+                    "source_filename": project.source_filename,
+                    "clips_count": len(clips),
+                    "stages": [
+                        {"id": s["id"], "name": s["name"], "desc": s["desc"], "status": "done" if status == "finished" else "pending", "percent": 100 if status == "finished" else 0}
+                        for s in STAGES_CONFIG
+                    ],
+                    "logs": [
+                        {"timestamp": project.created_at, "stage": "INIT", "level": "INFO", "message": f"Project '{project.title}' initialized."}
+                    ]
+                }
+        except Exception as e:
+            return {
+                "project_id": project_id,
+                "status": "error",
+                "percent": 0,
+                "error_detail": str(e),
+                "stages": [],
+                "logs": []
+            }
+
+    def run_pipeline(self, project_id: int, force_offline: bool = False):
+        """Top-level bulletproof thread entry point. Catches BaseException to guarantee no silent thread death."""
+        try:
+            self._execute_pipeline(project_id, force_offline)
+        except BaseException as exc:
+            tb = traceback.format_exc()
+            err_msg = str(exc) or exc.__class__.__name__
+            logger.critical(f"FATAL unhandled exception in pipeline thread for project {project_id}: {err_msg}\n{tb}")
+            try:
+                self.fail_job(
+                    project_id,
+                    error_message=f"Pipeline crashed unexpectedly: {err_msg}",
+                    error_detail=tb
+                )
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.status = "error"
+                        p.error_message = f"Fatal error: {err_msg[:120]}"
+                        session.add(p)
+                        session.commit()
+            except Exception as inner_err:
+                logger.error(f"Failed to record crash in DB for project {project_id}: {inner_err}")
+
+    def _execute_pipeline(self, project_id: int, force_offline: bool = False):
+        """
+        Full 5-stage background processing pipeline:
+        1. 0-15%: Media Prep (FFprobe probe, dimensions, duration)
+        2. 15-30%: Audio extraction (16kHz mono WAV) & 480p proxy (skipped if offline)
+        3. 30-65%: Recognizing voice & word timestamps with faster-whisper (VAD)
+        4. 65-90%: Detecting viral clips (100% Offline or Gemini Multimodal AI)
+        5. 90-100%: Timeline sync, database records, finalize
+        """
+        logger.info(f"Starting pipeline thread for project {project_id} (force_offline={force_offline})")
+
+        with Session(engine) as session:
+            project = session.get(Project, project_id)
+            if not project:
+                self.fail_job(project_id, f"Project {project_id} not found in database.")
+                return
+
+        # Check live settings for Gemini Boost vs Offline Mode
+        persisted = get_persisted_settings()
+        gemini_boost_enabled = persisted.get("gemini_enabled", persisted.get("gemini_boost_enabled", True))
+        job = self.get_progress(project_id) or {}
+        if force_offline or job.get("force_offline", False):
+            gemini_boost_enabled = False
+
+        gemini_api_key = persisted.get("gemini_api_key") or settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
+        gemini_model = persisted.get("gemini_model") or settings.GEMINI_MODEL or "gemini-3.5-flash-lite"
+        gemini_analysis_mode = persisted.get("gemini_analysis_mode", settings.GEMINI_ANALYSIS_MODE) # "transcript" or "multimodal"
+        auto_fallback_offline = persisted.get("auto_fallback_offline", settings.AUTO_FALLBACK_OFFLINE)
+        ai_provider = persisted.get("ai_provider", settings.AI_PROVIDER) # "gemini", "ollama", "offline"
+        ollama_endpoint = persisted.get("ollama_endpoint", settings.OLLAMA_ENDPOINT)
+        ollama_model = persisted.get("ollama_model", settings.OLLAMA_MODEL)
+
+        try:
+            # -------------------------------------------------------------
+            # Stage 1: Media Prep & Probing (0-15%)
+            # -------------------------------------------------------------
+            if self.is_cancelled(project_id): return
+            self.update_progress(
+                project_id, 8, "ingest", "Probing video stream & metadata...",
+                message=f"Running FFprobe on source: {os.path.basename(project.source_path)}",
+                eta_seconds=45
+            )
+
+            meta = probe_video(project.source_path)
+            duration = float(meta.get("duration", 0.0))
+            width = int(meta.get("width", 1920))
+            height = int(meta.get("height", 1080))
+            fps = float(meta.get("fps", 30.0))
+
+            with Session(engine) as session:
+                p = session.get(Project, project_id)
+                if p:
+                    p.duration = duration
+                    p.resolution_w = width
+                    p.resolution_h = height
+                    p.fps = fps
+                    session.add(p)
+                    session.commit()
+
+            self.update_progress(
+                project_id, 15, "ingest", "Media probed successfully",
+                message=f"Stream specs: {width}x{height} @ {fps:.1f}fps, total duration: {duration:.1f}s",
+                eta_seconds=40
+            )
+
+            # -------------------------------------------------------------
+            # Stage 2: Audio Extraction & Proxy Generation (15-30%)
+            # -------------------------------------------------------------
+            if self.is_cancelled(project_id): return
+            self.update_progress(
+                project_id, 18, "audio", "Extracting 16kHz mono audio...",
+                message="Checking checkpoints and extracting audio for whisper engine",
+                eta_seconds=35
+            )
+
+            p_dir = self._get_project_dir(project_id)
+            audio_path = p_dir / "audio_16k.wav"
+            proxy_path = p_dir / "proxy_480p.mp4"
+            transcript_path = p_dir / "transcript.json"
+
+            # 2a. 16kHz mono audio extraction
+            if audio_path.exists() and audio_path.stat().st_size > 1000:
+                self.update_progress(
+                    project_id, 22, "audio", "Audio checkpoint found",
+                    message="Reusing cached 16kHz audio from previous run",
+                    eta_seconds=33
+                )
+            else:
+                extract_audio_segment(project.source_path, 0.0, duration, str(audio_path))
+
+            # 2b. Proxy generation (Only needed when multimodal video proxy mode is chosen)
+            needs_proxy = (
+                gemini_boost_enabled and 
+                ai_provider == "gemini" and 
+                gemini_analysis_mode == "multimodal"
+            )
+
+            if not needs_proxy:
+                self.update_progress(
+                    project_id, 30, "audio", "Audio ready (Proxy Skipped)",
+                    message="Transcript-First / Local Mode active — skipping 480p proxy encoding",
+                    eta_seconds=28
+                )
+            else:
+                if proxy_path.exists() and proxy_path.stat().st_size > 1000:
+                    self.update_progress(
+                        project_id, 28, "audio", "Proxy checkpoint found",
+                        message="Reusing cached 480p proxy from previous run",
+                        eta_seconds=30
+                    )
+                else:
+                    create_gemini_proxy(project.source_path, str(proxy_path))
+
+                with Session(engine) as session:
+                    p = session.get(Project, project_id)
+                    if p:
+                        p.proxy_path = str(proxy_path)
+                        p.status = "proxy_ready"
+                        session.add(p)
+                        session.commit()
+
+                self.update_progress(
+                    project_id, 30, "audio", "16kHz audio & 480p proxy ready",
+                    message=f"Created lightweight proxy ({os.path.getsize(proxy_path) / (1024**2):.1f} MB) for Gemini multimodal upload",
+                    eta_seconds=30
+                )
+
+            # -------------------------------------------------------------
+            # Stage 3: Recognizing Voice with faster-whisper VAD (30-65%)
+            # -------------------------------------------------------------
+            if self.is_cancelled(project_id): return
+            self.update_progress(
+                project_id, 35, "transcribe", "Loading faster-whisper & recognizing speech...",
+                message=f"Checking speech recognition checkpoint (VAD, language='{project.caption_language}')...",
+                eta_seconds=25
+            )
+
+            transcript_words: List[Dict[str, Any]] = []
+            if transcript_path.exists():
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as tf:
+                        cached_words = json.load(tf)
+                        if isinstance(cached_words, list) and len(cached_words) > 0:
+                            transcript_words = cached_words
+                            self.update_progress(
+                                project_id, 65, "transcribe", "Voice recognition loaded from checkpoint",
+                                message=f"Loaded {len(transcript_words)} cached words with timestamps from checkpoint",
+                                eta_seconds=20
+                            )
+                except Exception as ex:
+                    logger.warning(f"Could not load cached transcript: {ex}")
+
+            if not transcript_words:
+                def on_speech_progress(pct: int, msg: str):
+                    progress_val = 35 + int(pct * 0.28)
+                    self.update_progress(
+                        project_id, progress_val, "transcribe", "Transcribing spoken words & timestamps...",
+                        message=msg,
+                        eta_seconds=max(5, int(25 * (1 - pct / 100)))
+                    )
+
+                self.update_progress(
+                    project_id, 40, "transcribe", "faster-whisper recognizing speech...",
+                    message="Running full faster-whisper inference with millisecond timestamps...",
+                    eta_seconds=22
+                )
+                transcript_words = transcribe_audio_full(
+                    str(audio_path),
+                    language=project.caption_language,
+                    on_progress=on_speech_progress
+                )
+                try:
+                    with open(transcript_path, "w", encoding="utf-8") as tf:
+                        json.dump(transcript_words, tf, indent=2)
+                except Exception as wex:
+                    logger.warning(f"Could not persist transcript checkpoint: {wex}")
+
+                self.update_progress(
+                    project_id, 65, "transcribe", "Voice recognition complete",
+                    message=f"Successfully transcribed {len(transcript_words)} words across {duration:.1f}s",
+                    eta_seconds=18
+                )
+
+            # -------------------------------------------------------------
+            # Stage 4: Viral Clip Detection (65-90%) - Gemini, Ollama or Offline
+            # -------------------------------------------------------------
+            if self.is_cancelled(project_id): return
+
+            # Reload fresh settings right before Stage 4 execution
+            fresh_settings = get_persisted_settings()
+            gemini_boost_enabled = fresh_settings.get("gemini_enabled", fresh_settings.get("gemini_boost_enabled", True))
+            job = self.get_progress(project_id) or {}
+            if force_offline or job.get("force_offline", False):
+                gemini_boost_enabled = False
+
+            gemini_api_key = fresh_settings.get("gemini_api_key") or settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
+            gemini_model = fresh_settings.get("gemini_model") or settings.GEMINI_MODEL or "gemini-3.5-flash-lite"
+            gemini_analysis_mode = fresh_settings.get("gemini_analysis_mode", settings.GEMINI_ANALYSIS_MODE)
+            auto_fallback_offline = fresh_settings.get("auto_fallback_offline", settings.AUTO_FALLBACK_OFFLINE)
+            ai_provider = fresh_settings.get("ai_provider", settings.AI_PROVIDER)
+            ollama_endpoint = fresh_settings.get("ollama_endpoint", settings.OLLAMA_ENDPOINT)
+            ollama_model = fresh_settings.get("ollama_model", settings.OLLAMA_MODEL)
+
+            # Explicitly reload transcript_words and audio_path from checkpoint if resuming
+            if not transcript_words and transcript_path.exists():
+                try:
+                    with open(transcript_path, "r", encoding="utf-8") as tf:
+                        cached_tr = json.load(tf)
+                        if isinstance(cached_tr, list):
+                            transcript_words = cached_tr
+                except Exception as ex:
+                    logger.warning(f"Could not load transcript checkpoint: {ex}")
+
+            if not duration or duration <= 0:
+                duration = float(project.duration or 120.0)
+
+            words_loaded_note = f"Loaded {len(transcript_words):,} cached words from transcript.json. " if transcript_words else ""
+
+            if not gemini_boost_enabled or ai_provider == "offline":
+                self.update_progress(
+                    project_id, 70, "gemini", "Offline Viral Detection",
+                    message=f"{words_loaded_note}Running 100% offline acoustic excitement & silence segmentation...",
+                    eta_seconds=10
+                )
+                raw_clips = extract_viral_clips_offline(
+                    audio_wav_path=str(audio_path),
+                    transcript_words=transcript_words,
+                    duration_sec=duration or 120.0,
+                    duration_preset=project.duration_preset or "Auto",
+                    clip_count=project.clip_count or 5,
+                    topic_focus=project.topic_focus
+                )
+                self.update_progress(
+                    project_id, 88, "gemini", "Offline blueprints extracted",
+                    message=f"Extracted {len(raw_clips)} viral moments 100% locally with acoustic energy & silence segmentation",
+                    eta_seconds=8
+                )
+            elif ai_provider == "ollama":
+                self.update_progress(
+                    project_id, 70, "gemini", f"Local Ollama AI ({ollama_model})",
+                    message=f"{words_loaded_note}Connecting to local Ollama on {ollama_endpoint}...",
+                    eta_seconds=15
+                )
+                try:
+                    raw_clips = extract_viral_clips_ollama(
+                        transcript_words=transcript_words,
+                        total_duration=duration or 120.0,
+                        duration_preset=project.duration_preset or "Auto",
+                        clip_count=project.clip_count or 5,
+                        topic_focus=project.topic_focus,
+                        endpoint=ollama_endpoint,
+                        model=ollama_model,
+                        on_log=lambda stage, msg: self.update_progress(project_id, 75, "gemini", "Ollama LLM", message=msg, eta_seconds=10)
+                    )
+                except Exception as o_err:
+                    logger.warning(f"Ollama extraction failed: {o_err}. Seamlessly falling back to 100% offline engine.")
+                    self.update_progress(
+                        project_id, 75, "gemini", "Ollama Offline Fallback",
+                        message=f"Ollama unreachable ({str(o_err)[:60]}) — seamlessly falling back to local acoustic energy engine",
+                        level="WARN"
+                    )
+                    raw_clips = extract_viral_clips_offline(
+                        audio_wav_path=str(audio_path),
+                        transcript_words=transcript_words,
+                        duration_sec=duration or 120.0,
+                        duration_preset=project.duration_preset or "Auto",
+                        clip_count=project.clip_count or 5,
+                        topic_focus=project.topic_focus
+                    )
+                    for c in raw_clips:
+                        c["analysis_source"] = "offline_fallback"
+            else:
+                # Cloud Gemini with 4-Model Cascade & Auto-Offline Fallback
+                clean_key = (gemini_api_key or "").strip()
+                if not clean_key or clean_key == "your_gemini_api_key_here":
+                    self.pause_job_for_api_key(
+                        project_id,
+                        reason="missing",
+                        message="A Google Gemini API key is required for AI Boost analysis. Paste your API key to continue, or switch to 100% Offline Mode."
+                    )
+                    return
+
+                self.update_progress(
+                    project_id, 68, "gemini", "Analyzing virality & hooks with Gemini...",
+                    message=f"{words_loaded_note}Sending transcript to {gemini_model} (timeout: 60s)...",
+                    eta_seconds=15
+                )
+
+                def on_gemini_log(stage: str, msg: str):
+                    self.update_progress(
+                        project_id, 75, "gemini", "Gemini AI Analysis",
+                        message=msg,
+                        eta_seconds=12
+                    )
+
+                try:
+                    raw_clips = extract_viral_clips(
+                        proxy_path=str(proxy_path) if proxy_path.exists() else None,
+                        total_duration=duration or 120.0,
+                        duration_preset=project.duration_preset or "Auto",
+                        clip_count=project.clip_count or 5,
+                        topic_focus=project.topic_focus,
+                        transcript_words=transcript_words,
+                        gemini_analysis_mode=gemini_analysis_mode,
+                        preferred_model=gemini_model,
+                        on_log=on_gemini_log
+                    )
+                except GeminiAuthError as ae:
+                    logger.warning(f"Project {project_id} paused due to Gemini auth error: {ae.message}")
+                    self.pause_job_for_api_key(project_id, reason=ae.reason, message=ae.message)
+                    return
+                except GeminiUnavailableError as ue:
+                    msg = getattr(ue, "message", str(ue))
+                    logger.warning(f"All Gemini models in cascade failed: {msg}")
+                    is_overload = any(k in msg.upper() for k in ["503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "OVERLOADED", "HIGH DEMAND"])
+                    summary_reason = "503/429 high demand" if is_overload else f"errors ({msg[:110]})"
+                    if auto_fallback_offline:
+                        self.update_progress(
+                            project_id, 75, "gemini", "Auto-Fallback to Offline Engine",
+                            message=f"Gemini cascade exhausted ({summary_reason}) — seamlessly completing Stage 4 with local Offline Viral Engine",
+                            level="WARN"
+                        )
+                        raw_clips = extract_viral_clips_offline(
+                            audio_wav_path=str(audio_path),
+                            transcript_words=transcript_words,
+                            duration_sec=duration or 120.0,
+                            duration_preset=project.duration_preset or "Auto",
+                            clip_count=project.clip_count or 5,
+                            topic_focus=project.topic_focus
+                        )
+                        for c in raw_clips:
+                            c["analysis_source"] = "offline_fallback"
+                    else:
+                        self.fail_job(
+                            project_id,
+                            error_message=f"All Gemini models unavailable ({summary_reason}).",
+                            error_detail=f"{ue.message}\nCheckpoints for Stages 1-3 are saved. Click 'Retry Job' or 'Complete in Offline Mode' below."
+                        )
+                        return
+
+                self.update_progress(
+                    project_id, 88, "gemini", "Viral blueprints extracted",
+                    message=f"Extracted {len(raw_clips)} viral moments with hook headlines & retention scoring",
+                    eta_seconds=8
+                )
+
+            # -------------------------------------------------------------
+            # Stage 5: Caption Sync & Database Assembly (90-100%)
+            # -------------------------------------------------------------
+            if self.is_cancelled(project_id): return
+            self.update_progress(
+                project_id, 90, "ready", "Snapping cuts to scene boundaries & syncing captions...",
+                message="Aligning clip boundaries to visual shot cuts & word-level transcripts",
+                eta_seconds=5
+            )
+
+            try:
+                raw_clips = snap_clip_boundaries_to_scenes(
+                    project.source_path,
+                    raw_clips,
+                    total_duration=float(duration or 0.0),
+                    snap_window=0.5,
+                )
+            except Exception as snap_err:
+                logger.warning(f"Scene boundary snapping skipped: {snap_err}")
+
+            saved_clips = []
+            with Session(engine) as session:
+                for idx, item in enumerate(raw_clips):
+                    if self.is_cancelled(project_id): return
+                    start_t = float(item["start_time"])
+                    dur_t = float(item["duration"])
+                    end_t = float(item["end_time"])
+
+                    # Slice words from master transcript_words
+                    clip_words = []
+                    if transcript_words:
+                        for w in transcript_words:
+                            w_start = float(w.get("start", 0.0))
+                            w_end = float(w.get("end", 0.0))
+                            if w_start >= (start_t - 0.25) and w_end <= (end_t + 0.25):
+                                clip_words.append({
+                                    "word": w.get("word", ""),
+                                    "start": round(max(0.0, w_start - start_t), 3),
+                                    "end": round(max(0.0, w_end - start_t), 3),
+                                    "is_filler": w.get("is_filler", False),
+                                    "deleted": False
+                                })
+
+                    # Fallback to audio segment transcription if slice is empty
+                    if not clip_words:
+                        try:
+                            clip_words = transcribe_clip(
+                                project.source_path,
+                                start_t,
+                                dur_t,
+                                language=project.caption_language
+                            )
+                        except Exception as ce:
+                            logger.warning(f"Clip-segment fallback transcription failed ({ce})")
+
+                    clip = ViralClip(
+                        project_id=project_id,
+                        start_time=start_t,
+                        end_time=end_t,
+                        duration=dur_t,
+                        virality_score=int(item.get("virality_score", 85)),
+                        hook_score=int(item.get("hook_score", 85)),
+                        retention_score=int(item.get("retention_score", 85)),
+                        emotional_score=int(item.get("emotional_score", 80)),
+                        standalone_score=int(item.get("standalone_score", 85)),
+                        viral_rationale=item.get("viral_rationale", ""),
+                        hook_headline=item.get("hook_headline", "THE CRITICAL BREAKTHROUGH"),
+                        show_hook_banner=True,
+                        cold_open_quote=item.get("cold_open_quote", ""),
+                        use_cold_open=False,
+                        auto_trim_dead_air=False,
+                        dynamic_punch_zoom=False,
+                        aspect_ratio=project.default_aspect_ratio or "9:16",
+                        frame_layout="auto_track",
+                        webcam_corner="auto",
+                        webcam_split_ratio=0.35,
+                        pip_border_color="#F59E0B",
+                        zoom=1.0,
+                        pan_x_offset=0.0,
+                        caption_style="Karaoke pop",
+                        caption_font="Montserrat",
+                        caption_animation="Karaoke",
+                        base_color="#FFFFFF",
+                        active_color="#C6F32F",
+                        outline_color="#000000",
+                        font_size=64,
+                        font_size_percent=100,
+                        bold=True,
+                        italic=False,
+                        all_caps=True,
+                        text_align="Centre",
+                        position_grid="bottom_center",
+                        position_x=50.0,
+                        position_y=78.0,
+                        hold_back_alpha=1.0,
+                        highlight_shape="Colour only",
+                        emoji_enabled=False,
+                        clean_filler_words=False,
+                        clip_size="1080p",
+                        color_preset="none",
+                        exposure=0.0,
+                        brightness=0.0,
+                        contrast=1.0,
+                        lift_mids=0.0,
+                        warmth=0.0,
+                        saturation=1.0,
+                        black_and_white=0.0,
+                        vintage=0.0,
+                        tint_color="none",
+                        tint_strength=0.0,
+                        glow=0.0,
+                        smooth=0.0,
+                        sharpness=0.0,
+                        blur=0.0,
+                        film_grain=0.0,
+                        vignette=0.0,
+                        bottom_fade=0.0,
+                        hardware_mode=project.hardware_mode or "gpu",
+                        selected_title=item.get("youtube_titles", ["Viral Short #Shorts"])[0],
+                        youtube_description=item.get("youtube_description", ""),
+                        pinned_comment=item.get("pinned_comment", ""),
+                        privacy_status="private",
+                        status="draft",
+                        render_status="idle",
+                        render_progress=0,
+                        analysis_source=item.get("analysis_source", "gemini")
+                    )
+                    clip.set_titles(item.get("youtube_titles", []))
+                    clip.set_transcript(clip_words)
+
+                    session.add(clip)
+                    saved_clips.append(clip)
+
+                session.commit()
+                for c_obj in saved_clips:
+                    session.refresh(c_obj)
+                saved_clip_ids = [c_obj.id for c_obj in saved_clips if c_obj.id is not None]
+
+            # Pre-render fast_preview MP4s for ALL extracted clips (1..N)
+            total_to_render = len(saved_clip_ids)
+            if total_to_render > 0 and project.source_path and os.path.exists(project.source_path):
+                active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                for clip_idx, cid in enumerate(saved_clip_ids, start=1):
+                    if self.is_cancelled(project_id):
+                        return
+
+                    with Session(active_db_engine) as rsession:
+                        c_row = rsession.get(ViralClip, cid)
+                        if not c_row:
+                            continue
+                        clip_label = (c_row.hook_headline or c_row.selected_title or f"Clip {clip_idx}").strip()
+                        clip_words_list = c_row.get_transcript()
+                        c_row.status = "rendering"
+                        c_row.render_status = "rendering"
+                        c_row.render_progress = 15
+                        c_row.render_message = f"Rendering preview {clip_idx}/{total_to_render}..."
+                        rsession.add(c_row)
+                        rsession.commit()
+
+                        clip_args = {
+                            "clip_id": cid,
+                            "project_id": project_id,
+                            "start_time": float(c_row.start_time),
+                            "duration": float(c_row.duration),
+                            "words": clip_words_list,
+                            "aspect_ratio": c_row.aspect_ratio,
+                            "custom_width": c_row.custom_width,
+                            "custom_height": c_row.custom_height,
+                            "frame_layout": c_row.frame_layout,
+                            "webcam_corner": c_row.webcam_corner,
+                            "webcam_split_ratio": c_row.webcam_split_ratio,
+                            "pip_border_color": c_row.pip_border_color,
+                            "zoom": c_row.zoom,
+                            "pan_x_offset": c_row.pan_x_offset,
+                            "burn_captions": c_row.burn_captions,
+                            "timing_offset": c_row.timing_offset,
+                            "caption_style": c_row.caption_style,
+                            "caption_font": c_row.caption_font,
+                            "caption_animation": c_row.caption_animation,
+                            "font_size_percent": c_row.font_size_percent,
+                            "base_color": c_row.base_color,
+                            "active_color": c_row.active_color,
+                            "outline_color": c_row.outline_color,
+                            "font_size": c_row.font_size,
+                            "bold": c_row.bold,
+                            "italic": c_row.italic,
+                            "all_caps": c_row.all_caps,
+                            "text_align": c_row.text_align,
+                            "position_grid": c_row.position_grid,
+                            "position_x": c_row.position_x,
+                            "position_y": c_row.position_y,
+                            "hold_back_alpha": c_row.hold_back_alpha,
+                            "highlight_shape": c_row.highlight_shape,
+                            "emoji_enabled": c_row.emoji_enabled,
+                            "highlight_power_words": bool(getattr(c_row, "highlight_power_words", False)),
+                            "how_phrase_arrives": c_row.how_phrase_arrives,
+                            "outline_width": c_row.outline_width,
+                            "shadow_depth": c_row.shadow_depth,
+                            "glow_intensity": c_row.glow_intensity,
+                            "letter_spacing": c_row.letter_spacing,
+                            "clean_filler_words": c_row.clean_filler_words,
+                            "tighten_pacing": c_row.tighten_pacing,
+                            "silence_threshold": c_row.silence_threshold,
+                            "censor_profanity": c_row.censor_profanity,
+                            "clip_size": c_row.clip_size,
+                            "color_preset": c_row.color_preset,
+                            "hardware_mode": c_row.hardware_mode or "gpu",
+                            "hook_headline": c_row.hook_headline,
+                            "show_hook_banner": c_row.show_hook_banner,
+                            "cold_open_quote": c_row.cold_open_quote,
+                            "use_cold_open": c_row.use_cold_open,
+                        }
+
+                    pct = 90 + int(9 * (clip_idx - 1) / max(1, total_to_render))
+                    self.update_progress(
+                        project_id,
+                        pct,
+                        "ready",
+                        f"Rendering clip preview {clip_idx}/{total_to_render}...",
+                        message=f"Rendering clip preview {clip_idx}/{total_to_render}: {clip_label}...",
+                        eta_seconds=max(1, (total_to_render - clip_idx + 1) * 3),
+                    )
+
+                    try:
+                        rendered_file = render_clip_ultra(
+                            master_video_path=project.source_path,
+                            quality_mode="fast_preview",
+                            **clip_args,
+                        )
+                        with Session(active_db_engine) as wsession:
+                            c_done = wsession.get(ViralClip, cid)
+                            if c_done:
+                                c_done.rendered_video_path = rendered_file
+                                c_done.rendered_path = rendered_file
+                                c_done.render_status = "completed"
+                                c_done.status = "ready"
+                                c_done.render_progress = 100
+                                c_done.render_message = "Preview ready"
+                                wsession.add(c_done)
+                                wsession.commit()
+
+                        done_pct = 90 + int(9 * clip_idx / max(1, total_to_render))
+                        self.update_progress(
+                            project_id,
+                            done_pct,
+                            "ready",
+                            f"Preview {clip_idx}/{total_to_render} ready",
+                            message=f"Ready {clip_idx}/{total_to_render}: {clip_label}",
+                            level="SUCCESS",
+                            eta_seconds=max(1, (total_to_render - clip_idx) * 3),
+                        )
+                    except Exception as clip_render_err:
+                        logger.warning(f"Stage 5 preview render failed for clip {cid}: {clip_render_err}")
+                        self.update_progress(
+                            project_id,
+                            pct,
+                            "ready",
+                            f"Preview warning {clip_idx}/{total_to_render}",
+                            message=f"Preview render deferred for '{clip_label}': {str(clip_render_err)[:100]}",
+                            level="WARN",
+                        )
+                        with Session(active_db_engine) as esession:
+                            c_err = esession.get(ViralClip, cid)
+                            if c_err:
+                                c_err.status = "draft"
+                                c_err.render_status = "idle"
+                                c_err.render_progress = 0
+                                c_err.render_message = "Will render on-demand when selected"
+                                esession.add(c_err)
+                                esession.commit()
+
+            self.finish_job(project_id, len(saved_clips))
+            logger.info(f"Pipeline finished successfully for project {project_id} with {len(saved_clips)} clips")
+
+        except Exception as e:
+            err_msg = str(e)
+            tb = traceback.format_exc()
+            logger.error(f"Pipeline error for project {project_id}: {err_msg}\n{tb}")
+            self.fail_job(project_id, err_msg, tb)
+
+# Global Singleton
+job_manager = JobManager()

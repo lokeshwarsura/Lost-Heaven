@@ -1,0 +1,457 @@
+import os
+import wave
+import logging
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+from app.services.proxy import get_ffmpeg_cmd, probe_video
+
+logger = logging.getLogger(__name__)
+
+FILLER_TOKENS = {"um", "uh", "erm", "ah", "er", "hmm"}
+
+
+def _compute_heatmap_metrics(
+    bins: List[float],
+    win_start: float,
+    win_end: float,
+    transcript_words: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute aligned `rms`, `speech_density` (0..1 normalized), and `is_silence` arrays
+    matching the N waveform bins across `[win_start, win_end]`.
+    """
+    n = len(bins)
+    if n == 0 or win_end <= win_start:
+        return {
+            "rms": list(bins),
+            "speech_density": [0.0] * n,
+            "is_silence": [b < 0.14 for b in bins],
+        }
+
+    bin_span = (win_end - win_start) / float(n)
+    counts = [0.0] * n
+
+    for w in (transcript_words or []):
+        if not isinstance(w, dict):
+            continue
+        if w.get("deleted") or w.get("cut_from_video"):
+            continue
+        ws = float(w.get("start", 0.0))
+        we = max(ws + 0.05, float(w.get("end", ws + 0.25)))
+        if we < win_start or ws > win_end:
+            continue
+        i0 = max(0, min(n - 1, int((ws - win_start) / bin_span)))
+        i1 = max(0, min(n - 1, int((we - win_start) / bin_span)))
+        for bi in range(i0, i1 + 1):
+            counts[bi] += 1.0
+
+    max_cnt = max(counts) if counts else 0.0
+    speech_density = [
+        round(min(1.0, c / max(1.0, max_cnt)), 3) if max_cnt > 0 else 0.0
+        for c in counts
+    ]
+    rms = [round(float(b), 4) for b in bins]
+    is_silence = [
+        bool(rms[i] < 0.14 and speech_density[i] <= 0.01)
+        for i in range(n)
+    ]
+    return {
+        "rms": rms,
+        "speech_density": speech_density,
+        "is_silence": is_silence,
+    }
+
+
+def extract_waveform_bins(
+    video_or_wav_path: str,
+    clip_start: float,
+    clip_end: float,
+    num_bins: int = 150,
+    audio_wav_path: Optional[str] = None,
+    transcript_words: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Extract 150 normalized RMS amplitude bins + vocal energy heatmap (`rms`, `speech_density`,
+    `is_silence`) from `audio_16k.wav` (or source video) over `[clip_start - 5s, clip_end + 5s]`.
+    """
+    num_bins = max(20, min(400, int(num_bins or 150)))
+    video_dur = 0.0
+    try:
+        if os.path.exists(video_or_wav_path) and not str(video_or_wav_path).lower().endswith(".wav"):
+            video_dur = float(probe_video(video_or_wav_path).get("duration") or 0.0)
+    except Exception:
+        video_dur = 0.0
+
+    wav_to_read: Optional[str] = None
+    tmp_wav_dir: Optional[Path] = None
+
+    if audio_wav_path and os.path.exists(audio_wav_path):
+        wav_to_read = audio_wav_path
+    elif str(video_or_wav_path).lower().endswith(".wav") and os.path.exists(video_or_wav_path):
+        wav_to_read = video_or_wav_path
+    elif os.path.exists(video_or_wav_path):
+        tmp_wav_dir = Path(tempfile.mkdtemp(prefix="lost_heaven_wave_"))
+        extracted = tmp_wav_dir / "slice_16k.wav"
+        win_s = max(0.0, float(clip_start) - 5.0)
+        win_e = float(clip_end) + 5.0
+        if video_dur > 0:
+            win_e = min(video_dur, win_e)
+        cmd = [
+            get_ffmpeg_cmd(),
+            "-y",
+            "-ss", f"{win_s:.3f}",
+            "-t", f"{max(1.0, win_e - win_s):.3f}",
+            "-i", os.path.abspath(video_or_wav_path),
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-c:a", "pcm_s16le",
+            str(extracted),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        if res.returncode == 0 and extracted.exists():
+            wav_to_read = str(extracted)
+            try:
+                with wave.open(wav_to_read, "rb") as wf:
+                    sr = wf.getframerate() or 16000
+                    nframes = wf.getnframes()
+                    raw = wf.readframes(nframes)
+                    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                bins = _bin_rms(samples, num_bins)
+                actual_end = round(win_s + (nframes / float(sr)), 3)
+                hm = _compute_heatmap_metrics(bins, win_s, actual_end, transcript_words)
+                return {
+                    "window_start": round(win_s, 3),
+                    "window_end": actual_end,
+                    "clip_start": round(float(clip_start), 3),
+                    "clip_end": round(float(clip_end), 3),
+                    "video_duration": round(video_dur if video_dur > 0 else win_e, 3),
+                    "bins": bins,
+                    **hm,
+                }
+            finally:
+                import shutil
+                shutil.rmtree(tmp_wav_dir, ignore_errors=True)
+
+    if tmp_wav_dir is not None and tmp_wav_dir.exists():
+        import shutil
+        shutil.rmtree(tmp_wav_dir, ignore_errors=True)
+
+    if not wav_to_read or not os.path.exists(wav_to_read):
+        win_s = max(0.0, float(clip_start) - 5.0)
+        win_e = float(clip_end) + 5.0
+        bins = [0.15] * num_bins
+        hm = _compute_heatmap_metrics(bins, win_s, win_e, transcript_words)
+        return {
+            "window_start": win_s,
+            "window_end": win_e,
+            "clip_start": round(float(clip_start), 3),
+            "clip_end": round(float(clip_end), 3),
+            "video_duration": round(video_dur if video_dur > 0 else win_e, 3),
+            "bins": bins,
+            **hm,
+        }
+
+    with wave.open(wav_to_read, "rb") as wf:
+        sr = wf.getframerate() or 16000
+        n_channels = wf.getnchannels() or 1
+        total_frames = wf.getnframes()
+        wav_dur = total_frames / float(sr)
+        if video_dur <= 0:
+            video_dur = wav_dur
+
+        win_s = max(0.0, float(clip_start) - 5.0)
+        win_e = min(video_dur, float(clip_end) + 5.0)
+        if win_e <= win_s:
+            win_e = min(video_dur, win_s + 5.0)
+
+        start_frame = max(0, min(total_frames, int(win_s * sr)))
+        end_frame = max(start_frame + 1, min(total_frames, int(win_e * sr)))
+        wf.setpos(start_frame)
+        raw = wf.readframes(end_frame - start_frame)
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if n_channels > 1:
+            samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+    bins = _bin_rms(samples, num_bins)
+    hm = _compute_heatmap_metrics(bins, win_s, win_e, transcript_words)
+    return {
+        "window_start": round(win_s, 3),
+        "window_end": round(win_e, 3),
+        "clip_start": round(float(clip_start), 3),
+        "clip_end": round(float(clip_end), 3),
+        "video_duration": round(video_dur, 3),
+        "bins": bins,
+        **hm,
+    }
+
+
+def _bin_rms(samples: np.ndarray, num_bins: int) -> List[float]:
+    if samples.size == 0:
+        return [0.05] * num_bins
+    chunks = np.array_split(samples, num_bins)
+    rms_vals = np.array([float(np.sqrt(np.mean(np.square(c)))) if c.size else 0.0 for c in chunks], dtype=np.float32)
+    peak = float(np.max(rms_vals))
+    if peak <= 1e-6:
+        return [0.05] * num_bins
+    norm = np.clip(rms_vals / peak, 0.03, 1.0)
+    return [round(float(v), 4) for v in norm]
+
+
+def _normalize_word_list(
+    words: List[Dict[str, Any]],
+    clip_start_time: float,
+    clip_duration: float,
+) -> List[Dict[str, Any]]:
+    if not words:
+        return []
+    max_end = max(float(w.get("end", 0.0)) for w in words)
+    is_abs = clip_start_time > 0.0 and (
+        (clip_duration > 0.0 and max_end > clip_duration + 1.0)
+        or (clip_duration <= 0.0 and min(float(w.get("start", 0.0)) for w in words) >= max(0.0, clip_start_time - 0.5))
+    )
+    out: List[Dict[str, Any]] = []
+    for w in words:
+        nw = dict(w)
+        ws = float(nw.get("start", 0.0))
+        we = float(nw.get("end", ws + 0.2))
+        if is_abs:
+            ws -= clip_start_time
+            we -= clip_start_time
+        if we <= 0.0:
+            continue
+        if clip_duration > 0 and ws >= clip_duration:
+            continue
+        ws = max(0.0, ws)
+        we = min(clip_duration, we) if clip_duration > 0 else we
+        nw["start"] = round(ws, 3)
+        nw["end"] = round(max(ws + 0.06, we), 3)
+        out.append(nw)
+    out.sort(key=lambda x: x["start"])
+    return out
+
+
+def compute_kept_segments_and_remapped_words(
+    words: List[Dict[str, Any]],
+    clip_start_time: float,
+    clip_duration: float,
+    tighten_pacing: bool = False,
+    silence_threshold: float = 0.45,
+    clean_filler_words: bool = False,
+    crossfade_sec: float = 0.03,
+) -> Dict[str, Any]:
+    """
+    Convert transcript word cuts (`cut_from_video`), optional filler-word cuts, and optional
+    dead-air silence cuts (`tighten_pacing`) into kept video segments + post-cut word timestamps.
+    """
+    clip_dur = max(0.2, float(clip_duration or 1.0))
+    norm_words = _normalize_word_list(words or [], clip_start_time, clip_dur)
+
+    raw_cuts: List[Tuple[float, float]] = []
+
+    def _is_filler(tok: str) -> bool:
+        clean = tok.strip(".,!?;:\"'").lower()
+        return clean in FILLER_TOKENS
+
+    active_spoken: List[Dict[str, Any]] = []
+    for w in norm_words:
+        is_cut = bool(w.get("cut_from_video", False))
+        if not is_cut and clean_filler_words and not w.get("keep_override", False):
+            if bool(w.get("is_filler")) or _is_filler(str(w.get("word", ""))):
+                is_cut = True
+        if is_cut:
+            raw_cuts.append((float(w["start"]), float(w["end"])))
+        else:
+            active_spoken.append(w)
+
+    # Dead-air silence cuts when tighten_pacing is active
+    thresh = max(0.25, min(1.5, float(silence_threshold or 0.45)))
+    if tighten_pacing and active_spoken:
+        cushion = 0.08
+        # Leading silence
+        if active_spoken[0]["start"] > thresh + cushion:
+            raw_cuts.append((0.0, round(active_spoken[0]["start"] - cushion, 3)))
+        # Inter-word gaps
+        for idx in range(len(active_spoken) - 1):
+            gap_s = active_spoken[idx]["end"]
+            gap_e = active_spoken[idx + 1]["start"]
+            if gap_e - gap_s > thresh:
+                c_s = round(gap_s + cushion, 3)
+                c_e = round(gap_e - cushion, 3)
+                if c_e > c_s + 0.08:
+                    raw_cuts.append((c_s, c_e))
+        # Trailing silence
+        if clip_dur - active_spoken[-1]["end"] > thresh + cushion:
+            raw_cuts.append((round(active_spoken[-1]["end"] + cushion, 3), clip_dur))
+
+    # Merge overlapping or nearly touching cut intervals
+    raw_cuts = [(max(0.0, s), min(clip_dur, e)) for s, e in raw_cuts if e > s + 0.04]
+    raw_cuts.sort(key=lambda pair: pair[0])
+    merged_cuts: List[Tuple[float, float]] = []
+    for cs, ce in raw_cuts:
+        if merged_cuts and cs <= merged_cuts[-1][1] + 0.06:
+            merged_cuts[-1] = (merged_cuts[-1][0], max(merged_cuts[-1][1], ce))
+        else:
+            merged_cuts.append((cs, ce))
+
+    if not merged_cuts:
+        return {
+            "kept_segments": [(0.0, clip_dur)],
+            "has_cuts": False,
+            "effective_duration": round(clip_dur, 3),
+            "remapped_words": norm_words,
+            "crossfade_sec": crossfade_sec,
+        }
+
+    # Build complement kept intervals inside [0.0, clip_dur]
+    kept: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for cs, ce in merged_cuts:
+        if cs - cursor >= 0.12:
+            kept.append((round(cursor, 3), round(cs, 3)))
+        cursor = max(cursor, ce)
+    if clip_dur - cursor >= 0.12:
+        kept.append((round(cursor, 3), round(clip_dur, 3)))
+
+    if not kept:
+        return {
+            "kept_segments": [(0.0, clip_dur)],
+            "has_cuts": False,
+            "effective_duration": round(clip_dur, 3),
+            "remapped_words": norm_words,
+            "crossfade_sec": crossfade_sec,
+        }
+
+    # Check if segments match full clip (meaning nothing meaningful was cut)
+    if len(kept) == 1 and kept[0][0] <= 0.02 and kept[0][1] >= clip_dur - 0.02:
+        return {
+            "kept_segments": [(0.0, clip_dur)],
+            "has_cuts": False,
+            "effective_duration": round(clip_dur, 3),
+            "remapped_words": norm_words,
+            "crossfade_sec": crossfade_sec,
+        }
+
+    cf = max(0.0, min(0.05, float(crossfade_sec)))
+    # Ensure every kept segment is strictly > 2 * cf so xfade/acrossfade never underflow
+    min_seg = min(e - s for s, e in kept)
+    if min_seg <= max(0.10, cf * 2.5):
+        cf = 0.0
+
+    # Compute exact output timeline offsets per segment (accounting for cf overlap at joins)
+    seg_out_starts: List[float] = []
+    out_cursor = 0.0
+    for idx, (ks, ke) in enumerate(kept):
+        seg_out_starts.append(out_cursor)
+        seg_len = ke - ks
+        if idx < len(kept) - 1:
+            out_cursor += seg_len - cf
+        else:
+            out_cursor += seg_len
+
+    effective_duration = round(max(0.1, out_cursor), 3)
+
+    # Remap remaining non-cut words onto shortened output timeline
+    remapped: List[Dict[str, Any]] = []
+    for w in active_spoken:
+        mid = 0.5 * (w["start"] + w["end"])
+        for idx, (ks, ke) in enumerate(kept):
+            if ks - 0.03 <= mid <= ke + 0.03:
+                rel_s = max(0.0, w["start"] - ks)
+                rel_e = min(ke - ks, max(rel_s + 0.06, w["end"] - ks))
+                nw = dict(w)
+                nw["start"] = round(seg_out_starts[idx] + rel_s, 3)
+                nw["end"] = round(seg_out_starts[idx] + rel_e, 3)
+                remapped.append(nw)
+                break
+
+    return {
+        "kept_segments": kept,
+        "has_cuts": True,
+        "effective_duration": effective_duration,
+        "remapped_words": remapped,
+        "crossfade_sec": cf,
+    }
+
+
+def build_timeline_trim_concat_filter(
+    kept_segments: List[Tuple[float, float]],
+    crossfade_sec: float = 0.03,
+    has_audio: bool = True,
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Build FFmpeg multi-segment trim/atrim + xfade/acrossfade filtergraph joining kept segments
+    with smooth 30ms audio crossfade and exact frame-locked video fade transition.
+    Returns (filter_fragment, video_out_label, audio_out_label_or_None).
+    """
+    if len(kept_segments) <= 1:
+        ks, ke = kept_segments[0]
+        parts = [f"[0:v]trim=start={ks:.3f}:end={ke:.3f},setpts=PTS-STARTPTS[v_tl]"]
+        a_lbl = None
+        if has_audio:
+            parts.append(f"[0:a]atrim=start={ks:.3f}:end={ke:.3f},asetpts=PTS-STARTPTS[a_tl]")
+            a_lbl = "a_tl"
+        return ";".join(parts), "v_tl", a_lbl
+
+    parts: List[str] = []
+    cf = max(0.0, float(crossfade_sec or 0.0))
+
+    for i, (ks, ke) in enumerate(kept_segments):
+        parts.append(f"[0:v]trim=start={ks:.3f}:end={ke:.3f},setpts=PTS-STARTPTS[tv{i}]")
+        if has_audio:
+            parts.append(f"[0:a]atrim=start={ks:.3f}:end={ke:.3f},asetpts=PTS-STARTPTS[ta{i}]")
+
+    if cf > 0.005:
+        # Chain xfade + acrossfade identically so A/V remain locked to 0.00ms
+        curr_v = "tv0"
+        curr_a = "ta0"
+        running_dur = kept_segments[0][1] - kept_segments[0][0]
+        for i in range(1, len(kept_segments)):
+            seg_dur = kept_segments[i][1] - kept_segments[i][0]
+            offset = max(0.02, running_dur - cf)
+            next_v = "v_tl" if i == len(kept_segments) - 1 else f"vx{i}"
+            parts.append(f"[{curr_v}][tv{i}]xfade=transition=fade:duration={cf:.3f}:offset={offset:.3f}[{next_v}]")
+            curr_v = next_v
+
+            if has_audio:
+                next_a = "a_tl" if i == len(kept_segments) - 1 else f"ax{i}"
+                parts.append(f"[{curr_a}][ta{i}]acrossfade=d={cf:.3f}:c1=tri:c2=tri[{next_a}]")
+                curr_a = next_a
+
+            running_dur = offset + seg_dur
+    else:
+        v_inputs = "".join(f"[tv{i}]" for i in range(len(kept_segments)))
+        if has_audio:
+            pair_inputs = "".join(f"[tv{i}][ta{i}]" for i in range(len(kept_segments)))
+            parts.append(f"{pair_inputs}concat=n={len(kept_segments)}:v=1:a=1[v_tl][a_tl]")
+        else:
+            parts.append(f"{v_inputs}concat=n={len(kept_segments)}:v=1:a=0[v_tl]")
+
+    return ";".join(parts), "v_tl", ("a_tl" if has_audio else None)
+
+
+def build_profanity_bleep_filter(
+    in_audio_label: str,
+    profanity_intervals: List[Tuple[float, float]],
+    total_duration: float,
+    out_audio_label: str = "a_bleep",
+) -> str:
+    """
+    Mute profane word windows on dialogue (`volume=0`) and mix in a clean -14 dB 1000 Hz
+    sine bleep (`aevalsrc`) gated to those exact millisecond intervals.
+    """
+    if not profanity_intervals:
+        return ""
+    dur = max(0.2, float(total_duration or 1.0))
+    expr_terms = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in profanity_intervals)
+    # 0.1995 linear amplitude ~= -14 dBFS sine wave
+    return (
+        f"[{in_audio_label}]volume=enable='{expr_terms}':volume=0[a_prof_muted];"
+        f"aevalsrc=exprs='0.1995*sin(2*PI*1000*t)*min(1\\,{expr_terms})':s=48000:c=stereo:d={dur:.3f}[a_bleep_tone];"
+        f"[a_prof_muted][a_bleep_tone]amix=inputs=2:duration=first:normalize=0[{out_audio_label}]"
+    )

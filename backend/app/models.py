@@ -1,0 +1,598 @@
+import json
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field
+from sqlmodel import SQLModel, Field as SQLField
+
+# -------------------------------------------------------------
+# Database Models
+# -------------------------------------------------------------
+
+class Project(SQLModel, table=True):
+    __tablename__ = "projects"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    title: str = SQLField(index=True)
+    source_type: str = SQLField(default="local") # "local" or "youtube"
+    source_filename: Optional[str] = SQLField(default=None)
+    source_path: str
+    proxy_path: Optional[str] = SQLField(default=None)
+    duration: float = SQLField(default=0.0)
+    resolution_w: int = SQLField(default=0)
+    resolution_h: int = SQLField(default=0)
+    fps: float = SQLField(default=30.0)
+    status: str = SQLField(default="created") # created, proxy_ready, analyzing, analyzed, error
+    error_message: Optional[str] = SQLField(default=None)
+
+    # Pre-analysis AI Controls
+    default_aspect_ratio: str = SQLField(default="9:16") # 9:16, 4:5, 1:1, 4:3, 16:9, custom
+    duration_preset: str = SQLField(default="Auto") # Auto, 15s, 30s, 45s, 60s, 90s, 30-58s
+    clip_count: int = SQLField(default=5) # 3, 5, 8, 10 or exact custom
+    clip_length_target: str = SQLField(default="Auto") # Auto, 15s, 30s, 45s, 60s, 90s
+    caption_language: str = SQLField(default="As spoken") # As spoken, Hinglish, English, Hindi, Spanish, French, German, Arabic, Portuguese, Japanese
+    hardware_mode: str = SQLField(default="gpu") # gpu (Graphics card) or cpu (Processor only)
+    topic_focus: Optional[str] = SQLField(default=None) # Optional creative guidance for Gemini
+
+    created_at: str = SQLField(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class BrandPreset(SQLModel, table=True):
+    __tablename__ = "brand_presets"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    name: str = SQLField(index=True)
+    caption_style_name: Optional[str] = SQLField(default="Cinematic")
+    watermark_url: Optional[str] = SQLField(default=None)
+    watermark_corner: str = SQLField(default="top_right") # top_left, top_right, bottom_left, bottom_right
+    watermark_opacity: float = SQLField(default=0.85)
+    watermark_size: float = SQLField(default=0.15)
+    outro_url: Optional[str] = SQLField(default=None)
+    bgm_url: Optional[str] = SQLField(default=None)
+    bgm_volume: float = SQLField(default=0.20)
+    aspect_ratio: str = SQLField(default="9:16")
+    safe_zone_guide: str = SQLField(default="TikTok") # No guide, TikTok, Instagram, YT Shorts, X, All
+    created_at: str = SQLField(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class CaptionStylePreset(SQLModel, table=True):
+    __tablename__ = "caption_style_presets"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    name: str = SQLField(index=True)
+    font_family: str = SQLField(default="Montserrat")
+    font_size_percent: int = SQLField(default=100)
+    bold: bool = SQLField(default=True)
+    italic: bool = SQLField(default=False)
+    uppercase: bool = SQLField(default=True)
+    text_align: str = SQLField(default="Centre") # Left, Centre, Right
+    base_color: str = SQLField(default="#FFFFFF")
+    active_color: str = SQLField(default="#C6F32F") # ClipShlip neon lime
+    hold_back_alpha: float = SQLField(default=1.0) # 0.0 to 1.0 (opacity of inactive words)
+    highlight_shape: str = SQLField(default="Colour only") # Colour only, Filled box, Underline
+    animation_type: str = SQLField(default="Karaoke pop")
+    position_grid: str = SQLField(default="bottom_center") # 3x3 position
+    position_x: float = SQLField(default=50.0) # % across
+    position_y: float = SQLField(default=78.0) # % down
+    outline_width: float = SQLField(default=4.0)
+    shadow_depth: float = SQLField(default=3.0)
+    glow_intensity: float = SQLField(default=0.0)
+    letter_spacing: float = SQLField(default=0.0)
+    timing_offset: float = SQLField(default=0.0)
+    emoji_enabled: bool = SQLField(default=False)
+    highlight_power_words: bool = SQLField(default=False)
+    how_phrase_arrives: str = SQLField(default="All at once") # All at once, Word by word
+    created_at: str = SQLField(default_factory=lambda: datetime.utcnow().isoformat())
+
+
+class ViralClip(SQLModel, table=True):
+    __tablename__ = "viral_clips"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    project_id: int = SQLField(index=True, foreign_key="projects.id")
+
+    # Time boundaries in seconds
+    start_time: float
+    end_time: float
+    duration: float
+
+    # Virality metrics
+    virality_score: int = SQLField(default=0)
+    hook_score: int = SQLField(default=0)
+    retention_score: int = SQLField(default=0)
+    emotional_score: int = SQLField(default=0)
+    standalone_score: int = SQLField(default=0)
+    viral_rationale: str = SQLField(default="")
+
+    # Hook engine & Retention FX
+    hook_headline: str = SQLField(default="")
+    show_hook_banner: bool = SQLField(default=True)
+    cold_open_quote: str = SQLField(default="")
+    use_cold_open: bool = SQLField(default=False)
+    auto_trim_dead_air: bool = SQLField(default=False)
+    dynamic_punch_zoom: bool = SQLField(default=False)
+    punch_zoom_intensity: float = SQLField(default=1.14) # 1.08 subtle, 1.14 standard, 1.22 aggressive
+
+    # Multi-Aspect Ratio & Framing Controls
+    aspect_ratio: str = SQLField(default="9:16") # 9:16, 4:5, 1:1, 4:3, 16:9, custom
+    custom_width: int = SQLField(default=1080)
+    custom_height: int = SQLField(default=1920)
+    frame_layout: str = SQLField(default="auto_track") # auto_track, webcam_gameplay_split, webcam_gameplay_pip, split_podcast, fit_blur
+    webcam_corner: str = SQLField(default="auto") # auto, top_left, top_right, bottom_left, bottom_right
+    webcam_split_ratio: float = SQLField(default=0.35) # 0.25 to 0.50
+    pip_border_color: str = SQLField(default="#F59E0B") # ClipShlip amber
+    zoom: float = SQLField(default=1.0) # 1.0 to 1.8
+    pan_x_offset: float = SQLField(default=0.0) # -0.40 to +0.40
+
+    # Step 2: Pro Captions & Typography
+    burn_captions: bool = SQLField(default=True)
+    timing_offset: float = SQLField(default=0.0) # -1.00s to +1.00s
+    caption_style: str = SQLField(default="Karaoke pop") # 12 styles
+    caption_font: str = SQLField(default="Montserrat")
+    caption_animation: str = SQLField(default="Karaoke") # Plays once vs whole line
+    base_color: str = SQLField(default="#FFFFFF")
+    active_color: str = SQLField(default="#C6F32F")
+    outline_color: str = SQLField(default="#000000")
+    font_size: int = SQLField(default=64)
+    font_size_percent: int = SQLField(default=100) # 50% to 160%
+    bold: bool = SQLField(default=True)
+    italic: bool = SQLField(default=False)
+    all_caps: bool = SQLField(default=True)
+    text_align: str = SQLField(default="Centre") # Left, Centre, Right
+    position_grid: str = SQLField(default="bottom_center") # 3x3 grid
+    position_x: float = SQLField(default=50.0)
+    position_y: float = SQLField(default=78.0)
+    hold_back_alpha: float = SQLField(default=1.0) # 0.0 to 1.0
+    highlight_shape: str = SQLField(default="Colour only") # Colour only, Filled box, Underline
+    emoji_enabled: bool = SQLField(default=False)
+    highlight_power_words: bool = SQLField(default=False)
+    how_phrase_arrives: str = SQLField(default="All at once") # All at once, Word by word
+    outline_width: float = SQLField(default=4.0) # 0-12
+    shadow_depth: float = SQLField(default=3.0) # 0-10
+    glow_intensity: float = SQLField(default=0.0) # 0-10
+    letter_spacing: float = SQLField(default=0.0) # 0-8
+    clean_filler_words: bool = SQLField(default=False)
+    tighten_pacing: bool = SQLField(default=False)
+    silence_threshold: float = SQLField(default=0.45)
+    censor_profanity: bool = SQLField(default=False)
+
+    # Step 3: Color Grading & Visual FX
+    clip_size: str = SQLField(default="1080p") # Auto, 1080p, 720p, 540p, 480p
+    color_preset: str = SQLField(default="none")
+    exposure: float = SQLField(default=0.0) # -0.50 to +0.50
+    brightness: float = SQLField(default=0.0) # -0.50 to +0.50
+    contrast: float = SQLField(default=1.0) # 0.50 to 1.50
+    lift_mids: float = SQLField(default=0.0) # 0.0 to 1.0
+    warmth: float = SQLField(default=0.0) # -0.50 to +0.50
+    saturation: float = SQLField(default=1.0) # 0.00 to 2.00
+    black_and_white: float = SQLField(default=0.0) # 0.0 to 1.0
+    vintage: float = SQLField(default=0.0) # 0.0 to 1.0
+    tint_color: str = SQLField(default="none") # none, red, blue, green, yellow, or hex
+    tint_strength: float = SQLField(default=0.0) # 0.0 to 1.0
+    glow: float = SQLField(default=0.0) # 0.0 to 1.0
+    smooth: float = SQLField(default=0.0) # 0.0 to 1.0
+    sharpness: float = SQLField(default=0.0) # 0.0 to 1.0
+    blur: float = SQLField(default=0.0) # 0.0 to 1.0
+    film_grain: float = SQLField(default=0.0) # 0.0 to 1.0
+    vignette: float = SQLField(default=0.0) # 0.0 to 1.0
+    bottom_fade: float = SQLField(default=0.0) # 0.0 to 1.0
+
+    # Step 4: Branding, Outro & Audio
+    watermark_path: Optional[str] = SQLField(default=None)
+    watermark_corner: str = SQLField(default="top_right")
+    watermark_opacity: float = SQLField(default=0.85)
+    watermark_size: float = SQLField(default=0.15)
+    outro_path: Optional[str] = SQLField(default=None)
+    bgm_path: Optional[str] = SQLField(default=None)
+    bgm_volume: float = SQLField(default=0.20)
+    audio_volume: float = SQLField(default=1.0)
+    normalize_audio: bool = SQLField(default=True)
+    vocal_clarity: bool = SQLField(default=False)
+    voice_isolation: bool = SQLField(default=False)
+    auto_sfx: bool = SQLField(default=False)
+    retention_bar_enabled: bool = SQLField(default=False)
+    retention_bar_color: str = SQLField(default="#C6F32F")
+    outro_cta_enabled: bool = SQLField(default=False)
+    outro_cta_text: str = SQLField(default="Subscribe for More")
+    broll_json: str = SQLField(default="[]")
+    hardware_mode: str = SQLField(default="gpu") # gpu or cpu
+
+    # Word-level transcript JSON
+    transcript_json: Optional[str] = SQLField(default="[]")
+
+    # Publishing metadata
+    youtube_titles: str = SQLField(default="[]") # JSON list of 3 titles
+    selected_title: str = SQLField(default="")
+    youtube_description: str = SQLField(default="")
+    hashtags: str = SQLField(default="")
+    pinned_comment: str = SQLField(default="")
+    analysis_source: Optional[str] = SQLField(default="gemini") # "gemini", "offline", "offline_fallback", "ollama"
+    privacy_status: str = SQLField(default="private") # private, unlisted, public
+
+    # Render pipeline states
+    status: str = SQLField(default="draft") # draft, rendering, ready, failed
+    render_status: str = SQLField(default="idle") # idle, rendering, completed, failed
+    render_progress: int = SQLField(default=0)
+    render_message: Optional[str] = SQLField(default=None)
+    rendered_path: Optional[str] = SQLField(default=None)
+    rendered_video_path: Optional[str] = SQLField(default=None)
+
+    # YouTube publish result
+    youtube_video_id: Optional[str] = SQLField(default=None)
+    youtube_url: Optional[str] = SQLField(default=None)
+
+    created_at: str = SQLField(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def get_titles(self) -> List[str]:
+        try:
+            return json.loads(self.youtube_titles)
+        except Exception:
+            return []
+
+    def set_titles(self, titles: List[str]):
+        self.youtube_titles = json.dumps(titles)
+
+    def get_transcript(self) -> List[Dict[str, Any]]:
+        try:
+            return json.loads(self.transcript_json or "[]")
+        except Exception:
+            return []
+
+    def set_transcript(self, words: List[Dict[str, Any]]):
+        self.transcript_json = json.dumps(words)
+
+
+# -------------------------------------------------------------
+# Gemini Structured Output Schemas
+# -------------------------------------------------------------
+
+class GeminiClipItem(BaseModel):
+    start_time: str = Field(description="Clip start time formatted as HH:MM:SS or MM:SS")
+    end_time: str = Field(description="Clip end time formatted as HH:MM:SS or MM:SS")
+    start_seconds: Optional[float] = Field(default=None, description="Start boundary in seconds")
+    end_seconds: Optional[float] = Field(default=None, description="End boundary in seconds")
+    virality_score: int = Field(ge=0, le=100, description="Overall virality score 0-100")
+    hook_score: int = Field(ge=0, le=100, description="Strength of opening 3 seconds")
+    retention_score: int = Field(ge=0, le=100, description="Narrative pacing and payoff")
+    emotional_score: int = Field(ge=0, le=100, description="Humor, surprise, urgency or insight")
+    standalone_score: int = Field(ge=0, le=100, description="Clarity without watching full video")
+    viral_rationale: str = Field(description="1-2 sentences explaining why this moment is viral")
+    hook_headline: str = Field(description="Punchy 4-6 word top banner text summarizing the hook")
+    cold_open_quote: str = Field(description="Exact 1-sentence climax quote inside the clip for cold open")
+    youtube_titles: List[str] = Field(description="3 A/B-testable YouTube titles under 60 chars")
+    youtube_description: str = Field(description="SEO description with 3-5 relevant hashtags")
+    pinned_comment: str = Field(description="1 engagement question for the YouTube comment section")
+
+
+class GeminiAnalysisResponse(BaseModel):
+    clips: List[GeminiClipItem] = Field(description="Ranked extracted viral clips")
+
+
+# -------------------------------------------------------------
+# API Request / Response DTOs
+# -------------------------------------------------------------
+
+class SystemInfoResponse(BaseModel):
+    cpu_model: str
+    cpu_cores: int
+    ram_gb: float
+    gpu_name: Optional[str] = None
+    has_cuda: bool = False
+    active_encoder: str = "libx264"
+    whisper_model: str = "large-v3-turbo"
+    gemini_status: str = "active"
+
+
+class PreviewFrameRequest(BaseModel):
+    clip_id: Optional[int] = None
+    project_id: Optional[int] = None
+    timestamp: float = 0.0
+
+    # Layout
+    aspect_ratio: str = "9:16"
+    custom_width: int = 1080
+    custom_height: int = 1920
+    frame_layout: str = "auto_track"
+    framing_template: Optional[str] = None
+    webcam_corner: str = "top_left"
+    webcam_split_ratio: float = 0.38
+    pip_border_color: str = "#F59E0B"
+    zoom: float = 1.0
+    pan_x_offset: float = 0.0
+    pan_x: Optional[float] = None
+    clip_rel_ts: Optional[float] = None
+    clip_size: str = "1080p"
+    export_resolution: Optional[str] = None
+    watermark_path: Optional[str] = None
+    watermark_corner: str = "top_right"
+    watermark_opacity: float = 0.85
+    watermark_size: float = 0.15
+
+    # Grading
+    color_preset: str = "none"
+    exposure: float = 0.0
+    brightness: float = 0.0
+    contrast: float = 1.0
+    lift_mids: float = 0.0
+    warmth: float = 0.0
+    saturation: float = 1.0
+    black_and_white: float = 0.0
+    vintage: float = 0.0
+    tint_color: str = "none"
+    color_tint: Optional[str] = None
+    tint_strength: float = 0.0
+    glow: float = 0.0
+    smooth: float = 0.0
+    sharpness: float = 0.0
+    blur: float = 0.0
+    film_grain: float = 0.0
+    vignette: float = 0.0
+    bottom_fade: float = 0.0
+
+    # Subtitles
+    burn_captions: bool = True
+    timing_offset: float = 0.0
+    caption_style: str = "Karaoke pop"
+    style_preset: Optional[str] = None
+    caption_font: str = "Montserrat"
+    font_family: Optional[str] = None
+    caption_animation: str = "Karaoke"
+    animation: Optional[str] = None
+    font_size_percent: int = 100
+    font_size_pct: Optional[int] = None
+    bold: bool = True
+    italic: bool = False
+    all_caps: bool = True
+    uppercase: Optional[bool] = None
+    text_align: str = "Centre"
+    alignment: Optional[str] = None
+    position_grid: str = "bottom_center"
+    base_color: str = "#FFFFFF"
+    active_color: str = "#C6F32F"
+    highlight_color: Optional[str] = None
+    outline_color: str = "#000000"
+    hold_back_alpha: float = 1.0
+    hold_back_opacity: Optional[float] = None
+    highlight_shape: str = "Colour only"
+    position_x: float = 50.0
+    pos_x: Optional[float] = None
+    position_y: float = 78.0
+    pos_y: Optional[float] = None
+    outline_width: float = 4.0
+    outline: Optional[float] = None
+    shadow_depth: float = 3.0
+    shadow: Optional[float] = None
+    glow_intensity: float = 0.0
+    letter_spacing: float = 0.0
+    emoji_enabled: bool = False
+    auto_emoji: Optional[bool] = None
+    highlight_power_words: bool = False
+    how_phrase_arrives: str = "All at once"
+    line_mode: Optional[str] = None
+    word_by_word: Optional[bool] = None
+    clean_filler_words: bool = False
+    censor_profanity: bool = False
+    show_hook_banner: bool = True
+    hook_banner_enabled: Optional[bool] = None
+    hook_headline: str = ""
+    retention_bar_enabled: bool = False
+    retention_bar_color: str = "#C6F32F"
+    outro_cta_enabled: bool = False
+    outro_cta_text: str = "Subscribe for More"
+    words: Optional[List[Dict[str, Any]]] = None
+
+
+class PreviewFrameResponse(BaseModel):
+    frame_url: str
+    render_time_ms: int
+    timestamp: float
+
+
+class YouTubeImportRequest(BaseModel):
+    url: str
+    aspect_ratio: Optional[str] = "9:16"
+    duration_preset: Optional[str] = "Auto"
+    clip_count: Optional[int] = 5
+    topic_focus: Optional[str] = None
+    caption_language: Optional[str] = "As spoken"
+    hardware_mode: Optional[str] = "gpu"
+
+
+class UpdateClipRequest(BaseModel):
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+    hook_headline: Optional[str] = None
+    show_hook_banner: Optional[bool] = None
+    cold_open_quote: Optional[str] = None
+    use_cold_open: Optional[bool] = None
+    auto_trim_dead_air: Optional[bool] = None
+    dynamic_punch_zoom: Optional[bool] = None
+    punch_zoom_intensity: Optional[float] = None
+
+    # Step 1: Layout & Framing
+    aspect_ratio: Optional[str] = None
+    custom_width: Optional[int] = None
+    custom_height: Optional[int] = None
+    frame_layout: Optional[str] = None
+    framing_template: Optional[str] = None
+    webcam_corner: Optional[str] = None
+    webcam_split_ratio: Optional[float] = None
+    pip_border_color: Optional[str] = None
+    zoom: Optional[float] = None
+    pan_x_offset: Optional[float] = None
+    pan_x: Optional[float] = None
+
+    # Step 2: Captions
+    burn_captions: Optional[bool] = None
+    timing_offset: Optional[float] = None
+    caption_style: Optional[str] = None
+    caption_font: Optional[str] = None
+    caption_animation: Optional[str] = None
+    base_color: Optional[str] = None
+    active_color: Optional[str] = None
+    outline_color: Optional[str] = None
+    font_size: Optional[int] = None
+    font_size_percent: Optional[int] = None
+    bold: Optional[bool] = None
+    italic: Optional[bool] = None
+    all_caps: Optional[bool] = None
+    text_align: Optional[str] = None
+    position_grid: Optional[str] = None
+    position_x: Optional[float] = None
+    position_y: Optional[float] = None
+    hold_back_alpha: Optional[float] = None
+    highlight_shape: Optional[str] = None
+    emoji_enabled: Optional[bool] = None
+    highlight_power_words: Optional[bool] = None
+    how_phrase_arrives: Optional[str] = None
+    outline_width: Optional[float] = None
+    shadow_depth: Optional[float] = None
+    glow_intensity: Optional[float] = None
+    letter_spacing: Optional[float] = None
+    clean_filler_words: Optional[bool] = None
+    tighten_pacing: Optional[bool] = None
+    silence_threshold: Optional[float] = None
+    censor_profanity: Optional[bool] = None
+
+    # Step 3: Color Grading & Effects
+    clip_size: Optional[str] = None
+    export_resolution: Optional[str] = None
+    color_preset: Optional[str] = None
+    exposure: Optional[float] = None
+    brightness: Optional[float] = None
+    contrast: Optional[float] = None
+    lift_mids: Optional[float] = None
+    warmth: Optional[float] = None
+    saturation: Optional[float] = None
+    black_and_white: Optional[float] = None
+    vintage: Optional[float] = None
+    tint_color: Optional[str] = None
+    color_tint: Optional[str] = None
+    tint_strength: Optional[float] = None
+    glow: Optional[float] = None
+    smooth: Optional[float] = None
+    sharpness: Optional[float] = None
+    blur: Optional[float] = None
+    film_grain: Optional[float] = None
+    vignette: Optional[float] = None
+    bottom_fade: Optional[float] = None
+
+    # Step 4: Branding & BGM / Audio
+    watermark_path: Optional[str] = None
+    watermark_corner: Optional[str] = None
+    watermark_opacity: Optional[float] = None
+    watermark_size: Optional[float] = None
+    outro_path: Optional[str] = None
+    bgm_path: Optional[str] = None
+    bgm_volume: Optional[float] = None
+    audio_volume: Optional[float] = None
+    normalize_audio: Optional[bool] = None
+    vocal_clarity: Optional[bool] = None
+    voice_isolation: Optional[bool] = None
+    auto_sfx: Optional[bool] = None
+    retention_bar_enabled: Optional[bool] = None
+    retention_bar_color: Optional[str] = None
+    outro_cta_enabled: Optional[bool] = None
+    outro_cta_text: Optional[str] = None
+    broll_segments: Optional[List[Dict[str, Any]]] = None
+    hardware_mode: Optional[str] = None
+
+    # Publishing metadata & transcript
+    selected_title: Optional[str] = None
+    youtube_description: Optional[str] = None
+    hashtags: Optional[str] = None
+    pinned_comment: Optional[str] = None
+    privacy_status: Optional[str] = None
+    transcript_words: Optional[List[Dict[str, Any]]] = None
+
+
+class UpdateClipMetadataRequest(BaseModel):
+    selected_title: Optional[str] = None
+    youtube_description: Optional[str] = None
+    hashtags: Optional[str] = None
+    pinned_comment: Optional[str] = None
+    privacy_status: Optional[str] = None
+
+
+class RenderClipRequest(BaseModel):
+    quality_mode: str = "final_hq"
+
+
+class TrimClipRequest(BaseModel):
+    start_time: float
+    end_time: float
+
+
+class CreateBrandPresetRequest(BaseModel):
+    name: str
+    caption_style_name: Optional[str] = "Cinematic"
+    watermark_url: Optional[str] = None
+    watermark_corner: Optional[str] = "top_right"
+    watermark_opacity: Optional[float] = 0.85
+    watermark_size: Optional[float] = 0.15
+    outro_url: Optional[str] = None
+    bgm_url: Optional[str] = None
+    bgm_volume: Optional[float] = 0.20
+    aspect_ratio: Optional[str] = "9:16"
+    safe_zone_guide: Optional[str] = "TikTok"
+
+
+class CreateCaptionStyleRequest(BaseModel):
+    name: str
+    font_family: Optional[str] = "Montserrat"
+    font_size_percent: Optional[int] = 100
+    bold: Optional[bool] = True
+    italic: Optional[bool] = False
+    uppercase: Optional[bool] = True
+    text_align: Optional[str] = "Centre"
+    base_color: Optional[str] = "#FFFFFF"
+    active_color: Optional[str] = "#C6F32F"
+    hold_back_alpha: Optional[float] = 1.0
+    highlight_shape: Optional[str] = "Colour only"
+    animation_type: Optional[str] = "Karaoke pop"
+    position_grid: Optional[str] = "bottom_center"
+    position_x: Optional[float] = 50.0
+    position_y: Optional[float] = 78.0
+    outline_width: Optional[float] = 4.0
+    shadow_depth: Optional[float] = 3.0
+    glow_intensity: Optional[float] = 0.0
+    letter_spacing: Optional[float] = 0.0
+    timing_offset: Optional[float] = 0.0
+    emoji_enabled: Optional[bool] = False
+    how_phrase_arrives: Optional[str] = "All at once"
+
+
+class PublishYouTubeRequest(BaseModel):
+    clip_id: Optional[int] = None
+    title: Optional[str] = None
+    description: Optional[str] = None
+    privacy_status: Optional[str] = "private"
+    privacy: Optional[str] = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    gemini_api_key: Optional[str] = None
+    gemini_model: Optional[str] = None
+    gemini_fallback_model: Optional[str] = None
+    gemini_analysis_mode: Optional[str] = None
+    auto_fallback_offline: Optional[bool] = None
+    ai_provider: Optional[str] = None
+    ollama_endpoint: Optional[str] = None
+    ollama_model: Optional[str] = None
+    whisper_model: Optional[str] = None
+    gemini_enabled: Optional[bool] = None
+    gemini_boost_enabled: Optional[bool] = None
+    active_theme: Optional[str] = None
+    hardware_acceleration: Optional[str] = None
+    pexels_api_key: Optional[str] = None
+    watch_folder_path: Optional[str] = None
+    watch_folder_enabled: Optional[bool] = None
+
+class TestGeminiRequest(BaseModel):
+    api_key: Optional[str] = None
+
+class ProvideKeyRequest(BaseModel):
+    api_key: str
+    model: Optional[str] = None
+
+class RetryProjectRequest(BaseModel):
+    force_offline: Optional[bool] = False
