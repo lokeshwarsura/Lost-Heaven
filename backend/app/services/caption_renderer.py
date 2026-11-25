@@ -11,6 +11,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from app.config import settings
 from app.services.captions_ass import CAPTION_STYLES_DEF, EMOJI_KEYWORDS
+from app.services.diarizer import detect_speaker_lower_third_turns
+from app.services.callout_engine import draw_callout_card, draw_speaker_lower_third
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +249,16 @@ def normalize_and_chunk_words(
         if clip_duration > 0.0:
             rel_e = min(clip_duration, max(rel_s + 0.08, rel_e))
 
-        normalized.append({"word": text, "start": round(rel_s, 3), "end": round(rel_e, 3)})
+        item_d: Dict[str, Any] = {"word": text, "start": round(rel_s, 3), "end": round(rel_e, 3)}
+        if w.get("speaker_id"):
+            item_d["speaker_id"] = w["speaker_id"]
+        if w.get("translated_text"):
+            item_d["translated_text"] = w["translated_text"]
+        if w.get("translated_phrase"):
+            item_d["translated_phrase"] = w["translated_phrase"]
+        if w.get("translated_chunk_id") is not None:
+            item_d["translated_chunk_id"] = w["translated_chunk_id"]
+        normalized.append(item_d)
 
     normalized.sort(key=lambda item: item["start"])
     if not normalized:
@@ -609,6 +620,186 @@ def _draw_outro_cta_card(
     )
 
 
+def _resolve_bilingual_font(px_size: int, text: str = "") -> Any:
+    """Resolve a Unicode-capable secondary caption font so accents, Devanagari, Telugu, CJK & Arabic render crisply."""
+    needs_unicode = any(ord(ch) > 255 for ch in text)
+    candidates = [
+        r"C:\Windows\Fonts\Nirmala.ttf",
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\malgun.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ] if needs_unicode else [
+        r"C:\Windows\Fonts\segoeui.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+    ]
+    for cp in candidates:
+        if os.path.exists(cp):
+            try:
+                return ImageFont.truetype(cp, px_size)
+            except Exception:
+                continue
+    return resolve_pillow_font("Montserrat", px_size, bold=False)
+
+
+def _compute_face_safe_anchor_y(
+    t: float,
+    default_anchor_y: float,
+    total_h: float,
+    margin_pad: float,
+    height: int,
+    face_keyframes: Optional[List[Dict[str, Any]]],
+) -> float:
+    """Shift caption vertical center cleanly out of the active face bbox when overlapping."""
+    if not face_keyframes:
+        return default_anchor_y
+    closest = min(face_keyframes, key=lambda kf: abs(float(kf.get("t", 0.0)) - t))
+    fcy = float(closest.get("cy", 0.4))
+    fh_norm = float(closest.get("face_h", 0.26) or 0.26)
+    cy_px = fcy * height
+    fh_px = max(height * 0.14, min(height * 0.45, fh_norm * height))
+    face_top = max(margin_pad, cy_px - 0.58 * fh_px)
+    face_bot = min(height - margin_pad, cy_px + 0.65 * fh_px)
+
+    pad = max(14.0, height * 0.025)
+    cap_top = default_anchor_y - total_h / 2.0
+    cap_bot = default_anchor_y + total_h / 2.0
+    overlaps = not (cap_bot < face_top - pad or cap_top > face_bot + pad)
+    if not overlaps:
+        return default_anchor_y
+
+    below_anchor = face_bot + pad + total_h / 2.0
+    above_anchor = face_top - pad - total_h / 2.0
+    min_anchor = margin_pad + total_h / 2.0
+    max_anchor = height - margin_pad - total_h / 2.0
+
+    below_ok = below_anchor <= max_anchor
+    above_ok = above_anchor >= min_anchor
+
+    if below_ok and fcy < 0.60:
+        return below_anchor
+    if above_ok:
+        return above_anchor
+    if below_ok:
+        return below_anchor
+    return max(min_anchor, min(max_anchor, below_anchor if fcy < 0.5 else above_anchor))
+
+
+def _compute_handle_pulse_visibility(t: float, display_mode: str) -> float:
+    """Return [0.0..1.0] alpha/entrance multiplier for creator handle watermark."""
+    mode = str(display_mode or "always").strip().lower()
+    if mode not in {"pulse", "pulse_12s", "periodic_pulse", "periodic"}:
+        return 1.0
+    phase = float(t) % 12.0
+    if phase < 0.35:
+        return max(0.05, phase / 0.35)
+    if phase <= 3.2:
+        return 1.0
+    if phase <= 3.6:
+        return max(0.0, 1.0 - (phase - 3.2) / 0.4)
+    return 0.0
+
+
+def _draw_creator_handle_watermark(
+    canvas: Image.Image,
+    t: float,
+    width: int,
+    height: int,
+    *,
+    handle_text: str,
+    platform_icon: str = "none",
+    corner: str = "bottom_right",
+    opacity: float = 0.65,
+    display_mode: str = "always",
+    font_resolver: Any = None,
+) -> Image.Image:
+    txt = str(handle_text or "").strip()
+    if not txt:
+        return canvas
+    vis = _compute_handle_pulse_visibility(t, display_mode)
+    if vis <= 0.02:
+        return canvas
+
+    eff_op = max(0.20, min(0.90, float(opacity or 0.65))) * vis
+    base = canvas.convert("RGBA") if canvas.mode != "RGBA" else canvas
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
+    px = max(13, int(width * 0.026))
+    font = font_resolver(px) if font_resolver else None
+    if font and hasattr(draw, "textbbox"):
+        tb = draw.textbbox((0, 0), txt, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+    else:
+        tw = int(len(txt) * px * 0.58)
+        th = px
+
+    icon_name = str(platform_icon or "none").strip().lower()
+    has_icon = icon_name in {"youtube", "tiktok", "instagram", "x"}
+    icon_sz = max(12, int(px * 1.05))
+    icon_gap = int(px * 0.42) if has_icon else 0
+    pad_x = max(10, int(width * 0.018))
+    pad_y = max(6, int(height * 0.007))
+    pill_w = min(int(width * 0.72), pad_x * 2 + (icon_sz if has_icon else 0) + icon_gap + tw)
+    pill_h = max(th + pad_y * 2, icon_sz + pad_y * 2)
+
+    mx = int(width * 0.045)
+    c_key = str(corner or "bottom_right").strip().lower()
+    if c_key == "top_left":
+        x0, y0 = mx, int(height * 0.045)
+    elif c_key == "top_right":
+        x0, y0 = width - mx - pill_w, int(height * 0.045)
+    elif c_key == "bottom_left":
+        x0, y0 = mx, int(height * 0.895) - pill_h
+    else:  # bottom_right
+        x0, y0 = width - mx - pill_w, int(height * 0.895) - pill_h
+
+    # Subtle slide nudge during periodic pulse fade-in
+    if vis < 0.99:
+        slide_shift = int((1.0 - vis) * max(10, width * 0.02))
+        x0 += (-slide_shift if "left" in c_key else slide_shift)
+
+    bg_a = int(round(170 * eff_op))
+    bd_a = int(round(90 * eff_op))
+    fg_a = int(round(248 * eff_op))
+
+    draw.rounded_rectangle(
+        [x0, y0, x0 + pill_w, y0 + pill_h],
+        radius=max(8, pill_h // 2),
+        fill=(12, 16, 26, bg_a),
+        outline=(255, 255, 255, bd_a),
+        width=max(1, int(width * 0.002)),
+    )
+
+    cur_x = x0 + pad_x
+    cy = y0 + pill_h // 2
+    if has_icon:
+        ix0, iy0 = cur_x, cy - icon_sz // 2
+        ix1, iy1 = ix0 + icon_sz, iy0 + icon_sz
+        if icon_name == "youtube":
+            draw.rounded_rectangle([ix0, iy0 + 1, ix1, iy1 - 1], radius=max(2, icon_sz // 5), fill=(239, 68, 68, fg_a))
+            draw.polygon(
+                [(ix0 + icon_sz * 0.38, iy0 + icon_sz * 0.28), (ix0 + icon_sz * 0.38, iy0 + icon_sz * 0.72), (ix0 + icon_sz * 0.72, cy)],
+                fill=(255, 255, 255, fg_a),
+            )
+        elif icon_name == "tiktok":
+            draw.ellipse([ix0 + 1, iy0 + icon_sz * 0.45, ix0 + icon_sz * 0.62, iy1], fill=(34, 211, 238, fg_a))
+            draw.line([(ix0 + icon_sz * 0.56, iy0 + icon_sz * 0.75), (ix0 + icon_sz * 0.56, iy0 + 1), (ix1 - 1, iy0 + icon_sz * 0.25)], fill=(255, 255, 255, fg_a), width=max(2, icon_sz // 6))
+        elif icon_name == "instagram":
+            draw.rounded_rectangle([ix0 + 1, iy0 + 1, ix1 - 1, iy1 - 1], radius=max(3, icon_sz // 4), outline=(244, 114, 182, fg_a), width=max(2, icon_sz // 7))
+            r_in = max(2, icon_sz // 5)
+            draw.ellipse([ix0 + icon_sz // 2 - r_in, cy - r_in, ix0 + icon_sz // 2 + r_in, cy + r_in], outline=(255, 255, 255, fg_a), width=max(1, icon_sz // 8))
+        else:  # x
+            w_line = max(2, icon_sz // 6)
+            draw.line([(ix0 + 2, iy0 + 2), (ix1 - 2, iy1 - 2)], fill=(255, 255, 255, fg_a), width=w_line)
+            draw.line([(ix1 - 2, iy0 + 2), (ix0 + 2, iy1 - 2)], fill=(255, 255, 255, fg_a), width=w_line)
+        cur_x = ix1 + icon_gap
+
+    draw.text((cur_x, cy), txt, font=font, fill=(248, 250, 252, fg_a), anchor="lm")
+    return Image.alpha_composite(base, overlay)
+
+
 def render_caption_frame(
     t: float,
     width: int,
@@ -650,6 +841,27 @@ def render_caption_frame(
     clean_filler_words: bool = False,
     highlight_power_words: bool = False,
     precomputed_chunks: Optional[List[Dict[str, Any]]] = None,
+    speakers: Optional[Dict[str, Any]] = None,
+    speaker_lower_thirds: bool = False,
+    face_safe_captions: bool = False,
+    face_keyframes: Optional[List[Dict[str, Any]]] = None,
+    callout_cards: Optional[List[Dict[str, Any]]] = None,
+    auto_callouts: bool = False,
+    precomputed_turns: Optional[List[Dict[str, Any]]] = None,
+    bilingual_enabled: bool = False,
+    secondary_language: str = "",
+    spectrum_enabled: bool = False,
+    spectrum_position: str = "bottom",
+    spectrum_color: str = "#C6F32F",
+    spectrum_data: Optional[Dict[str, Any]] = None,
+    chapters_enabled: bool = False,
+    chapters: Optional[List[Dict[str, Any]]] = None,
+    handle_watermark_enabled: bool = False,
+    handle_text: str = "",
+    handle_platform_icon: str = "none",
+    handle_corner: str = "bottom_right",
+    handle_opacity: float = 0.65,
+    handle_display_mode: str = "always",
 ) -> Image.Image:
     """
     Render a full-resolution transparent RGBA caption + retention/CTA overlay frame at clip-relative time `t`.
@@ -661,6 +873,19 @@ def render_caption_frame(
         dur_safe = max(0.5, float(clip_duration or 1.0))
         _draw_retention_bar(canvas, t / dur_safe, width, height, color_hex=retention_bar_color)
 
+    if spectrum_enabled and spectrum_data:
+        from app.services.beat_sync import draw_spectrum_visualizer, get_spectrum_bars_at_time
+        bars = get_spectrum_bars_at_time(spectrum_data, t)
+        if bars:
+            canvas = draw_spectrum_visualizer(
+                canvas,
+                bars=bars,
+                position=spectrum_position,
+                color_hex=spectrum_color,
+                width=width,
+                height=height,
+            )
+
     if outro_cta_enabled and clip_duration > 2.2 and t >= (clip_duration - 2.0):
         _draw_outro_cta_card(
             canvas, t, clip_duration, width, height,
@@ -668,11 +893,20 @@ def render_caption_frame(
             accent_hex=highlight_color or retention_bar_color or "#C6F32F",
         )
 
-    if not burn_captions:
-        return canvas
+    hook_visible_now = bool(burn_captions and hook_banner_enabled and hook_headline and 0.0 <= t <= 3.5)
 
-    if hook_banner_enabled and hook_headline and 0.0 <= t <= 3.5:
-        _draw_hook_banner(canvas, hook_headline, width, height)
+    if chapters_enabled and chapters:
+        from app.services.chapter_engine import draw_chapter_pill
+        canvas = draw_chapter_pill(
+            canvas,
+            chapters=chapters,
+            t=t,
+            width=width,
+            height=height,
+            accent_color=highlight_color or "#8B5CF6",
+            font_resolver=lambda px: resolve_pillow_font(font_family or "Montserrat", px, bold=True),
+            has_hook_banner=hook_visible_now,
+        )
 
     chunks = (
         precomputed_chunks
@@ -687,6 +921,55 @@ def render_caption_frame(
             word_by_word=word_by_word,
         )
     )
+
+    if auto_callouts and callout_cards:
+        for card in callout_cards:
+            if isinstance(card, dict):
+                draw_callout_card(
+                    canvas,
+                    card,
+                    t=t,
+                    width=width,
+                    height=height,
+                    font_resolver=lambda fam, px, bold=True: resolve_pillow_font(fam, px, bold=bold),
+                    has_hook_banner=hook_visible_now,
+                )
+
+    if speaker_lower_thirds:
+        turns = precomputed_turns
+        if turns is None:
+            flat_rel_words = [w for ch in chunks for w in (ch.get("words") or [])]
+            turns = detect_speaker_lower_third_turns(flat_rel_words, speakers)
+        for trn in turns:
+            draw_speaker_lower_third(
+                canvas,
+                trn,
+                t=t,
+                width=width,
+                height=height,
+                font_resolver=lambda fam, px, bold=True: resolve_pillow_font(fam, px, bold=bold),
+                has_hook_banner=hook_visible_now,
+            )
+
+    if handle_watermark_enabled and str(handle_text or "").strip():
+        canvas = _draw_creator_handle_watermark(
+            canvas,
+            t=t,
+            width=width,
+            height=height,
+            handle_text=handle_text,
+            platform_icon=handle_platform_icon,
+            corner=handle_corner,
+            opacity=handle_opacity,
+            display_mode=handle_display_mode,
+            font_resolver=lambda px: resolve_pillow_font(font_family or "Montserrat", px, bold=True),
+        )
+
+    if not burn_captions:
+        return canvas
+
+    if hook_visible_now:
+        _draw_hook_banner(canvas, hook_headline, width, height)
 
     active_chunk: Optional[Dict[str, Any]] = None
     for ch in chunks:
@@ -854,11 +1137,42 @@ def render_caption_frame(
     ]
     max_block_w = max(line_widths) if line_widths else 0.0
 
+    sec_line_txt = ""
+    sec_font = None
+    sec_w = 0.0
+    sec_h = 0.0
+    sec_gap = max(6.0, 10.0 * scale)
+    if bilingual_enabled:
+        for cw in cwords:
+            ph = str(cw.get("translated_phrase") or "").strip()
+            if ph:
+                sec_line_txt = ph
+                break
+        if not sec_line_txt:
+            toks_sec = [str(cw.get("translated_text") or "").strip() for cw in cwords if str(cw.get("translated_text") or "").strip()]
+            sec_line_txt = " ".join(toks_sec).strip()
+        if sec_line_txt:
+            sec_px = max(16, int(round(font_px * 0.68)))
+            sec_font = _resolve_bilingual_font(sec_px, sec_line_txt)
+            sbb = dummy_draw.textbbox((0, 0), sec_line_txt, font=sec_font)
+            sec_w = float(sbb[2] - sbb[0])
+            sec_h = float(sbb[3] - sbb[1])
+            total_h += sec_gap + sec_h + 10.0 * scale
+
     anchor_x = (cfg["pos_x"] / 100.0) * width
     anchor_y = (cfg["pos_y"] / 100.0) * height
 
-    # Keep block cleanly inside frame margins
+    # Keep block cleanly inside frame margins & optionally avoid detected faces
     margin_pad = max(16.0, 24.0 * scale)
+    if face_safe_captions and face_keyframes:
+        anchor_y = _compute_face_safe_anchor_y(
+            t=t,
+            default_anchor_y=anchor_y,
+            total_h=total_h,
+            margin_pad=margin_pad,
+            height=height,
+            face_keyframes=face_keyframes,
+        )
     start_y = max(margin_pad, min(height - total_h - margin_pad, anchor_y - total_h / 2.0))
 
     stroke_px = max(0, int(round(cfg["outline"] * scale)))
@@ -866,7 +1180,12 @@ def render_caption_frame(
     spacing_px = cfg["letter_spacing"] * scale
 
     inactive_rgba = _parse_rgba(cfg["base_color"], alpha_float=cfg["hold_back_opacity"])
-    active_rgba = _parse_rgba(cfg["highlight_color"], alpha_float=1.0)
+    active_hex = cfg["highlight_color"]
+    if speakers and 0 <= active_word_idx < len(cwords):
+        w_sid = str(cwords[active_word_idx].get("speaker_id") or "").strip()
+        if w_sid and w_sid in speakers and speakers[w_sid].get("color"):
+            active_hex = str(speakers[w_sid]["color"])
+    active_rgba = _parse_rgba(active_hex, alpha_float=1.0)
     outline_rgba = _parse_rgba(cfg["outline_color"], alpha_float=1.0)
     shadow_rgba = (0, 0, 0, 185)
 
@@ -914,7 +1233,7 @@ def render_caption_frame(
         pad_y = max(5, int(round(7 * scale)))
         for tok_i, tx, ty, tw, th in token_positions:
             if tok_i == active_word_idx:
-                pill_fill = _parse_rgba(cfg["highlight_color"], alpha_float=0.95)
+                pill_fill = (active_rgba[0], active_rgba[1], active_rgba[2], 242)
                 bg_draw.rounded_rectangle(
                     [tx - pad_x, ty - pad_y, tx + tw + pad_x, ty + th + pad_y],
                     radius=max(8, int(round(12 * scale))),
@@ -1025,6 +1344,20 @@ def render_caption_frame(
             stroke_fill=outline_rgba if tok_stroke > 0 else None,
         )
 
+    if bilingual_enabled and sec_line_txt and sec_font is not None:
+        sec_y = cy + sec_gap * 0.45
+        sx = max(margin_pad, min(width - sec_w - margin_pad, anchor_x - sec_w / 2.0))
+        pad_bx = max(10.0, 12.0 * scale)
+        pad_by = max(4.0, 6.0 * scale)
+        fg_draw.rounded_rectangle(
+            [sx - pad_bx, sec_y - pad_by, sx + sec_w + pad_bx, sec_y + sec_h + pad_by],
+            radius=max(6, int(round(10 * scale))),
+            fill=(12, 13, 18, 210),
+            outline=(active_rgba[0], active_rgba[1], active_rgba[2], 140),
+            width=max(1, int(round(1.5 * scale))),
+        )
+        fg_draw.text((sx, sec_y), sec_line_txt, font=sec_font, fill=(248, 250, 252, 250))
+
     canvas = Image.alpha_composite(canvas, fg_layer)
     return canvas
 
@@ -1047,6 +1380,26 @@ def build_caption_ffconcat(
     retention_bar_color: str = "#C6F32F",
     outro_cta_enabled: bool = False,
     outro_cta_text: str = "Subscribe for More",
+    speakers: Optional[Dict[str, Any]] = None,
+    speaker_lower_thirds: bool = False,
+    face_safe_captions: bool = False,
+    face_keyframes: Optional[List[Dict[str, Any]]] = None,
+    callout_cards: Optional[List[Dict[str, Any]]] = None,
+    auto_callouts: bool = False,
+    bilingual_enabled: bool = False,
+    secondary_language: str = "",
+    spectrum_enabled: bool = False,
+    spectrum_position: str = "bottom",
+    spectrum_color: str = "#C6F32F",
+    spectrum_data: Optional[Dict[str, Any]] = None,
+    chapters_enabled: bool = False,
+    chapters: Optional[List[Dict[str, Any]]] = None,
+    handle_watermark_enabled: bool = False,
+    handle_text: str = "",
+    handle_platform_icon: str = "none",
+    handle_corner: str = "bottom_right",
+    handle_opacity: float = 0.65,
+    handle_display_mode: str = "always",
     **style_kwargs: Any,
 ) -> Tuple[Path, Path, int]:
     """
@@ -1071,9 +1424,16 @@ def build_caption_ffconcat(
             clean_filler_words=clean_filler_words,
             word_by_word=word_by_word,
         )
-        if burn_captions
+        if (burn_captions or speaker_lower_thirds)
         else []
     )
+
+    turns = (
+        detect_speaker_lower_third_turns([w for ch in chunks for w in (ch.get("words") or [])], speakers)
+        if speaker_lower_thirds
+        else []
+    )
+    active_cards = [c for c in (callout_cards or []) if isinstance(c, dict) and c.get("enabled", True)] if auto_callouts else []
 
     breakpoints = {0.0, round(dur_total, 3)}
     if burn_captions and hook_banner_enabled and hook_headline.strip():
@@ -1090,12 +1450,58 @@ def build_caption_ffconcat(
         breakpoints.add(round(dur_total - 1.78, 3))
         breakpoints.add(round(dur_total - 1.60, 3))
 
-    for ch in chunks:
-        breakpoints.add(max(0.0, min(dur_total, round(ch["start"], 3))))
-        breakpoints.add(max(0.0, min(dur_total, round(ch["end"], 3))))
-        for w in ch["words"]:
-            breakpoints.add(max(0.0, min(dur_total, round(w["start"], 3))))
-            breakpoints.add(max(0.0, min(dur_total, round(w["end"], 3))))
+    if face_safe_captions and face_keyframes:
+        fk_step = 0.5
+        cur_ft = fk_step
+        while cur_ft < dur_total:
+            breakpoints.add(round(cur_ft, 3))
+            cur_ft += fk_step
+
+    for trn in turns:
+        breakpoints.add(max(0.0, min(dur_total, round(float(trn["start"]), 3))))
+        breakpoints.add(max(0.0, min(dur_total, round(float(trn["end"]), 3))))
+
+    for card in active_cards:
+        cs = float(card.get("start", 0.0))
+        ce = float(card.get("end", cs + 2.0))
+        for off in (0.0, 0.07, 0.14):
+            breakpoints.add(max(0.0, min(dur_total, round(cs + off, 3))))
+        breakpoints.add(max(0.0, min(dur_total, round(ce, 3))))
+
+    active_chapters = chapters if (chapters_enabled and chapters) else []
+    for ch_item in active_chapters:
+        cs = float(ch_item.get("start", 0.0))
+        ce = float(ch_item.get("end", dur_total))
+        for off in (0.0, 0.08, 0.16, 0.25):
+            breakpoints.add(max(0.0, min(dur_total, round(cs + off, 3))))
+        breakpoints.add(max(0.0, min(dur_total, round(ce, 3))))
+
+    spec_frames = (spectrum_data or {}).get("spectrum_frames") or [] if spectrum_enabled else []
+    spec_fps = int((spectrum_data or {}).get("spectrum_fps") or 10)
+    if spectrum_enabled and spec_frames:
+        step_s = 1.0 / float(max(2, min(10, spec_fps)))
+        cur_st = 0.0
+        while cur_st < dur_total:
+            breakpoints.add(round(cur_st, 3))
+            cur_st += step_s
+
+    handle_active = bool(handle_watermark_enabled and str(handle_text or "").strip())
+    if handle_active and str(handle_display_mode or "always").strip().lower() in {"pulse", "pulse_12s", "periodic_pulse", "periodic"}:
+        cyc = 0.0
+        while cyc < dur_total:
+            for off in (0.0, 0.14, 0.28, 0.40, 3.20, 3.40, 3.62):
+                pt = round(cyc + off, 3)
+                if 0.0 <= pt <= dur_total:
+                    breakpoints.add(pt)
+            cyc += 12.0
+
+    if burn_captions:
+        for ch in chunks:
+            breakpoints.add(max(0.0, min(dur_total, round(ch["start"], 3))))
+            breakpoints.add(max(0.0, min(dur_total, round(ch["end"], 3))))
+            for w in ch["words"]:
+                breakpoints.add(max(0.0, min(dur_total, round(w["start"], 3))))
+                breakpoints.add(max(0.0, min(dur_total, round(w["end"], 3))))
 
     sorted_pts = sorted(breakpoints)
     # Deduplicate points closer than 20ms while keeping endpoints
@@ -1108,7 +1514,7 @@ def build_caption_ffconcat(
     elif len(clean_pts) == 1:
         clean_pts.append(round(dur_total, 3))
 
-    state_to_filename: Dict[Tuple[int, int, bool, int, int], str] = {}
+    state_to_filename: Dict[Tuple[Any, ...], str] = {}
     ff_lines: List[str] = ["ffconcat version 1.0"]
     last_file = "blank.png"
     frame_counter = 0
@@ -1127,6 +1533,42 @@ def build_caption_ffconcat(
         if outro_cta_enabled and dur_total > 2.2 and mid_t >= (dur_total - 2.0):
             cta_bucket = min(3, int((mid_t - (dur_total - 2.0)) / 0.12))
 
+        turn_idx = -1
+        for ti, trn in enumerate(turns):
+            if trn["start"] <= mid_t <= trn["end"]:
+                turn_idx = ti
+                break
+
+        callout_state: Tuple[Tuple[int, int], ...] = tuple(
+            (ci, min(3, int(max(0.0, mid_t - float(c.get("start", 0.0))) / 0.06)))
+            for ci, c in enumerate(active_cards)
+            if float(c.get("start", 0.0)) <= mid_t <= float(c.get("end", 0.0))
+        )
+
+        face_bucket = -1
+        if burn_captions and face_safe_captions and face_keyframes:
+            closest_kf = min(face_keyframes, key=lambda kf: abs(float(kf.get("t", 0.0)) - mid_t))
+            face_bucket = int(round(float(closest_kf.get("cy", 0.4)) * 20))
+
+        chap_idx = -1
+        chap_ease = 0
+        for chi, ch_item in enumerate(active_chapters):
+            cs = float(ch_item.get("start", 0.0))
+            ce = float(ch_item.get("end", dur_total))
+            if cs <= mid_t < ce or (chi == len(active_chapters) - 1 and mid_t >= cs):
+                chap_idx = chi
+                chap_ease = min(3, int(max(0.0, mid_t - cs) / 0.07))
+                break
+
+        spec_bucket = -1
+        if spectrum_enabled and spec_frames:
+            spec_bucket = min(len(spec_frames) - 1, max(0, int(round(mid_t * spec_fps))))
+
+        handle_bucket = -1
+        if handle_active:
+            vis_h = _compute_handle_pulse_visibility(mid_t, handle_display_mode)
+            handle_bucket = int(round(vis_h * 10)) if vis_h > 0.02 else -1
+
         ch_idx = -1
         word_idx = -1
         if burn_captions:
@@ -1141,10 +1583,23 @@ def build_caption_ffconcat(
                             word_idx = wi
                     break
 
-        if ch_idx == -1 and not hook_vis and bar_bucket == -1 and cta_bucket == -1:
+        if (
+            ch_idx == -1
+            and not hook_vis
+            and bar_bucket == -1
+            and cta_bucket == -1
+            and turn_idx == -1
+            and not callout_state
+            and chap_idx == -1
+            and spec_bucket == -1
+            and handle_bucket == -1
+        ):
             fname = "blank.png"
         else:
-            state_key = (ch_idx, word_idx, hook_vis, bar_bucket, cta_bucket)
+            state_key = (
+                ch_idx, word_idx, hook_vis, bar_bucket, cta_bucket,
+                turn_idx, callout_state, face_bucket, chap_idx, chap_ease, spec_bucket, handle_bucket
+            )
             fname = state_to_filename.get(state_key, "")
             if not fname:
                 frame_counter += 1
@@ -1168,7 +1623,28 @@ def build_caption_ffconcat(
                     timing_offset=timing_offset,
                     clean_filler_words=clean_filler_words,
                     word_by_word=word_by_word,
-                    precomputed_chunks=chunks,
+                    precomputed_chunks=chunks if burn_captions else [],
+                    speakers=speakers,
+                    speaker_lower_thirds=speaker_lower_thirds,
+                    face_safe_captions=face_safe_captions,
+                    face_keyframes=face_keyframes,
+                    callout_cards=callout_cards,
+                    auto_callouts=auto_callouts,
+                    precomputed_turns=turns,
+                    bilingual_enabled=bilingual_enabled,
+                    secondary_language=secondary_language,
+                    spectrum_enabled=spectrum_enabled,
+                    spectrum_position=spectrum_position,
+                    spectrum_color=spectrum_color,
+                    spectrum_data=spectrum_data,
+                    chapters_enabled=chapters_enabled,
+                    chapters=chapters,
+                    handle_watermark_enabled=handle_watermark_enabled,
+                    handle_text=handle_text,
+                    handle_platform_icon=handle_platform_icon,
+                    handle_corner=handle_corner,
+                    handle_opacity=handle_opacity,
+                    handle_display_mode=handle_display_mode,
                     **style_kwargs,
                 )
                 img.save(temp_dir / fname, format="PNG")

@@ -670,6 +670,7 @@ def track_faces_in_clip(
                 "t": rel_t,
                 "cx": round(prev_single[0], 4),
                 "cy": round(prev_single[1], 4),
+                "face_h": round(float(primary.get("h", 0.26)) if primary else 0.26, 4),
                 "s1_cx": round(prev_s1[0], 4),
                 "s1_cy": round(prev_s1[1], 4),
                 "s2_cx": round(prev_s2[0], 4),
@@ -684,7 +685,7 @@ def track_faces_in_clip(
     cap.release()
 
     if not keyframes:
-        keyframes = [{"t": 0.0, "cx": 0.5, "cy": 0.4, "s1_cx": 0.3, "s1_cy": 0.4, "s2_cx": 0.7, "s2_cy": 0.4}]
+        keyframes = [{"t": 0.0, "cx": 0.5, "cy": 0.4, "face_h": 0.26, "s1_cx": 0.3, "s1_cy": 0.4, "s2_cx": 0.7, "s2_cy": 0.4}]
 
     detected_corner = max(set(corner_votes), key=corner_votes.count) if corner_votes else "top_left"
 

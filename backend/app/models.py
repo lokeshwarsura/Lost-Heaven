@@ -194,10 +194,40 @@ class ViralClip(SQLModel, table=True):
     outro_cta_enabled: bool = SQLField(default=False)
     outro_cta_text: str = SQLField(default="Subscribe for More")
     broll_json: str = SQLField(default="[]")
+    speakers_json: str = SQLField(default="{}")
+    speaker_lower_thirds: bool = SQLField(default=False)
+    face_safe_captions: bool = SQLField(default=True)
+    callout_cards_json: str = SQLField(default="[]")
+    auto_callouts: bool = SQLField(default=False)
+    bilingual_enabled: bool = SQLField(default=False)
+    secondary_language: str = SQLField(default="")
+    dubbing_enabled: bool = SQLField(default=False)
+    dubbing_language: str = SQLField(default="Spanish")
+    dubbing_voice: str = SQLField(default="default")
+    dubbing_bed_volume: float = SQLField(default=0.15)
+    dubbed_audio_path: Optional[str] = SQLField(default=None)
+    backdrop_mode: str = SQLField(default="none")
+    backdrop_blur_intensity: float = SQLField(default=18.0)
+    backdrop_color: str = SQLField(default="#18181B")
+    privacy_blur_json: str = SQLField(default="[]")
+    beat_sync_enabled: bool = SQLField(default=False)
+    spectrum_enabled: bool = SQLField(default=False)
+    spectrum_position: str = SQLField(default="bottom")
+    spectrum_color: str = SQLField(default="#C6F32F")
+    chapters_json: str = SQLField(default="[]")
+    chapters_enabled: bool = SQLField(default=False)
+    handle_watermark_enabled: bool = SQLField(default=False)
+    handle_text: str = SQLField(default="")
+    handle_platform_icon: str = SQLField(default="none")
+    handle_corner: str = SQLField(default="bottom_right")
+    handle_opacity: float = SQLField(default=0.65)
+    handle_display_mode: str = SQLField(default="always")
     hardware_mode: str = SQLField(default="gpu") # gpu or cpu
 
-    # Word-level transcript JSON
+    # Word-level transcript JSON & Multi-Segment Blade Cuts
     transcript_json: Optional[str] = SQLField(default="[]")
+    keep_segments_json: str = SQLField(default="[]")
+    merge_crossfade_sec: float = SQLField(default=0.03)
 
     # Publishing metadata
     youtube_titles: str = SQLField(default="[]") # JSON list of 3 titles
@@ -239,6 +269,78 @@ class ViralClip(SQLModel, table=True):
 
     def set_transcript(self, words: List[Dict[str, Any]]):
         self.transcript_json = json.dumps(words)
+
+    def get_keep_segments(self) -> List[List[float]]:
+        """Return [[start, end], ...] kept intervals in master-video seconds."""
+        try:
+            segs = json.loads(self.keep_segments_json or "[]")
+            cleaned: List[List[float]] = []
+            if isinstance(segs, list):
+                for item in segs:
+                    if isinstance(item, (list, tuple)) and len(item) >= 2:
+                        s, e = float(item[0]), float(item[1])
+                        if e > s + 0.05:
+                            cleaned.append([round(max(0.0, s), 3), round(e, 3)])
+            if cleaned:
+                return cleaned
+        except Exception:
+            pass
+        return [[round(max(0.0, float(self.start_time)), 3), round(max(float(self.start_time) + 0.2, float(self.end_time)), 3)]]
+
+    def set_keep_segments(self, segs: List[List[float]]):
+        """Persist non-empty kept segments and keep start_time, end_time, and duration in sync."""
+        cleaned: List[List[float]] = []
+        for item in segs or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                s, e = max(0.0, float(item[0])), max(0.0, float(item[1]))
+                if e > s + 0.1:
+                    cleaned.append([round(s, 3), round(e, 3)])
+        if not cleaned:
+            cleaned = [[round(max(0.0, float(self.start_time)), 3), round(max(float(self.start_time) + 0.5, float(self.end_time)), 3)]]
+        self.keep_segments_json = json.dumps(cleaned)
+        self.start_time = min(pair[0] for pair in cleaned)
+        self.end_time = max(pair[1] for pair in cleaned)
+        self.duration = round(sum(pair[1] - pair[0] for pair in cleaned), 2)
+
+    def get_speakers(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(self.speakers_json or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def set_speakers(self, speakers: Dict[str, Any]):
+        self.speakers_json = json.dumps(speakers if isinstance(speakers, dict) else {})
+
+    def get_callout_cards(self) -> List[Dict[str, Any]]:
+        try:
+            data = json.loads(self.callout_cards_json or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def set_callout_cards(self, cards: List[Dict[str, Any]]):
+        self.callout_cards_json = json.dumps(cards if isinstance(cards, list) else [])
+
+    def get_privacy_blur_boxes(self) -> List[Dict[str, Any]]:
+        try:
+            data = json.loads(self.privacy_blur_json or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def set_privacy_blur_boxes(self, boxes: List[Dict[str, Any]]):
+        self.privacy_blur_json = json.dumps(boxes[:3] if isinstance(boxes, list) else [])
+
+    def get_chapters(self) -> List[Dict[str, Any]]:
+        try:
+            data = json.loads(self.chapters_json or "[]")
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def set_chapters(self, chapters: List[Dict[str, Any]]):
+        self.chapters_json = json.dumps(chapters[:8] if isinstance(chapters, list) else [])
 
 
 # -------------------------------------------------------------
@@ -379,6 +481,31 @@ class PreviewFrameRequest(BaseModel):
     outro_cta_enabled: bool = False
     outro_cta_text: str = "Subscribe for More"
     words: Optional[List[Dict[str, Any]]] = None
+    keep_segments: Optional[List[List[float]]] = None
+    merge_crossfade_sec: Optional[float] = None
+    speakers: Optional[Dict[str, Any]] = None
+    speaker_lower_thirds: bool = False
+    face_safe_captions: bool = True
+    callout_cards: Optional[List[Dict[str, Any]]] = None
+    auto_callouts: bool = False
+    bilingual_enabled: bool = False
+    secondary_language: str = ""
+    backdrop_mode: str = "none"
+    backdrop_blur_intensity: float = 18.0
+    backdrop_color: str = "#18181B"
+    privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None
+    beat_sync_enabled: bool = False
+    spectrum_enabled: bool = False
+    spectrum_position: str = "bottom"
+    spectrum_color: str = "#C6F32F"
+    chapters_enabled: bool = False
+    chapters: Optional[List[Dict[str, Any]]] = None
+    handle_watermark_enabled: bool = False
+    handle_text: str = ""
+    handle_platform_icon: str = "none"
+    handle_corner: str = "bottom_right"
+    handle_opacity: float = 0.65
+    handle_display_mode: str = "always"
 
 
 class PreviewFrameResponse(BaseModel):
@@ -494,6 +621,34 @@ class UpdateClipRequest(BaseModel):
     outro_cta_enabled: Optional[bool] = None
     outro_cta_text: Optional[str] = None
     broll_segments: Optional[List[Dict[str, Any]]] = None
+    speakers: Optional[Dict[str, Any]] = None
+    speaker_lower_thirds: Optional[bool] = None
+    face_safe_captions: Optional[bool] = None
+    callout_cards: Optional[List[Dict[str, Any]]] = None
+    auto_callouts: Optional[bool] = None
+    bilingual_enabled: Optional[bool] = None
+    secondary_language: Optional[str] = None
+    dubbing_enabled: Optional[bool] = None
+    dubbing_language: Optional[str] = None
+    dubbing_voice: Optional[str] = None
+    dubbing_bed_volume: Optional[float] = None
+    dubbed_audio_path: Optional[str] = None
+    backdrop_mode: Optional[str] = None
+    backdrop_blur_intensity: Optional[float] = None
+    backdrop_color: Optional[str] = None
+    privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None
+    beat_sync_enabled: Optional[bool] = None
+    spectrum_enabled: Optional[bool] = None
+    spectrum_position: Optional[str] = None
+    spectrum_color: Optional[str] = None
+    chapters_enabled: Optional[bool] = None
+    chapters: Optional[List[Dict[str, Any]]] = None
+    handle_watermark_enabled: Optional[bool] = None
+    handle_text: Optional[str] = None
+    handle_platform_icon: Optional[str] = None
+    handle_corner: Optional[str] = None
+    handle_opacity: Optional[float] = None
+    handle_display_mode: Optional[str] = None
     hardware_mode: Optional[str] = None
 
     # Publishing metadata & transcript
@@ -503,6 +658,52 @@ class UpdateClipRequest(BaseModel):
     pinned_comment: Optional[str] = None
     privacy_status: Optional[str] = None
     transcript_words: Optional[List[Dict[str, Any]]] = None
+    keep_segments: Optional[List[List[float]]] = None
+    merge_crossfade_sec: Optional[float] = None
+
+
+class DiarizeClipRequest(BaseModel):
+    num_speakers: int = 0
+
+
+class UpdateSpeakersRequest(BaseModel):
+    speakers: Dict[str, Any]
+    transcript_words: Optional[List[Dict[str, Any]]] = None
+
+
+class ExtractCalloutsRequest(BaseModel):
+    max_cards: int = 3
+
+
+class TranslateClipRequest(BaseModel):
+    target_language: str = "Spanish"
+
+
+class DubClipRequest(BaseModel):
+    target_language: str = "Spanish"
+    voice: str = "default"
+    original_bed_volume: float = 0.15
+
+
+class CompileTrailerRequest(BaseModel):
+    title: Optional[str] = None
+    max_moments: int = 4
+    target_duration_sec: float = 32.0
+
+
+class GenerateThumbnailRequest(BaseModel):
+    timestamp: Optional[float] = None
+    headline: str = ""
+    format: str = "9:16"
+    depth_layer: bool = True
+    accent_color: str = "#C6F32F"
+    rim_glow: bool = True
+    badge_text: str = ""
+
+
+class GenerateChaptersRequest(BaseModel):
+    max_chapters: int = 4
+    enable: bool = True
 
 
 class UpdateClipMetadataRequest(BaseModel):
@@ -520,6 +721,18 @@ class RenderClipRequest(BaseModel):
 class TrimClipRequest(BaseModel):
     start_time: float
     end_time: float
+
+
+class UpdateSegmentsRequest(BaseModel):
+    keep_segments: List[List[float]]
+    crossfade_sec: Optional[float] = None
+
+
+class MergeClipsRequest(BaseModel):
+    clip_ids: List[int]
+    smooth_transition: bool = True
+    transition_duration: float = 0.35
+    title: Optional[str] = None
 
 
 class CreateBrandPresetRequest(BaseModel):
@@ -596,3 +809,29 @@ class ProvideKeyRequest(BaseModel):
 
 class RetryProjectRequest(BaseModel):
     force_offline: Optional[bool] = False
+
+
+class ImportAnalyticsCsvRequest(BaseModel):
+    csv_text: str
+
+
+class ExportEvent(SQLModel, table=True):
+    __tablename__ = "export_events"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    project_id: Optional[int] = SQLField(default=None, index=True)
+    clip_id: Optional[int] = SQLField(default=None, index=True)
+    event_type: str = SQLField(default="mp4_export")
+    aspect_ratio: str = SQLField(default="9:16")
+    caption_style: str = SQLField(default="Karaoke pop")
+    frame_layout: str = SQLField(default="auto_track")
+    duration_sec: float = SQLField(default=30.0)
+    hook_score: int = SQLField(default=0)
+    has_hook_banner: bool = SQLField(default=False)
+    beat_sync_enabled: bool = SQLField(default=False)
+    bilingual_enabled: bool = SQLField(default=False)
+    title: str = SQLField(default="")
+    views: int = SQLField(default=0)
+    retention_pct: float = SQLField(default=0.0)
+    ctr_pct: float = SQLField(default=0.0)
+    created_at: datetime = SQLField(default_factory=lambda: datetime.now(timezone.utc))

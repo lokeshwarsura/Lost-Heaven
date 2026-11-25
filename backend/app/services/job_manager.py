@@ -1041,6 +1041,13 @@ class JobManager:
 
             words_loaded_note = f"Loaded {len(transcript_words):,} cached words from transcript.json. " if transcript_words else ""
 
+            formula_weights = None
+            try:
+                from app.services.analytics_ledger import compute_top_performing_formula
+                formula_weights = compute_top_performing_formula(session)
+            except Exception:
+                formula_weights = None
+
             if not gemini_boost_enabled or ai_provider == "offline":
                 self.update_progress(
                     project_id, 70, "gemini", "Offline Viral Detection",
@@ -1053,7 +1060,8 @@ class JobManager:
                     duration_sec=duration or 120.0,
                     duration_preset=project.duration_preset or "Auto",
                     clip_count=project.clip_count or 5,
-                    topic_focus=project.topic_focus
+                    topic_focus=project.topic_focus,
+                    formula_weights=formula_weights,
                 )
                 self.update_progress(
                     project_id, 88, "gemini", "Offline blueprints extracted",
@@ -1090,7 +1098,8 @@ class JobManager:
                         duration_sec=duration or 120.0,
                         duration_preset=project.duration_preset or "Auto",
                         clip_count=project.clip_count or 5,
-                        topic_focus=project.topic_focus
+                        topic_focus=project.topic_focus,
+                        formula_weights=formula_weights,
                     )
                     for c in raw_clips:
                         c["analysis_source"] = "offline_fallback"
@@ -1128,7 +1137,8 @@ class JobManager:
                         transcript_words=transcript_words,
                         gemini_analysis_mode=gemini_analysis_mode,
                         preferred_model=gemini_model,
-                        on_log=on_gemini_log
+                        on_log=on_gemini_log,
+                        formula_weights=formula_weights,
                     )
                 except GeminiAuthError as ae:
                     logger.warning(f"Project {project_id} paused due to Gemini auth error: {ae.message}")
@@ -1151,7 +1161,8 @@ class JobManager:
                             duration_sec=duration or 120.0,
                             duration_preset=project.duration_preset or "Auto",
                             clip_count=project.clip_count or 5,
-                            topic_focus=project.topic_focus
+                            topic_focus=project.topic_focus,
+                            formula_weights=formula_weights,
                         )
                         for c in raw_clips:
                             c["analysis_source"] = "offline_fallback"
@@ -1380,6 +1391,34 @@ class JobManager:
                             "show_hook_banner": c_row.show_hook_banner,
                             "cold_open_quote": c_row.cold_open_quote,
                             "use_cold_open": c_row.use_cold_open,
+                            "keep_segments": c_row.get_keep_segments(),
+                            "merge_crossfade_sec": float(getattr(c_row, "merge_crossfade_sec", 0.03) or 0.03),
+                            "speakers": c_row.get_speakers(),
+                            "speaker_lower_thirds": bool(getattr(c_row, "speaker_lower_thirds", False)),
+                            "face_safe_captions": bool(getattr(c_row, "face_safe_captions", True)),
+                            "callout_cards": c_row.get_callout_cards(),
+                            "auto_callouts": bool(getattr(c_row, "auto_callouts", False)),
+                            "bilingual_enabled": bool(getattr(c_row, "bilingual_enabled", False)),
+                            "secondary_language": str(getattr(c_row, "secondary_language", "") or ""),
+                            "dubbing_enabled": bool(getattr(c_row, "dubbing_enabled", False)),
+                            "dubbed_audio_path": getattr(c_row, "dubbed_audio_path", None),
+                            "dubbing_bed_volume": float(getattr(c_row, "dubbing_bed_volume", 0.15) or 0.15),
+                            "backdrop_mode": getattr(c_row, "backdrop_mode", "none") or "none",
+                            "backdrop_blur_intensity": float(getattr(c_row, "backdrop_blur_intensity", 18.0) or 18.0),
+                            "backdrop_color": getattr(c_row, "backdrop_color", "#18181B") or "#18181B",
+                            "privacy_blur_boxes": c_row.get_privacy_blur_boxes(),
+                            "beat_sync_enabled": bool(getattr(c_row, "beat_sync_enabled", False)),
+                            "spectrum_enabled": bool(getattr(c_row, "spectrum_enabled", False)),
+                            "spectrum_position": str(getattr(c_row, "spectrum_position", "bottom") or "bottom"),
+                            "spectrum_color": str(getattr(c_row, "spectrum_color", "#C6F32F") or "#C6F32F"),
+                            "chapters_enabled": bool(getattr(c_row, "chapters_enabled", False)),
+                            "chapters": c_row.get_chapters(),
+                            "handle_watermark_enabled": bool(getattr(c_row, "handle_watermark_enabled", False)),
+                            "handle_text": str(getattr(c_row, "handle_text", "") or ""),
+                            "handle_platform_icon": str(getattr(c_row, "handle_platform_icon", "none") or "none"),
+                            "handle_corner": str(getattr(c_row, "handle_corner", "bottom_right") or "bottom_right"),
+                            "handle_opacity": float(getattr(c_row, "handle_opacity", 0.65) or 0.65),
+                            "handle_display_mode": str(getattr(c_row, "handle_display_mode", "always") or "always"),
                         }
 
                     pct = 90 + int(9 * (clip_idx - 1) / max(1, total_to_render))

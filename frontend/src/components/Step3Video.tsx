@@ -21,6 +21,32 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   const [metadataSaved, setMetadataSaved] = useState(false);
   const [loadingBroll, setLoadingBroll] = useState(false);
   const [brollNotice, setBrollNotice] = useState<string | null>(null);
+  const [loadingCallouts, setLoadingCallouts] = useState(false);
+  const [calloutNotice, setCalloutNotice] = useState<string | null>(null);
+  const [dubLang, setDubLang] = useState<string>('Spanish');
+  const [dubVoice, setDubVoice] = useState<string>('default');
+  const [isDubbing, setIsDubbing] = useState(false);
+  const [dubNotice, setDubNotice] = useState<string | null>(null);
+
+  const handleExtractCallouts = async () => {
+    if (!clip) return;
+    try {
+      setLoadingCallouts(true);
+      setCalloutNotice(null);
+      const res = await api.extractCalloutCards(clip.project_id, clip.id, 3);
+      const cards = res?.callout_cards || [];
+      onUpdateClip({ callout_cards: cards, auto_callouts: true });
+      setCalloutNotice(
+        cards.length > 0
+          ? `Extracted ${cards.length} stat callout card${cards.length === 1 ? '' : 's'}.`
+          : 'No numbers, percentages, or currency stats found.'
+      );
+    } catch {
+      setCalloutNotice('Failed to extract stat callout cards.');
+    } finally {
+      setLoadingCallouts(false);
+    }
+  };
 
   const handleSuggestBroll = async () => {
     if (!clip) return;
@@ -645,6 +671,159 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                 >
                   {clip.auto_sfx ? '✓ ' : ''}Auto Micro-SFX
                 </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateClip({ beat_sync_enabled: !(clip.beat_sync_enabled ?? false) })}
+                  className={`py-1.5 px-2.5 rounded-lg border text-[11px] font-medium text-left transition ${
+                    clip.beat_sync_enabled
+                      ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
+                >
+                  {clip.beat_sync_enabled ? '✓ ' : ''}Snap Zooms &amp; Cuts to Beat
+                </button>
+              </div>
+
+              {/* Live Audio Spectrum Visualizer */}
+              <div className="pt-2.5 border-t border-[var(--border-subtle)]/70 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-[11px] text-[var(--text-primary)]">
+                    Live Audio Spectrum Bar
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="color"
+                      value={clip.spectrum_color || '#C6F32F'}
+                      onChange={(e) => onUpdateClip({ spectrum_color: e.target.value })}
+                      className="w-6 h-5 rounded cursor-pointer border border-[var(--border-subtle)] bg-transparent p-0"
+                      title="Spectrum bar color"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => onUpdateClip({ spectrum_enabled: !(clip.spectrum_enabled ?? false) })}
+                      className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${
+                        clip.spectrum_enabled
+                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      {clip.spectrum_enabled ? '✓ Spectrum ON' : 'Spectrum OFF'}
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['bottom', 'top', 'center'] as const).map((pos) => (
+                    <button
+                      key={pos}
+                      type="button"
+                      onClick={() =>
+                        onUpdateClip({ spectrum_position: pos, spectrum_enabled: true })
+                      }
+                      className={`py-1 rounded border text-[10px] font-semibold capitalize transition ${
+                        (clip.spectrum_position || 'bottom') === pos
+                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      {pos}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* 1-Click Local AI Voice Dubbing */}
+              <div className="pt-2.5 border-t border-[var(--border-subtle)]/70 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-semibold text-[11px] text-[var(--text-primary)]">
+                    1-Click AI Voice Dubbing
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onUpdateClip({ dubbing_enabled: !(clip.dubbing_enabled ?? false) })}
+                    className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${
+                      clip.dubbing_enabled
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                    }`}
+                  >
+                    {clip.dubbing_enabled ? '✓ Dub ON' : 'Dub OFF'}
+                  </button>
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  <select
+                    value={clip.dubbing_language || dubLang}
+                    onChange={(e) => setDubLang(e.target.value)}
+                    aria-label="Dubbing target language"
+                    className="bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-lg px-2 py-1 text-[11px] text-[var(--text-primary)] outline-none"
+                  >
+                    {['Spanish', 'Hindi', 'Telugu', 'French', 'German', 'Portuguese', 'Japanese', 'Korean', 'Arabic', 'English'].map((lg) => (
+                      <option key={lg} value={lg}>{lg}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={clip.dubbing_voice || dubVoice}
+                    onChange={(e) => setDubVoice(e.target.value)}
+                    aria-label="Dubbing voice style"
+                    className="bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-lg px-2 py-1 text-[11px] text-[var(--text-primary)] outline-none"
+                  >
+                    <option value="default">Neutral Voice</option>
+                    <option value="female">Female Voice</option>
+                    <option value="male">Male Voice</option>
+                  </select>
+                  <button
+                    type="button"
+                    disabled={isDubbing}
+                    onClick={async () => {
+                      if (!clip) return;
+                      try {
+                        setIsDubbing(true);
+                        setDubNotice(null);
+                        const chosenLang = clip.dubbing_language && dubLang === 'Spanish' ? clip.dubbing_language : dubLang;
+                        const chosenVoice = clip.dubbing_voice && dubVoice === 'default' ? clip.dubbing_voice : dubVoice;
+                        const res = await api.dubClip(clip.project_id, clip.id, {
+                          target_language: chosenLang,
+                          voice: chosenVoice,
+                          original_bed_volume: clip.dubbing_bed_volume ?? 0.15,
+                        });
+                        onUpdateClip({
+                          dubbing_enabled: true,
+                          dubbing_language: chosenLang,
+                          dubbing_voice: chosenVoice,
+                          dubbed_audio_path: res.dubbed_audio_path,
+                          transcript_words: res.clip.transcript_words,
+                        });
+                        setDubNotice(`Dubbed via ${res.tts_backend} (${res.segment_count} lines)`);
+                      } catch (err: any) {
+                        setDubNotice(err?.message || 'Dubbing failed');
+                      } finally {
+                        setIsDubbing(false);
+                      }
+                    }}
+                    className="px-2 py-1 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold text-[10px] hover:opacity-90 transition disabled:opacity-50"
+                  >
+                    {isDubbing ? 'Dubbing...' : 'Generate Dub'}
+                  </button>
+                </div>
+                <div>
+                  <div className="flex justify-between text-[10px] text-[var(--text-secondary)] mb-0.5">
+                    <span>Original Audio Bed</span>
+                    <span className="font-mono text-[var(--accent-primary)]">
+                      {Math.round((clip.dubbing_bed_volume ?? 0.15) * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.0}
+                    max={0.6}
+                    step={0.05}
+                    value={clip.dubbing_bed_volume ?? 0.15}
+                    onChange={(e) => onUpdateClip({ dubbing_bed_volume: parseFloat(e.target.value) })}
+                    className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
+                  />
+                </div>
+                {dubNotice && (
+                  <div className="text-[10px] font-mono text-[var(--accent-primary)]">{dubNotice}</div>
+                )}
               </div>
             </div>
 
@@ -698,6 +877,117 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                   className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
                 />
               )}
+            </div>
+
+            {/* Anti-Reupload Animated Creator Handle Watermark */}
+            <div className="pt-3 border-t border-[var(--border-subtle)] space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-xs text-[var(--text-primary)] flex items-center gap-1.5">
+                  <Shield className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  Creator Handle Watermark
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextOn = !(clip.handle_watermark_enabled ?? false);
+                    onUpdateClip({
+                      handle_watermark_enabled: nextOn,
+                      ...(nextOn && !(clip.handle_text || '').trim() ? { handle_text: '@LostHeaven' } : {}),
+                    });
+                  }}
+                  className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${
+                    clip.handle_watermark_enabled
+                      ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
+                >
+                  {clip.handle_watermark_enabled ? '✓ Watermark ON' : 'Watermark OFF'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <input
+                  type="text"
+                  value={clip.handle_text || ''}
+                  onChange={(e) =>
+                    onUpdateClip({
+                      handle_text: e.target.value,
+                      ...(e.target.value.trim() && !clip.handle_watermark_enabled
+                        ? { handle_watermark_enabled: true }
+                        : {}),
+                    })
+                  }
+                  placeholder="@yourhandle"
+                  className="px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                />
+                <select
+                  aria-label="Creator Handle Corner"
+                  value={clip.handle_corner || 'bottom_right'}
+                  onChange={(e) => onUpdateClip({ handle_corner: e.target.value })}
+                  className="px-2 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] text-[var(--text-primary)] outline-none"
+                >
+                  <option value="bottom_right">Bottom Right</option>
+                  <option value="bottom_left">Bottom Left</option>
+                  <option value="top_right">Top Right</option>
+                  <option value="top_left">Top Left</option>
+                </select>
+              </div>
+
+              <div className="grid grid-cols-5 gap-1">
+                {(['none', 'youtube', 'tiktok', 'instagram', 'x'] as const).map((icon) => (
+                  <button
+                    key={icon}
+                    type="button"
+                    onClick={() => onUpdateClip({ handle_platform_icon: icon })}
+                    className={`py-1 rounded border text-[10px] font-semibold capitalize transition ${
+                      (clip.handle_platform_icon || 'none') === icon
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                    }`}
+                  >
+                    {icon === 'none' ? 'Plain' : icon === 'x' ? 'X' : icon}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex-1 min-w-[130px]">
+                  <div className="flex justify-between text-[10px] text-[var(--text-secondary)] mb-0.5">
+                    <span>Watermark Opacity</span>
+                    <span className="font-mono text-[var(--accent-primary)]">
+                      {Math.round((clip.handle_opacity ?? 0.65) * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.20}
+                    max={0.90}
+                    step={0.05}
+                    value={clip.handle_opacity ?? 0.65}
+                    onChange={(e) => onUpdateClip({ handle_opacity: parseFloat(e.target.value) })}
+                    className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
+                  />
+                </div>
+                <div className="flex items-center gap-1">
+                  {([
+                    { id: 'always', label: 'Always On' },
+                    { id: 'pulse_12s', label: 'Pulse 12s' },
+                  ] as const).map((mode) => (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      onClick={() => onUpdateClip({ handle_display_mode: mode.id })}
+                      className={`px-2 py-1 rounded border text-[10px] font-semibold transition ${
+                        (clip.handle_display_mode || 'always') === mode.id
+                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                      }`}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
 
             {/* Auto B-Roll Cutaways */}
@@ -773,6 +1063,200 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                 <p className="text-[10px] text-[var(--text-secondary)]">
                   Matches files in storage/broll/ or optional Pexels API key in Settings.
                 </p>
+              )}
+            </div>
+
+            {/* Smart Stat & Keyword Callout Pop-Up Cards */}
+            <div className="pt-3 border-t border-[var(--border-subtle)] space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-xs text-[var(--text-primary)] flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  Smart Callout Cards
+                </span>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => onUpdateClip({ auto_callouts: !(clip.auto_callouts ?? false) })}
+                    className={`px-2 py-1 rounded-lg border text-[10px] font-bold transition ${
+                      clip.auto_callouts
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                    }`}
+                  >
+                    {clip.auto_callouts ? '✓ Active' : 'Enable'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExtractCallouts}
+                    disabled={loadingCallouts}
+                    className="px-2.5 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-[11px] font-semibold text-[var(--text-primary)] transition disabled:opacity-50"
+                  >
+                    {loadingCallouts ? 'Extracting...' : 'Auto Callouts'}
+                  </button>
+                </div>
+              </div>
+              {calloutNotice && (
+                <div className="text-[10px] font-mono text-[var(--accent-primary)]">{calloutNotice}</div>
+              )}
+              {(clip.callout_cards || []).length > 0 && (
+                <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                  {(clip.callout_cards || []).map((card, idx) => (
+                    <div
+                      key={card.id || idx}
+                      className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px]"
+                    >
+                      <input
+                        type="text"
+                        value={card.badge}
+                        onChange={(e) => {
+                          const next = [...(clip.callout_cards || [])];
+                          next[idx] = { ...next[idx], badge: e.target.value };
+                          onUpdateClip({ callout_cards: next });
+                        }}
+                        className="w-20 bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded px-1.5 py-0.5 text-[10px] font-bold text-[var(--accent-primary)] outline-none"
+                      />
+                      <input
+                        type="text"
+                        value={card.title}
+                        onChange={(e) => {
+                          const next = [...(clip.callout_cards || [])];
+                          next[idx] = { ...next[idx], title: e.target.value };
+                          onUpdateClip({ callout_cards: next });
+                        }}
+                        className="flex-1 min-w-0 bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded px-1.5 py-0.5 text-[10px] text-[var(--text-primary)] outline-none"
+                      />
+                      <span className="font-mono text-[9px] text-[var(--text-secondary)] shrink-0 tabular-nums">
+                        {card.start.toFixed(1)}s
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const next = [...(clip.callout_cards || [])];
+                          next[idx] = { ...next[idx], enabled: !(next[idx].enabled ?? true) };
+                          onUpdateClip({ callout_cards: next });
+                        }}
+                        className={`px-1.5 py-0.5 rounded border text-[9px] font-bold shrink-0 ${
+                          (card.enabled ?? true)
+                            ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                            : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                        }`}
+                      >
+                        {(card.enabled ?? true) ? 'ON' : 'OFF'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Tracked Privacy / HUD / Watermark Blur Boxes (up to 3) */}
+            <div className="pt-3 border-t border-[var(--border-subtle)] space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-xs text-[var(--text-primary)] flex items-center gap-1.5">
+                  <Shield className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  Privacy / HUD Blur Boxes
+                </span>
+                <button
+                  type="button"
+                  disabled={(clip.privacy_blur_boxes || []).length >= 3}
+                  onClick={() => {
+                    const existing = clip.privacy_blur_boxes || [];
+                    if (existing.length >= 3) return;
+                    const offset = existing.length * 0.08;
+                    const nextBox = {
+                      id: `blur_${Date.now().toString(36)}`,
+                      x: Number((0.14 + offset).toFixed(2)),
+                      y: Number((0.18 + offset).toFixed(2)),
+                      w: 0.34,
+                      h: 0.14,
+                      mode: 'gaussian' as const,
+                      track_motion: true,
+                      intensity: 18,
+                    };
+                    onUpdateClip({ privacy_blur_boxes: [...existing, nextBox] });
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-[11px] font-semibold text-[var(--text-primary)] transition disabled:opacity-45"
+                >
+                  + Add Blur Box ({(clip.privacy_blur_boxes || []).length}/3)
+                </button>
+              </div>
+              {(clip.privacy_blur_boxes || []).length === 0 ? (
+                <p className="text-[10px] text-[var(--text-secondary)]">
+                  Hide usernames, stream HUDs, or license plates. Drag boxes directly on the preview frame.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {(clip.privacy_blur_boxes || []).map((box, bIdx) => (
+                    <div
+                      key={box.id || bIdx}
+                      className="p-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] space-y-1.5 text-[10px]"
+                    >
+                      <div className="flex items-center justify-between gap-1.5 flex-wrap">
+                        <span className="font-bold text-[var(--text-primary)] font-mono">
+                          Box #{bIdx + 1} ({Math.round(box.x * 100)}%, {Math.round(box.y * 100)}%)
+                        </span>
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = [...(clip.privacy_blur_boxes || [])];
+                              next[bIdx] = {
+                                ...next[bIdx],
+                                mode: box.mode === 'pixelate' ? 'gaussian' : 'pixelate',
+                              };
+                              onUpdateClip({ privacy_blur_boxes: next });
+                            }}
+                            className="px-2 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] font-semibold text-[var(--text-primary)]"
+                          >
+                            {box.mode === 'pixelate' ? 'Pixelate' : 'Gaussian'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = [...(clip.privacy_blur_boxes || [])];
+                              next[bIdx] = { ...next[bIdx], track_motion: !box.track_motion };
+                              onUpdateClip({ privacy_blur_boxes: next });
+                            }}
+                            className={`px-2 py-0.5 rounded border font-semibold ${
+                              box.track_motion
+                                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                            }`}
+                          >
+                            {box.track_motion ? '✓ Track Motion' : 'Static'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const next = (clip.privacy_blur_boxes || []).filter((_, i) => i !== bIdx);
+                              onUpdateClip({ privacy_blur_boxes: next });
+                            }}
+                            className="px-1.5 py-0.5 rounded border border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 font-bold"
+                            title="Remove blur box"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[var(--text-secondary)] shrink-0">Strength: {box.intensity ?? 18}</span>
+                        <input
+                          type="range"
+                          min={6}
+                          max={32}
+                          step={2}
+                          value={box.intensity ?? 18}
+                          onChange={(e) => {
+                            const next = [...(clip.privacy_blur_boxes || [])];
+                            next[bIdx] = { ...next[bIdx], intensity: parseInt(e.target.value, 10) };
+                            onUpdateClip({ privacy_blur_boxes: next });
+                          }}
+                          className="w-full h-1 bg-[var(--bg-card)] rounded appearance-none cursor-pointer"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
           </div>

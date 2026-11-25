@@ -1,10 +1,12 @@
 import os
 import logging
 import shutil
+import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from app.config import settings
+from app.services.proxy import get_ffmpeg_cmd
 
 logger = logging.getLogger(__name__)
 
@@ -133,3 +135,104 @@ def build_ducked_bgm_filter(
         f"[{v_main}][{bgm_duck}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[{out_label}]"
     )
     return frag, out_label
+
+
+def extract_room_tone_sample(
+    media_path: str,
+    exec_dir: str,
+    start_sec: float = 0.0,
+    duration_sec: float = 30.0,
+    sample_len: float = 0.50,
+    out_filename: str = "room_tone.wav",
+) -> Optional[str]:
+    """
+    Scan clip audio for the quietest non-silent `sample_len` window of ambient room tone
+    so jump-cut splices never drop to jarring digital -inf silence. Falls back to subtle
+    -52 dBFS pink room noise if no clean ambient bed exists.
+    """
+    import numpy as np
+    import wave
+
+    os.makedirs(exec_dir, exist_ok=True)
+    out_path = os.path.join(exec_dir, out_filename)
+    sr = 48000
+    target_samples = max(4800, int(round(sample_len * sr)))
+
+    if media_path and os.path.exists(media_path):
+        ffmpeg_bin = get_ffmpeg_cmd() or "ffmpeg"
+        raw_pcm = os.path.join(exec_dir, "_rt_scan.s16le")
+        cmd = [ffmpeg_bin, "-v", "error", "-y"]
+        if start_sec and start_sec > 0.001:
+            cmd += ["-ss", f"{float(start_sec):.3f}"]
+        cmd += ["-i", media_path, "-t", f"{min(90.0, max(1.0, float(duration_sec or 30.0))):.3f}"]
+        cmd += ["-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-acodec", "pcm_s16le", raw_pcm]
+        res = subprocess.run(cmd, cwd=exec_dir, capture_output=True, text=True)
+        if res.returncode == 0 and os.path.exists(raw_pcm):
+            raw_bytes = open(raw_pcm, "rb").read()
+            try:
+                os.remove(raw_pcm)
+            except OSError:
+                pass
+            samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            if len(samples) >= target_samples:
+                hop = max(2400, target_samples // 4)
+                best_rms = 1e9
+                best_seg = None
+                for i in range(0, len(samples) - target_samples + 1, hop):
+                    seg = samples[i:i + target_samples]
+                    rms = float(np.sqrt(np.mean(seg ** 2)))
+                    if 1e-5 < rms < best_rms:
+                        best_rms = rms
+                        best_seg = seg
+                if best_seg is not None:
+                    # Normalize gentle ambient bed to ~ -44 dBFS and apply 25ms fade in/out for seamless looping
+                    scale = min(1.0, 0.0063 / max(1e-5, best_rms))
+                    bed = np.clip(best_seg * scale, -0.15, 0.15)
+                    fade_n = min(1200, len(bed) // 6)
+                    if fade_n > 0:
+                        ramp = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+                        bed[:fade_n] *= ramp
+                        bed[-fade_n:] *= ramp[::-1]
+                    pcm_i16 = (bed * 32767.0).astype(np.int16)
+                    with wave.open(out_path, "wb") as wf:
+                        wf.setnchannels(2)
+                        wf.setsampwidth(2)
+                        wf.setframerate(sr)
+                        stereo = np.column_stack([pcm_i16, pcm_i16]).ravel()
+                        wf.writeframes(stereo.tobytes())
+                    return out_path
+
+    # Deterministic ultra-gentle ambient noise fallback (-52 dBFS)
+    rng = np.random.default_rng(seed=42)
+    noise = rng.normal(0.0, 0.0025, size=target_samples).astype(np.float32)
+    pcm_i16 = np.clip(noise * 32767.0, -32767, 32767).astype(np.int16)
+    with wave.open(out_path, "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        stereo = np.column_stack([pcm_i16, pcm_i16]).ravel()
+        wf.writeframes(stereo.tobytes())
+    return out_path
+
+
+def build_room_tone_bed_filter(
+    voice_label: str,
+    rt_input_idx: int,
+    duration: float,
+    out_label: str = "a_room",
+    bed_volume: float = 0.22,
+) -> Tuple[str, str]:
+    """Loop extracted 0.5s room-tone sample gently beneath jump-cut speech splices."""
+    dur = max(0.5, float(duration or 30.0))
+    vol = max(0.05, min(0.65, float(bed_volume)))
+    rt_lbl = f"_rtbed_{rt_input_idx}"
+    v_dup = f"_v_rt_{rt_input_idx}"
+    frag = (
+        f"[{voice_label}]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo[{v_dup}];"
+        f"[{rt_input_idx}:a]aloop=loop=-1:size=24000,aresample=48000,"
+        f"aformat=sample_rates=48000:channel_layouts=stereo,"
+        f"atrim=0:{dur:.3f},asetpts=PTS-STARTPTS,volume={vol:.3f}[{rt_lbl}];"
+        f"[{v_dup}][{rt_lbl}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[{out_label}]"
+    )
+    return frag, out_label
+

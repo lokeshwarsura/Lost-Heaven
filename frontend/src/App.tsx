@@ -85,6 +85,8 @@ export const App: React.FC = () => {
   const [toast, setToast] = useState<{ type: 'error' | 'success' | 'info'; message: string } | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isRendering, setIsRendering] = useState(false);
+  const [isMerging, setIsMerging] = useState(false);
+  const [isCompilingTrailer, setIsCompilingTrailer] = useState(false);
   const pendingClipPatchRef = useRef<Promise<any> | null>(null);
 
   const showToast = (message: string, type: 'error' | 'success' | 'info' = 'info') => {
@@ -330,6 +332,9 @@ export const App: React.FC = () => {
       } else if (keyLower === 'o') {
         e.preventDefault();
         window.dispatchEvent(new CustomEvent('lh-player-cmd', { detail: { type: 'trimOut' } }));
+      } else if (keyLower === 'b') {
+        e.preventDefault();
+        window.dispatchEvent(new CustomEvent('lh-player-cmd', { detail: { type: 'bladeSplit' } }));
       } else if (keyLower === 'm') {
         e.preventDefault();
         window.dispatchEvent(new CustomEvent('lh-player-cmd', { detail: { type: 'toggleMute' } }));
@@ -395,6 +400,95 @@ export const App: React.FC = () => {
     } catch (err: any) {
       console.error('Trim clip failed:', err);
       showToast(err?.message || 'Failed to trim clip', 'error');
+    }
+  };
+
+  const handleUpdateSegments = async (clipId: number, keepSegments: [number, number][]) => {
+    const clipObj = clips.find((c) => c.id === clipId) || selectedClip;
+    const pId = clipObj?.project_id || currentProject?.id;
+    if (!pId) return;
+    if (clipObj) {
+      pushSnapshot(clipObj.id, clipObj);
+    }
+    try {
+      const res = await api.updateClipSegments(pId, clipId, keepSegments);
+      if (res?.clip) {
+        setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, ...res.clip } : c)));
+        setSelectedClip((prev) => (prev && prev.id === clipId ? { ...prev, ...res.clip } : prev));
+        showToast(
+          `Updated timeline (${keepSegments.length} seg${keepSegments.length === 1 ? '' : 's'}, ${res.clip.duration.toFixed(1)}s)`,
+          'success'
+        );
+      }
+    } catch (err: any) {
+      console.error('Update segments failed:', err);
+      showToast(err?.message || 'Failed to update clip segments', 'error');
+    }
+  };
+
+  const handleApplyFixClip = async (clipId: number, updates: Partial<ViralClip>) => {
+    if (selectedClip?.id === clipId) {
+      await handleUpdateClip(updates);
+      showToast('Applied 1-click retention fix', 'success');
+      return;
+    }
+    const clipObj = clips.find((c) => c.id === clipId);
+    if (clipObj) {
+      pushSnapshot(clipObj.id, clipObj);
+      setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, ...updates } : c)));
+    }
+    try {
+      await api.updateClip(clipId, updates);
+      showToast('Applied 1-click retention fix', 'success');
+    } catch (err: any) {
+      showToast(err?.message || 'Failed to apply retention fix', 'error');
+    }
+  };
+
+  const handleMergeClips = async (clipIds: number[], smoothTransition: boolean, title?: string) => {
+    const pId = currentProject?.id || selectedClip?.project_id;
+    if (!pId || clipIds.length < 2) return;
+    try {
+      setIsMerging(true);
+      const res = await api.mergeClips(pId, {
+        clip_ids: clipIds,
+        smooth_transition: smoothTransition,
+        transition_duration: smoothTransition ? 0.35 : 0.02,
+        title
+      });
+      if (res?.clip) {
+        setClips((prev) => [res.clip, ...prev]);
+        setSelectedClip(res.clip);
+        setPreviewSeekTime(undefined);
+        setCurrentPlaybackTime(undefined);
+        showToast(`Merged ${clipIds.length} clips (${res.clip.duration.toFixed(1)}s)`, 'success');
+      }
+    } catch (err: any) {
+      console.error('Merge clips failed:', err);
+      showToast(err?.message || 'Failed to merge clips', 'error');
+    } finally {
+      setIsMerging(false);
+    }
+  };
+
+  const handleCompileTrailer = async () => {
+    const pId = currentProject?.id || selectedClip?.project_id;
+    if (!pId) return;
+    try {
+      setIsCompilingTrailer(true);
+      const res = await api.compileTrailer(pId);
+      if (res?.clip) {
+        setClips((prev) => [res.clip, ...prev]);
+        setSelectedClip(res.clip);
+        setPreviewSeekTime(undefined);
+        setCurrentPlaybackTime(undefined);
+        showToast(`Compiled AI Supercut Trailer (${res.clip.duration.toFixed(1)}s)`, 'success');
+      }
+    } catch (err: any) {
+      console.error('Trailer compilation failed:', err);
+      showToast(err?.message || 'Failed to compile trailer', 'error');
+    } finally {
+      setIsCompilingTrailer(false);
     }
   };
 
@@ -790,6 +884,10 @@ export const App: React.FC = () => {
                   setPreviewSeekTime(undefined);
                   setCurrentPlaybackTime(undefined);
                 }}
+                onMergeClips={handleMergeClips}
+                isMerging={isMerging}
+                onCompileTrailer={handleCompileTrailer}
+                isCompilingTrailer={isCompilingTrailer}
               />
 
               {/* Column 2: Full-Width Center Inspector */}
@@ -839,6 +937,8 @@ export const App: React.FC = () => {
                 onAutoRenderClip={handleAutoRenderClip}
                 onAutoRenderComplete={handleAutoRenderComplete}
                 onTrimClip={handleTrimClip}
+                onUpdateSegments={handleUpdateSegments}
+                onApplyFixClip={handleApplyFixClip}
                 isRendering={isRendering || selectedClip?.render_status === 'rendering'}
                 renderProgress={selectedClip?.render_progress || 0}
               />
@@ -1013,6 +1113,7 @@ export const App: React.FC = () => {
                 { key: '← / →', desc: 'Seek backward / forward 1 second' },
                 { key: 'Shift + ← / →', desc: 'Seek backward / forward 5 seconds' },
                 { key: 'I / O', desc: 'Set Clip In / Out boundary at playhead' },
+                { key: 'B', desc: 'Blade split timeline segment at playhead' },
                 { key: 'M', desc: 'Mute / Unmute preview audio' },
                 { key: 'Ctrl + Z', desc: 'Undo last clip edit' },
                 { key: 'Ctrl + Y / Shift+Z', desc: 'Redo clip edit' },

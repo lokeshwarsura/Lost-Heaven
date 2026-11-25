@@ -21,8 +21,12 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{hrs:02d}:{mins:02d}:{secs:02d},{ms:03d}"
 
 
-def build_srt_content(words: List[Dict[str, Any]], max_words_per_cue: int = 5) -> str:
-    """Group remapped spoken words into readable SubRip (.srt) cues."""
+def build_srt_content(
+    words: List[Dict[str, Any]],
+    max_words_per_cue: int = 5,
+    bilingual: bool = False,
+) -> str:
+    """Group remapped spoken words into readable SubRip (.srt) cues (optional dual-track bilingual lines)."""
     clean_words = [
         w for w in (words or [])
         if isinstance(w, dict) and not w.get("deleted") and not w.get("cut_from_video") and str(w.get("word", "")).strip()
@@ -37,7 +41,21 @@ def build_srt_content(words: List[Dict[str, Any]], max_words_per_cue: int = 5) -
         t0 = float(chunk[0].get("start", 0.0))
         t1 = max(t0 + 0.35, float(chunk[-1].get("end", t0 + 0.5)))
         txt = " ".join(str(w.get("word", "")).strip() for w in chunk)
-        cues.append(f"{idx}\n{_fmt_srt_time(t0)} --> {_fmt_srt_time(t1)}\n{txt}\n")
+        sec_txt = ""
+        if bilingual:
+            for cw in chunk:
+                ph = str(cw.get("translated_phrase") or "").strip()
+                if ph:
+                    sec_txt = ph
+                    break
+            if not sec_txt:
+                sec_txt = " ".join(
+                    str(cw.get("translated_text") or "").strip()
+                    for cw in chunk
+                    if str(cw.get("translated_text") or "").strip()
+                ).strip()
+        body = f"{txt}\n{sec_txt}" if (bilingual and sec_txt) else txt
+        cues.append(f"{idx}\n{_fmt_srt_time(t0)} --> {_fmt_srt_time(t1)}\n{body}\n")
         idx += 1
     return "\n".join(cues)
 
@@ -198,7 +216,10 @@ def export_clip_nle(
     )
     safe_stem = f"lost_heaven_clip_{clip.id}"
 
-    srt_txt = build_srt_content(words)
+    srt_txt = build_srt_content(
+        words,
+        bilingual=bool(getattr(clip, "bilingual_enabled", False)),
+    )
     if fmt == "srt":
         return {"filename": f"{safe_stem}.srt", "media_type": "text/plain; charset=utf-8", "content": srt_txt.encode("utf-8")}
 

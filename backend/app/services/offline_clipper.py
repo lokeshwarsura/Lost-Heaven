@@ -228,7 +228,8 @@ def extract_viral_clips_offline(
     topic_focus: Optional[str] = None,
     target_length: Optional[str] = None,
     num_clips: Optional[int] = None,
-    duration: Optional[float] = None
+    duration: Optional[float] = None,
+    formula_weights: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     100% Offline Viral Clip Extraction Engine.
@@ -297,6 +298,9 @@ def extract_viral_clips_offline(
                     0.20 * emotional_score + 
                     0.20 * standalone_score
                 ))
+                if formula_weights and formula_weights.get("has_data"):
+                    from app.services.analytics_ledger import apply_formula_boost_to_score
+                    virality_score = apply_formula_boost_to_score(virality_score, dur, hook_score, formula_weights)
 
                 # Identify highest-energy sentence for cold-open quote
                 best_sentence = max(sentences[i:j+1], key=lambda s: len(s["text"]))
@@ -336,6 +340,9 @@ def extract_viral_clips_offline(
             peak_energy = float(np.max(window_energy)) if len(window_energy) > 0 else 60.0
             
             virality_score = int(min(95, max(60, round(0.5 * avg_energy + 0.5 * peak_energy))))
+            if formula_weights and formula_weights.get("has_data"):
+                from app.services.analytics_ledger import apply_formula_boost_to_score
+                virality_score = apply_formula_boost_to_score(virality_score, e_t - s_t, virality_score, formula_weights)
             
             candidates.append({
                 "start_time": round(s_t, 2),

@@ -207,14 +207,20 @@ def _normalize_word_list(
     words: List[Dict[str, Any]],
     clip_start_time: float,
     clip_duration: float,
+    prefer_abs_with_segments: bool = False,
 ) -> List[Dict[str, Any]]:
     if not words:
         return []
-    max_end = max(float(w.get("end", 0.0)) for w in words)
-    is_abs = clip_start_time > 0.0 and (
-        (clip_duration > 0.0 and max_end > clip_duration + 1.0)
-        or (clip_duration <= 0.0 and min(float(w.get("start", 0.0)) for w in words) >= max(0.0, clip_start_time - 0.5))
-    )
+    if any(bool(w.get("timeline_relative")) for w in words if isinstance(w, dict)):
+        is_abs = False
+    else:
+        max_end = max(float(w.get("end", 0.0)) for w in words)
+        min_start = min(float(w.get("start", 0.0)) for w in words)
+        is_abs = clip_start_time > 0.0 and (
+            (clip_duration > 0.0 and max_end > clip_duration + 1.0)
+            or (prefer_abs_with_segments and min_start >= max(0.0, clip_start_time - 0.1))
+            or (clip_duration <= 0.0 and min_start >= max(0.0, clip_start_time - 0.5))
+        )
     out: List[Dict[str, Any]] = []
     for w in words:
         nw = dict(w)
@@ -236,6 +242,27 @@ def _normalize_word_list(
     return out
 
 
+def map_output_time_to_source_time(
+    rel_t: float,
+    abs_segments: List[Tuple[float, float]],
+    crossfade_sec: float = 0.03,
+) -> float:
+    """Map a stitched clip-relative playback time back to its master-video timestamp."""
+    if not abs_segments:
+        return max(0.0, float(rel_t))
+    t = max(0.0, float(rel_t))
+    cf = max(0.0, float(crossfade_sec or 0.0))
+    cursor = 0.0
+    for idx, (s, e) in enumerate(abs_segments):
+        seg_len = max(0.1, e - s)
+        step_cf = min(cf, seg_len * 0.25) if idx < len(abs_segments) - 1 else 0.0
+        eff_advance = seg_len - step_cf
+        if t <= cursor + seg_len or idx == len(abs_segments) - 1:
+            return round(s + min(seg_len, max(0.0, t - cursor)), 3)
+        cursor += eff_advance
+    return round(abs_segments[-1][1], 3)
+
+
 def compute_kept_segments_and_remapped_words(
     words: List[Dict[str, Any]],
     clip_start_time: float,
@@ -244,13 +271,36 @@ def compute_kept_segments_and_remapped_words(
     silence_threshold: float = 0.45,
     clean_filler_words: bool = False,
     crossfade_sec: float = 0.03,
+    explicit_keep_segments: Optional[List[Tuple[float, float]]] = None,
 ) -> Dict[str, Any]:
     """
-    Convert transcript word cuts (`cut_from_video`), optional filler-word cuts, and optional
-    dead-air silence cuts (`tighten_pacing`) into kept video segments + post-cut word timestamps.
+    Convert explicit blade `keep_segments`, transcript word cuts (`cut_from_video`), optional filler-word cuts,
+    and optional dead-air silence cuts (`tighten_pacing`) into kept video segments + post-cut word timestamps.
     """
     clip_dur = max(0.2, float(clip_duration or 1.0))
-    norm_words = _normalize_word_list(words or [], clip_start_time, clip_dur)
+
+    # Normalize explicit keep segments relative to clip_start_time if supplied
+    norm_explicit: Optional[List[Tuple[float, float]]] = None
+    is_abs_seg = False
+    if explicit_keep_segments:
+        abs_pairs: List[Tuple[float, float]] = []
+        for item in explicit_keep_segments:
+            if len(item) >= 2:
+                s, e = max(0.0, float(item[0])), max(0.0, float(item[1]))
+                if e > s + 0.1:
+                    abs_pairs.append((round(s, 3), round(e, 3)))
+        if abs_pairs:
+            # Determine if coordinates are master-absolute or already clip-relative
+            is_abs_seg = clip_start_time > 0.0 and min(s for s, _ in abs_pairs) >= max(0.0, clip_start_time - 0.5)
+            rel_pairs = [
+                (round(max(0.0, s - clip_start_time), 3), round(max(0.1, e - clip_start_time), 3))
+                if is_abs_seg else (round(s, 3), round(e, 3))
+                for s, e in abs_pairs
+            ]
+            norm_explicit = rel_pairs
+            clip_dur = max(clip_dur, max(e for _, e in rel_pairs))
+
+    norm_words = _normalize_word_list(words or [], clip_start_time, clip_dur, prefer_abs_with_segments=is_abs_seg)
 
     raw_cuts: List[Tuple[float, float]] = []
 
@@ -299,49 +349,66 @@ def compute_kept_segments_and_remapped_words(
         else:
             merged_cuts.append((cs, ce))
 
-    if not merged_cuts:
+    has_explicit_edits = bool(
+        norm_explicit
+        and (
+            len(norm_explicit) > 1
+            or norm_explicit[0][0] > 0.05
+            or norm_explicit[0][1] < clip_dur - 0.05
+        )
+    )
+
+    if not merged_cuts and not has_explicit_edits:
+        base_segs = norm_explicit if norm_explicit else [(0.0, clip_dur)]
+        eff = round(sum(e - s for s, e in base_segs), 3)
         return {
-            "kept_segments": [(0.0, clip_dur)],
+            "kept_segments": base_segs,
+            "kept_segments_abs": [(round(clip_start_time + s, 3), round(clip_start_time + e, 3)) for s, e in base_segs],
             "has_cuts": False,
-            "effective_duration": round(clip_dur, 3),
+            "effective_duration": max(0.2, eff),
             "remapped_words": norm_words,
             "crossfade_sec": crossfade_sec,
         }
 
-    # Build complement kept intervals inside [0.0, clip_dur]
+    # Subtract word/silence cut intervals from each kept base segment
+    base_kept = norm_explicit if norm_explicit else [(0.0, clip_dur)]
     kept: List[Tuple[float, float]] = []
-    cursor = 0.0
-    for cs, ce in merged_cuts:
-        if cs - cursor >= 0.12:
-            kept.append((round(cursor, 3), round(cs, 3)))
-        cursor = max(cursor, ce)
-    if clip_dur - cursor >= 0.12:
-        kept.append((round(cursor, 3), round(clip_dur, 3)))
+    for bs, be in base_kept:
+        cursor = bs
+        for cs, ce in merged_cuts:
+            if ce <= cursor:
+                continue
+            if cs >= be:
+                break
+            if cs - cursor >= 0.12:
+                kept.append((round(cursor, 3), round(min(be, cs), 3)))
+            cursor = max(cursor, min(be, ce))
+        if be - cursor >= 0.12:
+            kept.append((round(cursor, 3), round(be, 3)))
 
     if not kept:
+        kept = [(0.0, clip_dur)]
+
+    # Check if single full segment matches full clip cleanly with no cuts
+    if (
+        not has_explicit_edits
+        and len(kept) == 1
+        and kept[0][0] <= 0.02
+        and kept[0][1] >= clip_dur - 0.02
+    ):
         return {
             "kept_segments": [(0.0, clip_dur)],
+            "kept_segments_abs": [(round(clip_start_time, 3), round(clip_start_time + clip_dur, 3))],
             "has_cuts": False,
             "effective_duration": round(clip_dur, 3),
             "remapped_words": norm_words,
             "crossfade_sec": crossfade_sec,
         }
 
-    # Check if segments match full clip (meaning nothing meaningful was cut)
-    if len(kept) == 1 and kept[0][0] <= 0.02 and kept[0][1] >= clip_dur - 0.02:
-        return {
-            "kept_segments": [(0.0, clip_dur)],
-            "has_cuts": False,
-            "effective_duration": round(clip_dur, 3),
-            "remapped_words": norm_words,
-            "crossfade_sec": crossfade_sec,
-        }
-
-    cf = max(0.0, min(0.05, float(crossfade_sec)))
-    # Ensure every kept segment is strictly > 2 * cf so xfade/acrossfade never underflow
+    cf = max(0.0, min(0.6, float(crossfade_sec or 0.0)))
     min_seg = min(e - s for s, e in kept)
-    if min_seg <= max(0.10, cf * 2.5):
-        cf = 0.0
+    if min_seg <= max(0.10, cf * 2.1):
+        cf = min(cf, max(0.0, round(min_seg * 0.25, 3)))
 
     # Compute exact output timeline offsets per segment (accounting for cf overlap at joins)
     seg_out_starts: List[float] = []
@@ -349,29 +416,44 @@ def compute_kept_segments_and_remapped_words(
     for idx, (ks, ke) in enumerate(kept):
         seg_out_starts.append(out_cursor)
         seg_len = ke - ks
-        if idx < len(kept) - 1:
-            out_cursor += seg_len - cf
-        else:
-            out_cursor += seg_len
+        step_cf = min(cf, seg_len * 0.25) if idx < len(kept) - 1 else 0.0
+        out_cursor += seg_len - step_cf
 
     effective_duration = round(max(0.1, out_cursor), 3)
 
-    # Remap remaining non-cut words onto shortened output timeline
-    remapped: List[Dict[str, Any]] = []
-    for w in active_spoken:
-        mid = 0.5 * (w["start"] + w["end"])
-        for idx, (ks, ke) in enumerate(kept):
-            if ks - 0.03 <= mid <= ke + 0.03:
-                rel_s = max(0.0, w["start"] - ks)
-                rel_e = min(ke - ks, max(rel_s + 0.06, w["end"] - ks))
-                nw = dict(w)
-                nw["start"] = round(seg_out_starts[idx] + rel_s, 3)
-                nw["end"] = round(seg_out_starts[idx] + rel_e, 3)
-                remapped.append(nw)
-                break
+    # Check if words were already remapped onto [0, sum_kept] (e.g. from clip_merger)
+    sum_kept = sum(e - s for s, e in kept)
+    already_stitched_words = any(bool(w.get("timeline_relative")) for w in active_spoken) or bool(
+        has_explicit_edits
+        and active_spoken
+        and max(w["end"] for w in active_spoken) <= sum_kept + 0.8
+        and kept[0][1] < clip_dur - 1.0
+        and any(w["end"] <= sum_kept and w["start"] >= kept[0][1] for w in active_spoken)
+        and not any(
+            any(ks <= 0.5 * (w["start"] + w["end"]) <= ke for ks, ke in kept[1:])
+            for w in active_spoken
+        )
+    )
+
+    if already_stitched_words:
+        remapped = [dict(w) for w in active_spoken]
+    else:
+        remapped = []
+        for w in active_spoken:
+            mid = 0.5 * (w["start"] + w["end"])
+            for idx, (ks, ke) in enumerate(kept):
+                if ks - 0.03 <= mid <= ke + 0.03:
+                    rel_s = max(0.0, w["start"] - ks)
+                    rel_e = min(ke - ks, max(rel_s + 0.06, w["end"] - ks))
+                    nw = dict(w)
+                    nw["start"] = round(seg_out_starts[idx] + rel_s, 3)
+                    nw["end"] = round(seg_out_starts[idx] + rel_e, 3)
+                    remapped.append(nw)
+                    break
 
     return {
         "kept_segments": kept,
+        "kept_segments_abs": [(round(clip_start_time + ks, 3), round(clip_start_time + ke, 3)) for ks, ke in kept],
         "has_cuts": True,
         "effective_duration": effective_duration,
         "remapped_words": remapped,
@@ -383,44 +465,58 @@ def build_timeline_trim_concat_filter(
     kept_segments: List[Tuple[float, float]],
     crossfade_sec: float = 0.03,
     has_audio: bool = True,
+    multi_input: bool = False,
 ) -> Tuple[str, str, Optional[str]]:
     """
     Build FFmpeg multi-segment trim/atrim + xfade/acrossfade filtergraph joining kept segments
-    with smooth 30ms audio crossfade and exact frame-locked video fade transition.
-    Returns (filter_fragment, video_out_label, audio_out_label_or_None).
+    with smooth crossfade transition and exact frame-locked video fade.
+    When `multi_input=True`, expects each segment `i` as separate FFmpeg input `i` already seeked
+    with `-ss s_i -t dur_i`. Returns (filter_fragment, video_out_label, audio_out_label_or_None).
     """
     if len(kept_segments) <= 1:
         ks, ke = kept_segments[0]
-        parts = [f"[0:v]trim=start={ks:.3f}:end={ke:.3f},setpts=PTS-STARTPTS[v_tl]"]
-        a_lbl = None
-        if has_audio:
-            parts.append(f"[0:a]atrim=start={ks:.3f}:end={ke:.3f},asetpts=PTS-STARTPTS[a_tl]")
-            a_lbl = "a_tl"
+        if multi_input:
+            parts = ["[0:v]setpts=PTS-STARTPTS[v_tl]"]
+            a_lbl = None
+            if has_audio:
+                parts.append("[0:a]asetpts=PTS-STARTPTS[a_tl]")
+                a_lbl = "a_tl"
+        else:
+            parts = [f"[0:v]trim=start={ks:.3f}:end={ke:.3f},setpts=PTS-STARTPTS[v_tl]"]
+            a_lbl = None
+            if has_audio:
+                parts.append(f"[0:a]atrim=start={ks:.3f}:end={ke:.3f},asetpts=PTS-STARTPTS[a_tl]")
+                a_lbl = "a_tl"
         return ";".join(parts), "v_tl", a_lbl
 
     parts: List[str] = []
     cf = max(0.0, float(crossfade_sec or 0.0))
 
     for i, (ks, ke) in enumerate(kept_segments):
-        parts.append(f"[0:v]trim=start={ks:.3f}:end={ke:.3f},setpts=PTS-STARTPTS[tv{i}]")
-        if has_audio:
-            parts.append(f"[0:a]atrim=start={ks:.3f}:end={ke:.3f},asetpts=PTS-STARTPTS[ta{i}]")
+        if multi_input:
+            parts.append(f"[{i}:v]setpts=PTS-STARTPTS[tv{i}]")
+            if has_audio:
+                parts.append(f"[{i}:a]asetpts=PTS-STARTPTS[ta{i}]")
+        else:
+            parts.append(f"[0:v]trim=start={ks:.3f}:end={ke:.3f},setpts=PTS-STARTPTS[tv{i}]")
+            if has_audio:
+                parts.append(f"[0:a]atrim=start={ks:.3f}:end={ke:.3f},asetpts=PTS-STARTPTS[ta{i}]")
 
     if cf > 0.005:
-        # Chain xfade + acrossfade identically so A/V remain locked to 0.00ms
         curr_v = "tv0"
         curr_a = "ta0"
         running_dur = kept_segments[0][1] - kept_segments[0][0]
         for i in range(1, len(kept_segments)):
             seg_dur = kept_segments[i][1] - kept_segments[i][0]
-            offset = max(0.02, running_dur - cf)
+            step_cf = min(cf, running_dur * 0.25, seg_dur * 0.25)
+            offset = max(0.02, running_dur - step_cf)
             next_v = "v_tl" if i == len(kept_segments) - 1 else f"vx{i}"
-            parts.append(f"[{curr_v}][tv{i}]xfade=transition=fade:duration={cf:.3f}:offset={offset:.3f}[{next_v}]")
+            parts.append(f"[{curr_v}][tv{i}]xfade=transition=fade:duration={step_cf:.3f}:offset={offset:.3f}[{next_v}]")
             curr_v = next_v
 
             if has_audio:
                 next_a = "a_tl" if i == len(kept_segments) - 1 else f"ax{i}"
-                parts.append(f"[{curr_a}][ta{i}]acrossfade=d={cf:.3f}:c1=tri:c2=tri[{next_a}]")
+                parts.append(f"[{curr_a}][ta{i}]acrossfade=d={step_cf:.3f}:c1=qsin:c2=qsin[{next_a}]")
                 curr_a = next_a
 
             running_dur = offset + seg_dur

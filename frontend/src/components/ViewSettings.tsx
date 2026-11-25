@@ -68,6 +68,8 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
   const [watchFolderEnabled, setWatchFolderEnabled] = useState<boolean>(false);
   const [integrationNotice, setIntegrationNotice] = useState<string | null>(null);
   const [scanningWatch, setScanningWatch] = useState<boolean>(false);
+  const [importingCsv, setImportingCsv] = useState<boolean>(false);
+  const [csvImportSummary, setCsvImportSummary] = useState<string | null>(null);
 
   useEffect(() => {
     loadAllDiagnostics();
@@ -1066,6 +1068,49 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
             >
               Save Integrations
             </button>
+          </div>
+
+          {/* Local Export & Style Intelligence CSV Analytics Import */}
+          <div className="pt-3 border-t border-[var(--border-subtle)] flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-bold text-[var(--text-primary)]">
+                Style Intelligence Ledger (YouTube Studio CSV)
+              </div>
+              <div className="text-[11px] text-[var(--text-secondary)]">
+                Import Shorts Analytics CSVs to learn your top-performing aspect, style, and duration formula.
+              </div>
+              {csvImportSummary && (
+                <div className="text-[11px] font-mono text-[var(--accent-primary)] mt-1">
+                  {csvImportSummary}
+                </div>
+              )}
+            </div>
+            <label className="px-3.5 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] text-xs font-semibold text-[var(--text-primary)] cursor-pointer transition shrink-0">
+              {importingCsv ? 'Importing CSV...' : 'Import Analytics CSV'}
+              <input
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                disabled={importingCsv}
+                onChange={async (e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  try {
+                    setImportingCsv(true);
+                    const text = await file.text();
+                    const res = await api.importAnalyticsCsv(text);
+                    setCsvImportSummary(
+                      `Imported ${res.imported_rows} row(s) (${res.matched_clips} matched) · Formula: ${res.formula?.headline || 'Updated'}`
+                    );
+                  } catch (err: any) {
+                    setCsvImportSummary(err?.message || 'CSV import failed.');
+                  } finally {
+                    setImportingCsv(false);
+                    e.target.value = '';
+                  }
+                }}
+              />
+            </label>
           </div>
         </div>
       </div>

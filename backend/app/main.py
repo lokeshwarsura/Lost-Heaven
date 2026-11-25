@@ -20,7 +20,11 @@ from app.database import init_db, get_session
 from app.models import (
     Project, ViralClip, BrandPreset, CaptionStylePreset,
     YouTubeImportRequest, UpdateClipRequest, UpdateClipMetadataRequest, PublishYouTubeRequest,
-    RenderClipRequest, TrimClipRequest, SettingsUpdateRequest, PreviewFrameRequest, PreviewFrameResponse,
+    RenderClipRequest, TrimClipRequest, UpdateSegmentsRequest, MergeClipsRequest,
+    DiarizeClipRequest, UpdateSpeakersRequest, ExtractCalloutsRequest,
+    TranslateClipRequest, DubClipRequest, CompileTrailerRequest, GenerateThumbnailRequest,
+    GenerateChaptersRequest, ImportAnalyticsCsvRequest, ExportEvent,
+    SettingsUpdateRequest, PreviewFrameRequest, PreviewFrameResponse,
     CreateBrandPresetRequest, CreateCaptionStyleRequest,
     ProvideKeyRequest, RetryProjectRequest, TestGeminiRequest
 )
@@ -41,6 +45,14 @@ from app.services.nle_exporter import export_clip_nle
 from app.services.hook_generator import generate_hook_variants
 from app.services.social_copywriter import generate_multi_platform_copy
 from app.services.publish_pack import build_publish_pack_zip
+from app.services.retention_auditor import audit_clip_retention
+from app.services.diarizer import diarize_clip_speakers
+from app.services.callout_engine import extract_callout_cards
+from app.services.translator import translate_clip_transcript
+from app.services.dubbing_engine import dub_clip_audio
+from app.services.trailer_compiler import compile_project_trailer
+from app.services.thumbnail_studio import generate_depth_thumbnail
+from app.services.clip_merger import build_merged_clip_model
 from app.services.profile_manager import list_profiles, create_profile, delete_profile
 from app.services.batch_queue import list_batch_queue, enqueue_batch_project, scan_watch_folder
 from fastapi.responses import Response
@@ -104,14 +116,16 @@ storage_assets = storage_path / "assets"
 storage_fonts = storage_path / "fonts"
 storage_models = storage_path / "models"
 storage_projects = storage_path / "projects"
+storage_thumbnails = storage_path / "thumbnails"
 
-for p in [storage_renders, storage_masters, storage_previews, storage_assets, storage_fonts, storage_models, storage_projects]:
+for p in [storage_renders, storage_masters, storage_previews, storage_assets, storage_fonts, storage_models, storage_projects, storage_thumbnails]:
     p.mkdir(parents=True, exist_ok=True)
 
 app.mount("/media/renders", StaticFiles(directory=str(storage_renders)), name="renders")
 app.mount("/media/masters", StaticFiles(directory=str(storage_masters)), name="masters")
 app.mount("/media/previews", StaticFiles(directory=str(storage_previews)), name="previews")
 app.mount("/media/assets", StaticFiles(directory=str(storage_assets)), name="assets")
+app.mount("/media/thumbnails", StaticFiles(directory=str(storage_thumbnails)), name="thumbnails")
 
 def _hydrate_settings_from_disk() -> None:
     """Hydrate runtime Settings & RUNTIME_SETTINGS from persisted settings.json on startup."""
@@ -436,6 +450,8 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
     transcript_words = list(req.words) if req.words is not None else []
     clip_start_time = 0.0
     clip_duration = 0.0
+    clip_keep_segments = req.keep_segments
+    clip_merge_cf = float(req.merge_crossfade_sec) if req.merge_crossfade_sec is not None else 0.03
     proj_id = req.project_id
 
     if req.clip_id:
@@ -443,6 +459,10 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         if clip:
             if not transcript_words:
                 transcript_words = clip.get_transcript()
+            if not clip_keep_segments:
+                clip_keep_segments = clip.get_keep_segments()
+            if req.merge_crossfade_sec is None:
+                clip_merge_cf = float(getattr(clip, "merge_crossfade_sec", 0.03) or 0.03)
             clip_start_time = float(clip.start_time or 0.0)
             clip_duration = float(clip.duration or 0.0)
             proj_id = clip.project_id
@@ -517,6 +537,29 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "retention_bar_color": req.retention_bar_color,
         "outro_cta_enabled": req.outro_cta_enabled,
         "outro_cta_text": req.outro_cta_text,
+        "speakers": req.speakers,
+        "speaker_lower_thirds": req.speaker_lower_thirds,
+        "face_safe_captions": req.face_safe_captions,
+        "callout_cards": req.callout_cards,
+        "auto_callouts": req.auto_callouts,
+        "bilingual_enabled": req.bilingual_enabled,
+        "secondary_language": req.secondary_language,
+        "backdrop_mode": req.backdrop_mode,
+        "backdrop_blur_intensity": req.backdrop_blur_intensity,
+        "backdrop_color": req.backdrop_color,
+        "privacy_blur_boxes": req.privacy_blur_boxes,
+        "beat_sync_enabled": req.beat_sync_enabled,
+        "spectrum_enabled": req.spectrum_enabled,
+        "spectrum_position": req.spectrum_position,
+        "spectrum_color": req.spectrum_color,
+        "chapters_enabled": req.chapters_enabled,
+        "chapters": req.chapters,
+        "handle_watermark_enabled": req.handle_watermark_enabled,
+        "handle_text": req.handle_text,
+        "handle_platform_icon": req.handle_platform_icon,
+        "handle_corner": req.handle_corner,
+        "handle_opacity": req.handle_opacity,
+        "handle_display_mode": req.handle_display_mode,
     }
 
     try:
@@ -547,6 +590,24 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             watermark_opacity=req.watermark_opacity,
             watermark_size=req.watermark_size,
             project_id=proj_id,
+            keep_segments=clip_keep_segments,
+            merge_crossfade_sec=clip_merge_cf,
+            backdrop_mode=req.backdrop_mode,
+            backdrop_blur_intensity=req.backdrop_blur_intensity,
+            backdrop_color=req.backdrop_color,
+            privacy_blur_boxes=req.privacy_blur_boxes,
+            beat_sync_enabled=req.beat_sync_enabled,
+            spectrum_enabled=req.spectrum_enabled,
+            spectrum_position=req.spectrum_position,
+            spectrum_color=req.spectrum_color,
+            chapters_enabled=req.chapters_enabled,
+            chapters=req.chapters,
+            handle_watermark_enabled=req.handle_watermark_enabled,
+            handle_text=req.handle_text,
+            handle_platform_icon=req.handle_platform_icon,
+            handle_corner=req.handle_corner,
+            handle_opacity=req.handle_opacity,
+            handle_display_mode=req.handle_display_mode,
         )
         return result
     except Exception as e:
@@ -896,6 +957,36 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     cdict = clip.model_dump()
     cdict["youtube_titles"] = clip.get_titles()
     cdict["transcript_words"] = clip.get_transcript()
+    cdict["keep_segments"] = clip.get_keep_segments()
+    cdict["merge_crossfade_sec"] = float(getattr(clip, "merge_crossfade_sec", 0.03) or 0.03)
+    cdict["speakers"] = clip.get_speakers()
+    cdict["speaker_lower_thirds"] = bool(getattr(clip, "speaker_lower_thirds", False))
+    cdict["face_safe_captions"] = bool(getattr(clip, "face_safe_captions", True))
+    cdict["callout_cards"] = clip.get_callout_cards()
+    cdict["auto_callouts"] = bool(getattr(clip, "auto_callouts", False))
+    cdict["bilingual_enabled"] = bool(getattr(clip, "bilingual_enabled", False))
+    cdict["secondary_language"] = str(getattr(clip, "secondary_language", "") or "")
+    cdict["dubbing_enabled"] = bool(getattr(clip, "dubbing_enabled", False))
+    cdict["dubbing_language"] = str(getattr(clip, "dubbing_language", "Spanish") or "Spanish")
+    cdict["dubbing_voice"] = str(getattr(clip, "dubbing_voice", "default") or "default")
+    cdict["dubbing_bed_volume"] = float(getattr(clip, "dubbing_bed_volume", 0.15) or 0.15)
+    cdict["dubbed_audio_path"] = getattr(clip, "dubbed_audio_path", None)
+    cdict["backdrop_mode"] = str(getattr(clip, "backdrop_mode", "none") or "none")
+    cdict["backdrop_blur_intensity"] = float(getattr(clip, "backdrop_blur_intensity", 18.0) or 18.0)
+    cdict["backdrop_color"] = str(getattr(clip, "backdrop_color", "#18181B") or "#18181B")
+    cdict["privacy_blur_boxes"] = clip.get_privacy_blur_boxes()
+    cdict["beat_sync_enabled"] = bool(getattr(clip, "beat_sync_enabled", False))
+    cdict["spectrum_enabled"] = bool(getattr(clip, "spectrum_enabled", False))
+    cdict["spectrum_position"] = str(getattr(clip, "spectrum_position", "bottom") or "bottom")
+    cdict["spectrum_color"] = str(getattr(clip, "spectrum_color", "#C6F32F") or "#C6F32F")
+    cdict["chapters_enabled"] = bool(getattr(clip, "chapters_enabled", False))
+    cdict["chapters"] = clip.get_chapters()
+    cdict["handle_watermark_enabled"] = bool(getattr(clip, "handle_watermark_enabled", False))
+    cdict["handle_text"] = str(getattr(clip, "handle_text", "") or "")
+    cdict["handle_platform_icon"] = str(getattr(clip, "handle_platform_icon", "none") or "none")
+    cdict["handle_corner"] = str(getattr(clip, "handle_corner", "bottom_right") or "bottom_right")
+    cdict["handle_opacity"] = float(getattr(clip, "handle_opacity", 0.65) or 0.65)
+    cdict["handle_display_mode"] = str(getattr(clip, "handle_display_mode", "always") or "always")
     try:
         cdict["broll_segments"] = json.loads(getattr(clip, "broll_json", "[]") or "[]")
     except Exception:
@@ -1316,12 +1407,26 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    # Time boundaries
-    if req.start_time is not None:
-        clip.start_time = req.start_time
-    if req.end_time is not None:
-        clip.end_time = req.end_time
-    clip.duration = round(clip.end_time - clip.start_time, 2)
+    # Time boundaries & multi-segment blade cuts
+    if req.merge_crossfade_sec is not None:
+        clip.merge_crossfade_sec = max(0.0, min(0.6, float(req.merge_crossfade_sec)))
+    if req.keep_segments is not None:
+        clip.set_keep_segments(req.keep_segments)
+    elif req.start_time is not None or req.end_time is not None:
+        if req.start_time is not None:
+            clip.start_time = req.start_time
+        if req.end_time is not None:
+            clip.end_time = req.end_time
+        segs = clip.get_keep_segments()
+        if len(segs) <= 1:
+            clip.set_keep_segments([[clip.start_time, clip.end_time]])
+        else:
+            clamped = [
+                [max(clip.start_time, s), min(clip.end_time, e)]
+                for s, e in segs
+                if min(clip.end_time, e) > max(clip.start_time, s) + 0.1
+            ]
+            clip.set_keep_segments(clamped or [[clip.start_time, clip.end_time]])
 
     # Hooks & Retention
     if req.hook_headline is not None:
@@ -1502,6 +1607,62 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.outro_cta_text = req.outro_cta_text
     if req.broll_segments is not None:
         clip.broll_json = json.dumps(req.broll_segments)
+    if req.speakers is not None:
+        clip.set_speakers(req.speakers)
+    if req.speaker_lower_thirds is not None:
+        clip.speaker_lower_thirds = req.speaker_lower_thirds
+    if req.face_safe_captions is not None:
+        clip.face_safe_captions = req.face_safe_captions
+    if req.callout_cards is not None:
+        clip.set_callout_cards(req.callout_cards)
+    if req.auto_callouts is not None:
+        clip.auto_callouts = req.auto_callouts
+    if req.bilingual_enabled is not None:
+        clip.bilingual_enabled = req.bilingual_enabled
+    if req.secondary_language is not None:
+        clip.secondary_language = req.secondary_language
+    if req.dubbing_enabled is not None:
+        clip.dubbing_enabled = req.dubbing_enabled
+    if req.dubbing_language is not None:
+        clip.dubbing_language = req.dubbing_language
+    if req.dubbing_voice is not None:
+        clip.dubbing_voice = req.dubbing_voice
+    if req.dubbing_bed_volume is not None:
+        clip.dubbing_bed_volume = max(0.0, min(1.0, float(req.dubbing_bed_volume)))
+    if req.dubbed_audio_path is not None:
+        clip.dubbed_audio_path = req.dubbed_audio_path
+    if req.backdrop_mode is not None:
+        clip.backdrop_mode = req.backdrop_mode
+    if req.backdrop_blur_intensity is not None:
+        clip.backdrop_blur_intensity = max(2.0, min(55.0, float(req.backdrop_blur_intensity)))
+    if req.backdrop_color is not None:
+        clip.backdrop_color = req.backdrop_color
+    if req.privacy_blur_boxes is not None:
+        clip.set_privacy_blur_boxes(req.privacy_blur_boxes)
+    if req.beat_sync_enabled is not None:
+        clip.beat_sync_enabled = bool(req.beat_sync_enabled)
+    if req.spectrum_enabled is not None:
+        clip.spectrum_enabled = bool(req.spectrum_enabled)
+    if req.spectrum_position is not None:
+        clip.spectrum_position = req.spectrum_position
+    if req.spectrum_color is not None:
+        clip.spectrum_color = req.spectrum_color
+    if req.chapters_enabled is not None:
+        clip.chapters_enabled = bool(req.chapters_enabled)
+    if req.chapters is not None:
+        clip.set_chapters(req.chapters)
+    if req.handle_watermark_enabled is not None:
+        clip.handle_watermark_enabled = bool(req.handle_watermark_enabled)
+    if req.handle_text is not None:
+        clip.handle_text = req.handle_text
+    if req.handle_platform_icon is not None:
+        clip.handle_platform_icon = req.handle_platform_icon
+    if req.handle_corner is not None:
+        clip.handle_corner = req.handle_corner
+    if req.handle_opacity is not None:
+        clip.handle_opacity = max(0.20, min(0.90, float(req.handle_opacity)))
+    if req.handle_display_mode is not None:
+        clip.handle_display_mode = req.handle_display_mode
     if req.punch_zoom_intensity is not None:
         clip.punch_zoom_intensity = max(1.04, min(1.35, float(req.punch_zoom_intensity)))
     if req.hardware_mode is not None:
@@ -1553,7 +1714,7 @@ def get_clip_waveform(
                 transcript_words = json.loads(t_json.read_text(encoding="utf-8"))
             except Exception:
                 transcript_words = []
-    return extract_waveform_bins(
+    wf = extract_waveform_bins(
         video_or_wav_path=project.source_path or str(audio_wav_path),
         clip_start=clip.start_time,
         clip_end=clip.end_time,
@@ -1561,6 +1722,9 @@ def get_clip_waveform(
         audio_wav_path=str(audio_wav_path) if audio_wav_path.exists() else None,
         transcript_words=transcript_words,
     )
+    wf["keep_segments"] = clip.get_keep_segments()
+    wf["merge_crossfade_sec"] = float(getattr(clip, "merge_crossfade_sec", 0.03) or 0.03)
+    return wf
 
 
 @app.patch("/api/clips/{project_id}/{clip_id}/trim")
@@ -1645,6 +1809,7 @@ def trim_clip_endpoint(
 
     clip.start_time = round(new_start, 3)
     clip.end_time = round(new_end, 3)
+    clip.set_keep_segments([[clip.start_time, clip.end_time]])
     clip.duration = round(new_end - new_start, 3)
     clip.set_transcript(sliced_words)
 
@@ -1653,6 +1818,500 @@ def trim_clip_endpoint(
     session.refresh(clip)
 
     return {"status": "trimmed", "clip": _serialize_clip(clip, project)}
+
+
+@app.patch("/api/clips/{project_id}/{clip_id}/segments")
+def update_clip_segments_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: UpdateSegmentsRequest,
+    session: Session = Depends(get_session),
+):
+    """Persist multi-segment blade cuts (`keep_segments`) and update clip duration."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cleaned: List[List[float]] = []
+    for item in req.keep_segments or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            s, e = max(0.0, float(item[0])), float(item[1])
+            if e > s + 0.2:
+                cleaned.append([round(s, 3), round(e, 3)])
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="At least one valid kept segment (> 0.2s) is required.")
+
+    if req.crossfade_sec is not None:
+        clip.merge_crossfade_sec = max(0.0, min(0.6, float(req.crossfade_sec)))
+    clip.set_keep_segments(cleaned)
+    # Invalidate rendered file so next play / auto-render rebuilds with new segments
+    clip.status = "draft"
+    clip.render_status = "idle"
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {"status": "updated", "clip": _serialize_clip(clip, project)}
+
+
+@app.post("/api/projects/{project_id}/clips/merge")
+def merge_project_clips_endpoint(
+    project_id: int,
+    req: MergeClipsRequest,
+    session: Session = Depends(get_session),
+):
+    """Merge 2 or more clips into one unified multi-segment clip (with optional 0.35s crossfade)."""
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not req.clip_ids or len(req.clip_ids) < 2:
+        raise HTTPException(status_code=400, detail="Select at least 2 clips to merge.")
+
+    by_id = {
+        c.id: c
+        for c in session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
+    }
+    ordered_clips: List[ViralClip] = []
+    seen = set()
+    for cid in req.clip_ids:
+        if cid in by_id and cid not in seen:
+            ordered_clips.append(by_id[cid])
+            seen.add(cid)
+
+    if len(ordered_clips) < 2:
+        raise HTTPException(status_code=404, detail="Could not find 2 valid clips to merge in this project.")
+
+    merged = build_merged_clip_model(
+        source_clips=ordered_clips,
+        project_id=project_id,
+        smooth_transition=bool(req.smooth_transition),
+        transition_duration=float(req.transition_duration or 0.35),
+        custom_title=req.title,
+    )
+    session.add(merged)
+    session.commit()
+    session.refresh(merged)
+
+    # Pre-render fast preview synchronously if master source exists so the merged clip plays right away
+    if project.source_path and os.path.exists(project.source_path):
+        try:
+            snap = _snapshot_clip(merged)
+            rendered_out = _render_clip_from_snapshot(snap, project.source_path, quality_mode="fast_preview")
+            if rendered_out and os.path.exists(rendered_out):
+                merged.rendered_path = rendered_out
+                merged.rendered_video_path = rendered_out
+                merged.status = "ready"
+                merged.render_status = "completed"
+                merged.render_progress = 100
+                merged.render_message = "Merged clip preview ready"
+                session.add(merged)
+                session.commit()
+                session.refresh(merged)
+        except Exception as exc:
+            logger.warning(f"Inline preview render after clip merge skipped (will render on-demand): {exc}")
+
+    return {"status": "merged", "clip": _serialize_clip(merged, project)}
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/retention-audit")
+def retention_audit_endpoint(
+    project_id: int,
+    clip_id: int,
+    session: Session = Depends(get_session),
+):
+    """Audit clip second-by-second for hook velocity, dead air, static framing, and WPM dips."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    proj_dir = Path(settings.STORAGE_DIR) / "projects" / str(project_id)
+    audio_wav = proj_dir / "audio_16k.wav"
+    face_cache = proj_dir / f"clip_{clip_id}" / "face_track.json"
+    face_track_data = None
+    if face_cache.exists():
+        try:
+            face_track_data = json.loads(face_cache.read_text(encoding="utf-8"))
+        except Exception:
+            face_track_data = None
+
+    return audit_clip_retention(
+        clip=clip,
+        audio_path=str(audio_wav) if audio_wav.exists() else None,
+        face_track=face_track_data,
+        video_path=project.source_path if (project.source_path and os.path.exists(project.source_path)) else None,
+    )
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/diarize")
+def diarize_clip_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: Optional[DiarizeClipRequest] = Body(default=None),
+    session: Session = Depends(get_session),
+):
+    """Run pure-numpy local acoustic + spatial speaker diarization and assign speaker IDs."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    words = clip.get_transcript() or []
+    proj_dir = Path(settings.STORAGE_DIR) / "projects" / str(project_id)
+    audio_wav = proj_dir / "audio_16k.wav"
+    media_src = str(audio_wav) if audio_wav.exists() else (project.source_path or "")
+
+    face_cache = proj_dir / f"clip_{clip_id}" / "face_track.json"
+    face_track_data = None
+    if face_cache.exists():
+        try:
+            face_track_data = json.loads(face_cache.read_text(encoding="utf-8"))
+        except Exception:
+            face_track_data = None
+
+    num_spk = int(req.num_speakers) if req else 0
+    diar = diarize_clip_speakers(
+        audio_or_video_path=media_src,
+        words=words,
+        face_track=face_track_data,
+        clip_start_time=clip.start_time,
+        num_speakers=num_spk,
+    )
+    clip.set_speakers(diar["speakers"])
+    clip.set_transcript(diar["words"])
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+
+    return {
+        "status": "diarized",
+        "speakers": diar["speakers"],
+        "words": diar["words"],
+        "speaker_count": diar["speaker_count"],
+        "clip": _serialize_clip(clip, project),
+    }
+
+
+@app.patch("/api/clips/{project_id}/{clip_id}/speakers")
+def update_clip_speakers_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: UpdateSpeakersRequest,
+    session: Session = Depends(get_session),
+):
+    """Update speaker names/colors and optional manual per-word speaker assignments."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    clip.set_speakers(req.speakers)
+    if req.transcript_words is not None:
+        clip.set_transcript(req.transcript_words)
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {"status": "saved", "clip": _serialize_clip(clip, project)}
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/callouts")
+def extract_clip_callouts_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: Optional[ExtractCalloutsRequest] = Body(default=None),
+    session: Session = Depends(get_session),
+):
+    """Detect stats, percentages, currencies & multipliers and persist editable Pop-Up Callout Cards."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    cards = extract_callout_cards(
+        words=clip.get_transcript() or [],
+        clip_start_time=clip.start_time,
+        clip_duration=float(clip.duration or (clip.end_time - clip.start_time)),
+        max_cards=int(req.max_cards) if req else 3,
+    )
+    clip.set_callout_cards(cards)
+    clip.auto_callouts = True
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {
+        "status": "generated",
+        "callout_cards": cards,
+        "clip": _serialize_clip(clip, project),
+    }
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/translate")
+def translate_clip_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: TranslateClipRequest,
+    session: Session = Depends(get_session),
+):
+    """Translate clip transcript chunks for Bilingual Stacked Captions (Gemini + offline lexicon)."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    persisted = get_persisted_settings()
+    api_key = str(persisted.get("gemini_api_key") or getattr(settings, "GEMINI_API_KEY", "") or "").strip()
+    model = str(persisted.get("gemini_model") or "").strip() or None
+
+    tr = translate_clip_transcript(
+        words=clip.get_transcript() or [],
+        target_language=req.target_language or "Spanish",
+        api_key=api_key,
+        model=model,
+    )
+    clip.set_transcript(tr["words"])
+    clip.bilingual_enabled = True
+    clip.secondary_language = tr["target_language"]
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {
+        "status": "translated",
+        "target_language": tr["target_language"],
+        "source": tr["source"],
+        "translations": tr["translations"],
+        "clip": _serialize_clip(clip, project),
+    }
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/dub")
+def dub_clip_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: DubClipRequest,
+    session: Session = Depends(get_session),
+):
+    """Generate 1-click local AI dubbed voice WAV aligned via FFmpeg atempo and ducked original bed."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    persisted = get_persisted_settings()
+    api_key = str(persisted.get("gemini_api_key") or getattr(settings, "GEMINI_API_KEY", "") or "").strip()
+    model = str(persisted.get("gemini_model") or "").strip() or None
+
+    lang_slug = re.sub(r"[^a-z0-9]+", "_", (req.target_language or "spanish").lower()).strip("_") or "dub"
+    dub_out = Path(settings.STORAGE_DIR) / "projects" / str(project_id) / "dubs" / f"dub_{clip_id}_{lang_slug}.wav"
+
+    eff_dur = max(1.0, float(clip.duration or (clip.end_time - clip.start_time) or 5.0))
+    dub_res = dub_clip_audio(
+        words=clip.get_transcript() or [],
+        clip_duration=eff_dur,
+        output_wav_path=str(dub_out),
+        clip_start_time=float(clip.start_time),
+        target_language=req.target_language or "Spanish",
+        voice=req.voice or "default",
+        api_key=api_key,
+        model=model,
+    )
+    clip.set_transcript(dub_res["words"])
+    clip.dubbing_enabled = True
+    clip.dubbing_language = dub_res["target_language"]
+    clip.dubbing_voice = dub_res["voice"]
+    clip.dubbing_bed_volume = max(0.0, min(1.0, float(req.original_bed_volume)))
+    clip.dubbed_audio_path = dub_res["dubbed_audio_path"]
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {
+        "status": "dubbed",
+        "dubbed_audio_path": dub_res["dubbed_audio_path"],
+        "tts_backend": dub_res["tts_backend"],
+        "segment_count": dub_res["segment_count"],
+        "clip": _serialize_clip(clip, project),
+    }
+
+
+@app.post("/api/projects/{project_id}/compile-trailer")
+def compile_project_trailer_endpoint(
+    project_id: int,
+    req: Optional[CompileTrailerRequest] = Body(default=None),
+    session: Session = Depends(get_session),
+):
+    """Compile top 3-5 project viral moments into an AI Supercut Trailer clip with fast preview."""
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    all_clips = session.exec(
+        select(ViralClip).where(ViralClip.project_id == project_id)
+    ).all()
+    if not all_clips:
+        raise HTTPException(status_code=400, detail="Project has no clips to compile into a trailer.")
+
+    # Exclude any earlier supercut trailer from source pool when possible
+    non_trailer = [c for c in all_clips if getattr(c, "analysis_source", "") != "supercut_trailer"]
+    pool = non_trailer if non_trailer else all_clips
+
+    trailer = compile_project_trailer(
+        source_clips=pool,
+        project_id=project_id,
+        max_moments=int(req.max_moments) if req else 4,
+        target_duration_sec=float(req.target_duration_sec) if req else 32.0,
+        custom_title=req.title if req else None,
+    )
+    session.add(trailer)
+    session.commit()
+    session.refresh(trailer)
+
+    if project.source_path and os.path.exists(project.source_path):
+        try:
+            snap = _snapshot_clip(trailer)
+            rendered_out = _render_clip_from_snapshot(snap, project.source_path, quality_mode="fast_preview")
+            if rendered_out and os.path.exists(rendered_out):
+                trailer.rendered_path = rendered_out
+                trailer.rendered_video_path = rendered_out
+                trailer.status = "ready"
+                trailer.render_status = "completed"
+                trailer.render_progress = 100
+                trailer.render_message = "Supercut Trailer ready"
+                session.add(trailer)
+                session.commit()
+                session.refresh(trailer)
+        except Exception as exc:
+            logger.warning(f"Trailer inline fast preview skipped: {exc}")
+
+    return {"status": "compiled", "clip": _serialize_clip(trailer, project)}
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/generate-thumbnail")
+def generate_thumbnail_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: GenerateThumbnailRequest,
+    session: Session = Depends(get_session),
+):
+    """Generate depth-layered 1080x1920 or 1280x720 AI cover thumbnail with subject-over-text compositing."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+
+    fmt = "16:9" if (req.format or "").strip() == "16:9" else "9:16"
+    headline = (req.headline or "").strip() or (clip.hook_headline or clip.selected_title or "WATCH THIS")
+    res = generate_depth_thumbnail(
+        video_path=project.source_path,
+        clip_id=clip_id,
+        project_id=project_id,
+        timestamp=req.timestamp,
+        clip_start_time=float(clip.start_time or 0.0),
+        clip_duration=float(clip.duration or 5.0),
+        headline=headline,
+        aspect_ratio=fmt,
+        frame_layout=clip.frame_layout or "auto_track",
+        zoom=float(clip.zoom or 1.0),
+        pan_x_offset=float(clip.pan_x_offset or 0.0),
+        depth_layer=bool(req.depth_layer),
+        accent_color=req.accent_color or "#C6F32F",
+        rim_glow=bool(req.rim_glow),
+        badge_text=req.badge_text or "",
+    )
+    return {"status": "generated", **res}
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/generate-chapters")
+def generate_chapters_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: GenerateChaptersRequest = GenerateChaptersRequest(),
+    session: Session = Depends(get_session),
+):
+    """Auto-detect 2-4 crisp timeline mini-chapters from timed words (Gemini + deterministic fallback)."""
+    from app.services.chapter_engine import generate_clip_chapters
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    persisted = get_persisted_settings()
+    api_key = str(persisted.get("gemini_api_key") or "").strip() or None
+    model = str(persisted.get("gemini_model") or "").strip() or None
+
+    chapters = generate_clip_chapters(
+        words=clip.get_transcript(),
+        clip_start_time=float(clip.start_time or 0.0),
+        clip_duration=max(1.0, float(clip.duration or 30.0)),
+        max_chapters=max(2, min(6, int(req.max_chapters or 4))),
+        api_key=api_key,
+        model=model,
+    )
+    clip.set_chapters(chapters)
+    if req.enable:
+        clip.chapters_enabled = True
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {
+        "status": "generated",
+        "clip_id": clip.id,
+        "chapters_enabled": bool(clip.chapters_enabled),
+        "chapters": chapters,
+    }
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/preflight")
+def clip_preflight_endpoint(
+    project_id: int,
+    clip_id: int,
+    session: Session = Depends(get_session),
+):
+    """Run platform demonetization, audio clipping, and safe-zone UI overlap audit with 1-Click Fix patches."""
+    from app.services.safety_scanner import scan_clip_preflight
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    media_path = project.source_path if (project and project.source_path and os.path.exists(project.source_path)) else None
+    return scan_clip_preflight(clip, media_path=media_path)
+
+
+@app.post("/api/analytics/import-csv")
+def import_analytics_csv_endpoint(
+    req: ImportAnalyticsCsvRequest,
+    session: Session = Depends(get_session),
+):
+    """Import YouTube Studio Analytics CSV rows to correlate views/retention with export styles."""
+    from app.services.analytics_ledger import import_youtube_analytics_csv
+
+    try:
+        return import_youtube_analytics_csv(session, req.csv_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/api/analytics/formula")
+def get_analytics_formula_endpoint(session: Session = Depends(get_session)):
+    """Return Your Top Performing Formula aggregated from export telemetry & imported CSV analytics."""
+    from app.services.analytics_ledger import compute_top_performing_formula
+
+    return compute_top_performing_formula(session)
 
 
 @app.get("/api/clips/{project_id}/{clip_id}/broll-suggestions")
@@ -1782,6 +2441,11 @@ def export_publish_pack_endpoint(
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    try:
+        from app.services.analytics_ledger import record_export_event
+        record_export_event(session, clip, event_type="publish_pack")
+    except Exception:
+        pass
     return FileResponse(
         path=zip_path,
         media_type="application/zip",
@@ -2101,12 +2765,42 @@ def _render_clip_from_snapshot(
         censor_profanity=clip_data.get("censor_profanity", False),
         quality_mode=quality_mode,
         progress_callback=progress_callback,
+        keep_segments=clip_data.get("keep_segments"),
+        merge_crossfade_sec=float(clip_data.get("merge_crossfade_sec", 0.03) or 0.03),
+        speakers=clip_data.get("speakers"),
+        speaker_lower_thirds=bool(clip_data.get("speaker_lower_thirds", False)),
+        face_safe_captions=bool(clip_data.get("face_safe_captions", True)),
+        callout_cards=clip_data.get("callout_cards"),
+        auto_callouts=bool(clip_data.get("auto_callouts", False)),
+        bilingual_enabled=bool(clip_data.get("bilingual_enabled", False)),
+        secondary_language=str(clip_data.get("secondary_language", "") or ""),
+        dubbing_enabled=bool(clip_data.get("dubbing_enabled", False)),
+        dubbed_audio_path=clip_data.get("dubbed_audio_path"),
+        dubbing_bed_volume=float(clip_data.get("dubbing_bed_volume", 0.15) or 0.15),
+        backdrop_mode=str(clip_data.get("backdrop_mode", "none") or "none"),
+        backdrop_blur_intensity=float(clip_data.get("backdrop_blur_intensity", 18.0) or 18.0),
+        backdrop_color=str(clip_data.get("backdrop_color", "#18181B") or "#18181B"),
+        privacy_blur_boxes=clip_data.get("privacy_blur_boxes") or [],
+        beat_sync_enabled=bool(clip_data.get("beat_sync_enabled", False)),
+        spectrum_enabled=bool(clip_data.get("spectrum_enabled", False)),
+        spectrum_position=str(clip_data.get("spectrum_position", "bottom") or "bottom"),
+        spectrum_color=str(clip_data.get("spectrum_color", "#C6F32F") or "#C6F32F"),
+        chapters_enabled=bool(clip_data.get("chapters_enabled", False)),
+        chapters=clip_data.get("chapters") or [],
+        handle_watermark_enabled=bool(clip_data.get("handle_watermark_enabled", False)),
+        handle_text=str(clip_data.get("handle_text", "") or ""),
+        handle_platform_icon=str(clip_data.get("handle_platform_icon", "none") or "none"),
+        handle_corner=str(clip_data.get("handle_corner", "bottom_right") or "bottom_right"),
+        handle_opacity=float(clip_data.get("handle_opacity", 0.65) or 0.65),
+        handle_display_mode=str(clip_data.get("handle_display_mode", "always") or "always"),
     )
 
 
 def _snapshot_clip(clip: ViralClip) -> Dict[str, Any]:
     snap = clip.model_dump()
     snap["words"] = clip.get_transcript()
+    snap["keep_segments"] = clip.get_keep_segments()
+    snap["merge_crossfade_sec"] = float(getattr(clip, "merge_crossfade_sec", 0.03) or 0.03)
     snap["audio_volume"] = getattr(clip, "audio_volume", 1.0)
     snap["normalize_audio"] = getattr(clip, "normalize_audio", True)
     snap["vocal_clarity"] = getattr(clip, "vocal_clarity", False)
@@ -2125,6 +2819,32 @@ def _snapshot_clip(clip: ViralClip) -> Dict[str, Any]:
     snap["silence_threshold"] = getattr(clip, "silence_threshold", 0.50)
     snap["censor_profanity"] = getattr(clip, "censor_profanity", False)
     snap["highlight_power_words"] = bool(getattr(clip, "highlight_power_words", False))
+    snap["speakers"] = clip.get_speakers()
+    snap["speaker_lower_thirds"] = bool(getattr(clip, "speaker_lower_thirds", False))
+    snap["face_safe_captions"] = bool(getattr(clip, "face_safe_captions", True))
+    snap["callout_cards"] = clip.get_callout_cards()
+    snap["auto_callouts"] = bool(getattr(clip, "auto_callouts", False))
+    snap["bilingual_enabled"] = bool(getattr(clip, "bilingual_enabled", False))
+    snap["secondary_language"] = str(getattr(clip, "secondary_language", "") or "")
+    snap["dubbing_enabled"] = bool(getattr(clip, "dubbing_enabled", False))
+    snap["dubbed_audio_path"] = getattr(clip, "dubbed_audio_path", None)
+    snap["dubbing_bed_volume"] = float(getattr(clip, "dubbing_bed_volume", 0.15) or 0.15)
+    snap["backdrop_mode"] = str(getattr(clip, "backdrop_mode", "none") or "none")
+    snap["backdrop_blur_intensity"] = float(getattr(clip, "backdrop_blur_intensity", 18.0) or 18.0)
+    snap["backdrop_color"] = str(getattr(clip, "backdrop_color", "#18181B") or "#18181B")
+    snap["privacy_blur_boxes"] = clip.get_privacy_blur_boxes()
+    snap["beat_sync_enabled"] = bool(getattr(clip, "beat_sync_enabled", False))
+    snap["spectrum_enabled"] = bool(getattr(clip, "spectrum_enabled", False))
+    snap["spectrum_position"] = str(getattr(clip, "spectrum_position", "bottom") or "bottom")
+    snap["spectrum_color"] = str(getattr(clip, "spectrum_color", "#C6F32F") or "#C6F32F")
+    snap["chapters_enabled"] = bool(getattr(clip, "chapters_enabled", False))
+    snap["chapters"] = clip.get_chapters()
+    snap["handle_watermark_enabled"] = bool(getattr(clip, "handle_watermark_enabled", False))
+    snap["handle_text"] = str(getattr(clip, "handle_text", "") or "")
+    snap["handle_platform_icon"] = str(getattr(clip, "handle_platform_icon", "none") or "none")
+    snap["handle_corner"] = str(getattr(clip, "handle_corner", "bottom_right") or "bottom_right")
+    snap["handle_opacity"] = float(getattr(clip, "handle_opacity", 0.65) or 0.65)
+    snap["handle_display_mode"] = str(getattr(clip, "handle_display_mode", "always") or "always")
     return snap
 
 
@@ -2197,6 +2917,12 @@ def render_worker_ultra(clip_id: int, quality_mode: str = "final_hq"):
                 c_done.rendered_video_path = output_file
                 session.add(c_done)
                 session.commit()
+                if (quality_mode or "final_hq").strip().lower() != "fast_preview":
+                    try:
+                        from app.services.analytics_ledger import record_export_event
+                        record_export_event(session, c_done, event_type="mp4_render")
+                    except Exception:
+                        pass
 
         except RenderSupersededError:
             logger.info(f"Background render for clip {clip_id} superseded cleanly by newer request.")
@@ -2370,6 +3096,11 @@ def download_by_project_clip(project_id: int, clip_id: int, session: Session = D
     clip = session.get(ViralClip, clip_id)
     if not clip or clip.project_id != project_id:
         raise HTTPException(status_code=404, detail="Clip not found")
+    try:
+        from app.services.analytics_ledger import record_export_event
+        record_export_event(session, clip, event_type="mp4_download")
+    except Exception:
+        pass
     return serve_download_file(clip)
 
 @app.get("/api/clips/{clip_id}/download")
@@ -2377,6 +3108,11 @@ def download_by_clip(clip_id: int, session: Session = Depends(get_session)):
     clip = session.get(ViralClip, clip_id)
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
+    try:
+        from app.services.analytics_ledger import record_export_event
+        record_export_event(session, clip, event_type="mp4_download")
+    except Exception:
+        pass
     return serve_download_file(clip)
 
 # -------------------------------------------------------------

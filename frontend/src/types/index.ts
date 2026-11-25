@@ -6,6 +6,39 @@ export interface WordTimestamp {
   deleted?: boolean;
   cut_from_video?: boolean;
   is_profane?: boolean;
+  speaker_id?: string;
+  translated_text?: string;
+  translated_phrase?: string;
+  translated_chunk_id?: number;
+}
+
+export interface SpeakerProfile {
+  id: string;
+  name: string;
+  color: string;
+  word_count?: number;
+}
+
+export interface CalloutCard {
+  id: string;
+  start: number;
+  end: number;
+  badge: string;
+  title: string;
+  category?: string;
+  accent_color?: string;
+  enabled?: boolean;
+}
+
+export interface PrivacyBlurBox {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  mode: 'gaussian' | 'pixelate';
+  track_motion: boolean;
+  intensity?: number;
 }
 
 export interface BrandPreset {
@@ -71,6 +104,39 @@ export interface PlatformCopyEntry {
 
 export type PlatformCopyMap = Record<'youtube_shorts' | 'tiktok' | 'instagram_reels' | 'x_twitter', PlatformCopyEntry>;
 
+export interface RetentionPoint {
+  sec: number;
+  score: number;
+  wpm: number;
+  rms: number;
+  face_offset: number;
+}
+
+export interface RetentionWarning {
+  id: string;
+  timestamp: number;
+  end_timestamp: number;
+  severity: 'high' | 'medium' | 'low';
+  category: string;
+  issue: string;
+  fix_label: string;
+  fix_action: {
+    type: 'set_segments' | 'patch_clip';
+    keep_segments?: [number, number][];
+    updates?: Partial<ViralClip>;
+  };
+}
+
+export interface RetentionAuditReport {
+  clip_id: number;
+  effective_duration: number;
+  overall_score: number;
+  time_to_first_word: number;
+  dead_air_count: number;
+  retention_curve: RetentionPoint[];
+  drop_off_warnings: RetentionWarning[];
+}
+
 export interface SystemInfo {
   cpu_model: string;
   cpu_cores: number;
@@ -92,12 +158,46 @@ export interface PreviewFrameResponse {
   timestamp: number;
 }
 
+export interface PreflightCheck {
+  id: string;
+  title: string;
+  status: 'pass' | 'warn' | 'fail';
+  detail: string;
+  fix_label?: string;
+  fix_patch?: Partial<ViralClip>;
+}
+
+export interface PreflightReport {
+  clip_id: number;
+  readiness_score: number;
+  status: 'pass' | 'warn' | 'risk';
+  checks: PreflightCheck[];
+}
+
+export interface AnalyticsFormulaReport {
+  has_data: boolean;
+  sample_count: number;
+  headline: string;
+  preferred_aspect_ratio: string;
+  preferred_caption_style: string;
+  preferred_frame_layout: string;
+  preferred_duration_band: string;
+  preferred_duration_bounds: [number, number];
+  hook_banner_recommended: boolean;
+  beat_sync_recommended: boolean;
+  avg_views: number;
+  avg_retention_pct: number;
+  prompt_guidance: string;
+}
+
 export interface ViralClip {
   id: number;
   project_id: number;
   start_time: number;
   end_time: number;
   duration: number;
+  keep_segments?: [number, number][];
+  merge_crossfade_sec?: number;
   virality_score: number;
   hook_score: number;
   retention_score: number;
@@ -200,6 +300,34 @@ export interface ViralClip {
   outro_cta_text?: string;
   broll_json?: string;
   broll_segments?: BrollSegment[];
+  speakers?: Record<string, SpeakerProfile>;
+  speaker_lower_thirds?: boolean;
+  face_safe_captions?: boolean;
+  callout_cards?: CalloutCard[];
+  auto_callouts?: boolean;
+  bilingual_enabled?: boolean;
+  secondary_language?: string;
+  dubbing_enabled?: boolean;
+  dubbing_language?: string;
+  dubbing_voice?: string;
+  dubbing_bed_volume?: number;
+  dubbed_audio_path?: string;
+  backdrop_mode?: string;
+  backdrop_blur_intensity?: number;
+  backdrop_color?: string;
+  privacy_blur_boxes?: PrivacyBlurBox[];
+  beat_sync_enabled?: boolean;
+  spectrum_enabled?: boolean;
+  spectrum_position?: 'bottom' | 'top' | 'center' | string;
+  spectrum_color?: string;
+  chapters_enabled?: boolean;
+  chapters?: Array<{ id?: string; start: number; end: number; title: string }>;
+  handle_watermark_enabled?: boolean;
+  handle_text?: string;
+  handle_platform_icon?: 'none' | 'youtube' | 'tiktok' | 'instagram' | 'x' | string;
+  handle_corner?: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' | string;
+  handle_opacity?: number;
+  handle_display_mode?: 'always' | 'pulse_12s' | string;
   hardware_mode: 'gpu' | 'cpu';
 
   // Transcript & publishing

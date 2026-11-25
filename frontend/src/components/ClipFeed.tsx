@@ -1,19 +1,43 @@
 import React, { useMemo, useState } from 'react';
-import { Flame, Check, Loader2, Sparkles, AlertTriangle, ArrowUpDown } from 'lucide-react';
+import { Flame, Check, Loader2, Sparkles, AlertTriangle, ArrowUpDown, GitMerge, CheckSquare, Square, Clapperboard } from 'lucide-react';
 import { ViralClip } from '../types';
 
 interface ClipFeedProps {
   clips: ViralClip[];
   selectedClipId: number | null;
   onSelectClip: (clip: ViralClip) => void;
+  onMergeClips?: (clipIds: number[], smoothTransition: boolean) => Promise<void>;
+  isMerging?: boolean;
+  onCompileTrailer?: () => Promise<void>;
+  isCompilingTrailer?: boolean;
 }
 
 export const ClipFeed: React.FC<ClipFeedProps> = ({
   clips,
   selectedClipId,
-  onSelectClip
+  onSelectClip,
+  onMergeClips,
+  isMerging = false,
+  onCompileTrailer,
+  isCompilingTrailer = false,
 }) => {
   const [sortBy, setSortBy] = useState<'score' | 'timeline'>('score');
+  const [mergeMode, setMergeMode] = useState(false);
+  const [mergeSelection, setMergeSelection] = useState<number[]>([]);
+  const [smoothTransition, setSmoothTransition] = useState(true);
+
+  const toggleMergeSelection = (clipId: number) => {
+    setMergeSelection((prev) =>
+      prev.includes(clipId) ? prev.filter((id) => id !== clipId) : [...prev, clipId]
+    );
+  };
+
+  const handleRunMerge = async () => {
+    if (!onMergeClips || mergeSelection.length < 2 || isMerging) return;
+    await onMergeClips(mergeSelection, smoothTransition);
+    setMergeSelection([]);
+    setMergeMode(false);
+  };
 
   const formatMMSS = (secs: number) => {
     const safe = Math.max(0, Math.floor(secs || 0));
@@ -54,6 +78,36 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
+          {onCompileTrailer && clips.length > 0 && (
+            <button
+              type="button"
+              disabled={isCompilingTrailer}
+              onClick={() => void onCompileTrailer()}
+              className="px-2 py-1 rounded-lg border bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] hover:border-[var(--accent-primary)]/50 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50"
+              title="Compile top 3-5 viral moments into an AI Supercut Trailer"
+            >
+              {isCompilingTrailer ? <Loader2 className="w-3 h-3 animate-spin" /> : <Clapperboard className="w-3 h-3" />}
+              <span>{isCompilingTrailer ? '...' : 'Trailer'}</span>
+            </button>
+          )}
+          {onMergeClips && clips.length >= 2 && (
+            <button
+              type="button"
+              onClick={() => {
+                setMergeMode((v) => !v);
+                setMergeSelection([]);
+              }}
+              className={`px-2 py-1 rounded-lg border text-[10px] font-bold flex items-center gap-1 transition ${
+                mergeMode
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)]'
+              }`}
+              title="Select 2+ clips to stitch together"
+            >
+              <GitMerge className="w-3 h-3" />
+              <span>{mergeMode ? 'Done' : 'Merge'}</span>
+            </button>
+          )}
           <ArrowUpDown className="w-3 h-3 text-[var(--text-secondary)]" />
           <select
             aria-label="Sort clips"
@@ -66,6 +120,36 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
           </select>
         </div>
       </div>
+
+      {mergeMode && (
+        <div className="px-3 py-2 border-b border-[var(--border-subtle)] bg-[var(--accent-subtle)]/40 space-y-2 shrink-0">
+          <div className="flex items-center justify-between text-[11px]">
+            <span className="font-semibold text-[var(--text-primary)]">
+              Selected: {mergeSelection.length} clip{mergeSelection.length === 1 ? '' : 's'}
+            </span>
+            <label className="flex items-center gap-1.5 text-[10px] text-[var(--text-secondary)] cursor-pointer">
+              <input
+                type="checkbox"
+                checked={smoothTransition}
+                onChange={(e) => setSmoothTransition(e.target.checked)}
+                className="accent-[var(--accent-primary)] w-3 h-3"
+              />
+              <span>0.35s Crossfade</span>
+            </label>
+          </div>
+          <button
+            type="button"
+            disabled={mergeSelection.length < 2 || isMerging}
+            onClick={handleRunMerge}
+            className="w-full py-1.5 px-2.5 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold text-[11px] flex items-center justify-center gap-1.5 hover:opacity-90 transition disabled:opacity-45 disabled:cursor-not-allowed"
+          >
+            {isMerging ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <GitMerge className="w-3.5 h-3.5" />}
+            <span>
+              {isMerging ? 'Merging Clips...' : `Merge Selected Clips (${mergeSelection.length})`}
+            </span>
+          </button>
+        </div>
+      )}
 
       {/* Scrollable Clip Cards */}
       <div className="flex-1 min-h-0 overflow-y-auto p-3 space-y-2.5">
@@ -80,18 +164,37 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
         ) : (
           sortedClips.map((clip, index) => {
             const isSelected = clip.id === selectedClipId;
+            const mergeOrder = mergeSelection.indexOf(clip.id);
+            const isCheckedForMerge = mergeOrder !== -1;
             return (
               <div
                 key={clip.id}
-                onClick={() => onSelectClip(clip)}
-                className={`group rounded-xl p-3 border transition-all cursor-pointer space-y-2 ${isSelected
+                onClick={() => (mergeMode ? toggleMergeSelection(clip.id) : onSelectClip(clip))}
+                className={`group rounded-xl p-3 border transition-all cursor-pointer space-y-2 ${
+                  mergeMode && isCheckedForMerge
+                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
+                    : isSelected
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
                     : 'bg-[var(--bg-card)] border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/45'
-                  }`}
+                }`}
               >
                 {/* Top Row: Rank pill, Duration + Range, Virality Score Badge */}
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 min-w-0 tabular-nums">
+                    {mergeMode && (
+                      <span className="inline-flex items-center gap-1 text-[var(--accent-primary)] shrink-0">
+                        {isCheckedForMerge ? (
+                          <CheckSquare className="w-3.5 h-3.5" />
+                        ) : (
+                          <Square className="w-3.5 h-3.5 text-[var(--text-secondary)]" />
+                        )}
+                        {isCheckedForMerge && (
+                          <span className="text-[9px] font-black px-1 rounded bg-[var(--accent-primary)] text-[var(--accent-foreground)]">
+                            {mergeOrder + 1}
+                          </span>
+                        )}
+                      </span>
+                    )}
                     <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-md bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-primary)] shrink-0">
                       #{index + 1}
                     </span>

@@ -9,6 +9,7 @@ SQLITE_URL = f"sqlite:///{SQLITE_DB_PATH}"
 engine = create_engine(SQLITE_URL, echo=False, connect_args={"check_same_thread": False})
 
 def init_db():
+    import app.models  # noqa: F401 - ensure all SQLModel tables (including ExportEvent) register before create_all
     SQLModel.metadata.create_all(engine)
     # Lightweight schema auto-migration for existing SQLite tables
     try:
@@ -36,6 +37,36 @@ def init_db():
                     "status": "ALTER TABLE viral_clips ADD COLUMN status TEXT DEFAULT 'draft'",
                     "rendered_path": "ALTER TABLE viral_clips ADD COLUMN rendered_path TEXT",
                     "highlight_power_words": "ALTER TABLE viral_clips ADD COLUMN highlight_power_words BOOLEAN DEFAULT 0",
+                    "keep_segments_json": "ALTER TABLE viral_clips ADD COLUMN keep_segments_json TEXT DEFAULT '[]'",
+                    "merge_crossfade_sec": "ALTER TABLE viral_clips ADD COLUMN merge_crossfade_sec FLOAT DEFAULT 0.03",
+                    "speakers_json": "ALTER TABLE viral_clips ADD COLUMN speakers_json TEXT DEFAULT '{}'",
+                    "speaker_lower_thirds": "ALTER TABLE viral_clips ADD COLUMN speaker_lower_thirds BOOLEAN DEFAULT 0",
+                    "face_safe_captions": "ALTER TABLE viral_clips ADD COLUMN face_safe_captions BOOLEAN DEFAULT 1",
+                    "callout_cards_json": "ALTER TABLE viral_clips ADD COLUMN callout_cards_json TEXT DEFAULT '[]'",
+                    "auto_callouts": "ALTER TABLE viral_clips ADD COLUMN auto_callouts BOOLEAN DEFAULT 0",
+                    "bilingual_enabled": "ALTER TABLE viral_clips ADD COLUMN bilingual_enabled BOOLEAN DEFAULT 0",
+                    "secondary_language": "ALTER TABLE viral_clips ADD COLUMN secondary_language TEXT DEFAULT ''",
+                    "dubbing_enabled": "ALTER TABLE viral_clips ADD COLUMN dubbing_enabled BOOLEAN DEFAULT 0",
+                    "dubbing_language": "ALTER TABLE viral_clips ADD COLUMN dubbing_language TEXT DEFAULT 'Spanish'",
+                    "dubbing_voice": "ALTER TABLE viral_clips ADD COLUMN dubbing_voice TEXT DEFAULT 'default'",
+                    "dubbing_bed_volume": "ALTER TABLE viral_clips ADD COLUMN dubbing_bed_volume FLOAT DEFAULT 0.15",
+                    "dubbed_audio_path": "ALTER TABLE viral_clips ADD COLUMN dubbed_audio_path TEXT",
+                    "backdrop_mode": "ALTER TABLE viral_clips ADD COLUMN backdrop_mode TEXT DEFAULT 'none'",
+                    "backdrop_blur_intensity": "ALTER TABLE viral_clips ADD COLUMN backdrop_blur_intensity FLOAT DEFAULT 18.0",
+                    "backdrop_color": "ALTER TABLE viral_clips ADD COLUMN backdrop_color TEXT DEFAULT '#18181B'",
+                    "privacy_blur_json": "ALTER TABLE viral_clips ADD COLUMN privacy_blur_json TEXT DEFAULT '[]'",
+                    "beat_sync_enabled": "ALTER TABLE viral_clips ADD COLUMN beat_sync_enabled BOOLEAN DEFAULT 0",
+                    "spectrum_enabled": "ALTER TABLE viral_clips ADD COLUMN spectrum_enabled BOOLEAN DEFAULT 0",
+                    "spectrum_position": "ALTER TABLE viral_clips ADD COLUMN spectrum_position TEXT DEFAULT 'bottom'",
+                    "spectrum_color": "ALTER TABLE viral_clips ADD COLUMN spectrum_color TEXT DEFAULT '#C6F32F'",
+                    "chapters_json": "ALTER TABLE viral_clips ADD COLUMN chapters_json TEXT DEFAULT '[]'",
+                    "chapters_enabled": "ALTER TABLE viral_clips ADD COLUMN chapters_enabled BOOLEAN DEFAULT 0",
+                    "handle_watermark_enabled": "ALTER TABLE viral_clips ADD COLUMN handle_watermark_enabled BOOLEAN DEFAULT 0",
+                    "handle_text": "ALTER TABLE viral_clips ADD COLUMN handle_text TEXT DEFAULT ''",
+                    "handle_platform_icon": "ALTER TABLE viral_clips ADD COLUMN handle_platform_icon TEXT DEFAULT 'none'",
+                    "handle_corner": "ALTER TABLE viral_clips ADD COLUMN handle_corner TEXT DEFAULT 'bottom_right'",
+                    "handle_opacity": "ALTER TABLE viral_clips ADD COLUMN handle_opacity FLOAT DEFAULT 0.65",
+                    "handle_display_mode": "ALTER TABLE viral_clips ADD COLUMN handle_display_mode TEXT DEFAULT 'always'",
                 }
                 added = False
                 for col, sql in migrations.items():

@@ -512,10 +512,13 @@ def get_duration_range(preset: str) -> tuple[float, float]:
 def build_gemini_prompt(
     duration_preset: str = "30-58s",
     clip_count: int = 5,
-    topic_focus: Optional[str] = None
+    topic_focus: Optional[str] = None,
+    formula_weights: Optional[Dict[str, Any]] = None,
 ) -> str:
     min_dur, max_dur = get_duration_range(duration_preset)
     focus_clause = f"\nCREATIVE TOPIC FOCUS: Prioritize moments focusing on: '{topic_focus}'." if topic_focus else ""
+    guidance = (formula_weights or {}).get("prompt_guidance") or ""
+    formula_clause = f"\n{guidance}" if (formula_weights and formula_weights.get("has_data") and guidance) else ""
 
     return f"""
 You are an elite YouTube Shorts & multi-format virality director and video systems architect.
@@ -523,7 +526,7 @@ Analyze this video content and extract the top {clip_count} most compelling, hig
 
 CRITICAL REQUIREMENTS:
 1. Target Count: Return exactly {clip_count} distinct, high-impact clip moments from the actual content.
-2. Duration: Each clip MUST be strictly between {int(min_dur)} and {int(max_dur)} seconds in length.{focus_clause}
+2. Duration: Each clip MUST be strictly between {int(min_dur)} and {int(max_dur)} seconds in length.{focus_clause}{formula_clause}
 3. Complete Sentences: Clip start and end timestamps MUST align with natural pauses and full sentences. NEVER cut off speech mid-word or mid-thought.
 4. Virality Criteria:
    - Strong hook in opening 3 seconds (curiosity gap, controversial statement, surprising insight, or energetic action).
@@ -580,7 +583,8 @@ def extract_viral_clips(
     transcript_words: Optional[List[Dict[str, Any]]] = None,
     gemini_analysis_mode: str = "transcript",
     preferred_model: Optional[str] = None,
-    on_log: Optional[Any] = None
+    on_log: Optional[Any] = None,
+    formula_weights: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Extract viral clips using official Google GenAI SDK.
@@ -609,7 +613,7 @@ def extract_viral_clips(
 
     # Enforce strict 60-second HTTP timeout per request
     client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
-    prompt = build_gemini_prompt(duration_preset, clip_count, topic_focus)
+    prompt = build_gemini_prompt(duration_preset, clip_count, topic_focus, formula_weights=formula_weights)
     min_dur, max_dur = get_duration_range(duration_preset)
 
     cascade = get_model_cascade(preferred_model or settings.GEMINI_MODEL, api_key=api_key)

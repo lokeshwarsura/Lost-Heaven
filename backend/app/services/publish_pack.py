@@ -145,6 +145,8 @@ def build_publish_pack_zip(
         raise FileNotFoundError(f"Master video missing for project {project.id}")
 
     raw_words = clip.get_transcript() or []
+    keep_segs = clip.get_keep_segments()
+    merge_cf = float(getattr(clip, "merge_crossfade_sec", 0.03) or 0.03)
     clip_dur = max(0.5, float(clip.end_time) - float(clip.start_time))
     tl_plan = compute_kept_segments_and_remapped_words(
         words=raw_words,
@@ -153,6 +155,8 @@ def build_publish_pack_zip(
         tighten_pacing=bool(getattr(clip, "tighten_pacing", False)),
         silence_threshold=float(getattr(clip, "silence_threshold", 0.50)),
         clean_filler_words=bool(clip.clean_filler_words),
+        crossfade_sec=merge_cf,
+        explicit_keep_segments=[(s, e) for s, e in keep_segs],
     )
     remapped_words = tl_plan.get("remapped_words") or raw_words
     effective_duration = float(tl_plan.get("effective_duration") or clip_dur)
@@ -271,6 +275,8 @@ def build_publish_pack_zip(
                 quality_mode=quality_mode,
                 output_path_override=out_mp4,
                 allow_concurrent=True,
+                keep_segments=keep_segs,
+                merge_crossfade_sec=merge_cf,
             )
             if rendered_out and os.path.exists(rendered_out):
                 rendered_files.append((rendered_out, arcname))

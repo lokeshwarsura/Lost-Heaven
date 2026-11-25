@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import {
   Type, Sparkles, Move, Palette, Upload, AlignLeft, AlignCenter, AlignRight,
-  RefreshCw, Volume2, Globe, EyeOff, Eye, Save, Check, RotateCcw, X, Scissors, ShieldAlert, Zap
+  RefreshCw, Volume2, Globe, EyeOff, Eye, Save, Check, RotateCcw, X, Scissors, ShieldAlert, Zap,
+  Users, ShieldCheck
 } from 'lucide-react';
 import { ViralClip, CaptionStylePreset } from '../types';
 import { api } from '../api/client';
@@ -39,6 +40,14 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
   const [showSaveStyle, setShowSaveStyle] = useState(false);
   const [styleNameInput, setStyleNameInput] = useState('');
   const [styleSavedFeedback, setStyleSavedFeedback] = useState(false);
+  const [isDiarizing, setIsDiarizing] = useState(false);
+  const [diarizeMsg, setDiarizeMsg] = useState<string | null>(null);
+  const [editingSpeakerId, setEditingSpeakerId] = useState<string | null>(null);
+  const [bilingualLang, setBilingualLang] = useState<string>('Spanish');
+  const [isTranslating, setIsTranslating] = useState(false);
+  const [translateMsg, setTranslateMsg] = useState<string | null>(null);
+  const [isGeneratingChapters, setIsGeneratingChapters] = useState(false);
+  const [chapterMsg, setChapterMsg] = useState<string | null>(null);
 
   if (!clip) {
     return (
@@ -205,11 +214,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
           <button
             type="button"
             onClick={() => onUpdateClip({ tighten_pacing: !clip.tighten_pacing })}
-            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${
-              clip.tighten_pacing
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
+            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${clip.tighten_pacing
+              ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+              : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
             title="Automatically jump-cut awkward pauses longer than the threshold"
           >
             <Zap className="w-3 h-3" />
@@ -237,11 +245,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
           <button
             type="button"
             onClick={() => onUpdateClip({ clean_filler_words: !clip.clean_filler_words })}
-            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${
-              clip.clean_filler_words
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
+            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${clip.clean_filler_words
+              ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+              : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
             title="Cut filler utterances (um, uh, erm, ah) from video & captions"
           >
             <Scissors className="w-3 h-3" />
@@ -251,16 +258,254 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
           <button
             type="button"
             onClick={() => onUpdateClip({ censor_profanity: !clip.censor_profanity })}
-            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${
-              clip.censor_profanity
-                ? 'bg-amber-500/15 border-amber-500/40 text-amber-400'
-                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
+            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${clip.censor_profanity
+              ? 'bg-amber-500/15 border-amber-500/40 text-amber-400'
+              : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
             title="Mask profanity in captions (e.g. f***) and replace audio with -14dB 1000Hz bleep"
           >
             <ShieldAlert className="w-3 h-3" />
             <span>Auto-Censor Profanity</span>
           </button>
+
+          <button
+            type="button"
+            disabled={isDiarizing || words.length === 0}
+            onClick={async () => {
+              if (!clip) return;
+              try {
+                setIsDiarizing(true);
+                setDiarizeMsg(null);
+                const res = await api.diarizeClip(projectId ?? clip.project_id, clip.id);
+                onUpdateClip({ speakers: res.speakers, transcript_words: res.words });
+                setDiarizeMsg(`Detected ${res.speaker_count} speaker${res.speaker_count === 1 ? '' : 's'}`);
+              } catch (err: any) {
+                setDiarizeMsg(err?.message || 'Diarization failed');
+              } finally {
+                setIsDiarizing(false);
+              }
+            }}
+            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition disabled:opacity-50 ${Object.keys(clip.speakers || {}).length > 0
+              ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+              : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+            title="Detect local speakers using acoustic timbre + active face tracking"
+          >
+            <Users className="w-3 h-3" />
+            <span>{isDiarizing ? 'Detecting...' : 'Detect Speakers'}</span>
+          </button>
+
+          {Object.keys(clip.speakers || {}).length > 0 && (
+            <button
+              type="button"
+              onClick={() => onUpdateClip({ speaker_lower_thirds: !(clip.speaker_lower_thirds ?? false) })}
+              className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1 transition ${clip.speaker_lower_thirds
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              title="Burn automatic 2.5s nameplate badge on speaker turns"
+            >
+              <span>{clip.speaker_lower_thirds ? '✓ ' : ''}Speaker Nameplates</span>
+            </button>
+          )}
+        </div>
+
+        {(diarizeMsg || Object.keys(clip.speakers || {}).length > 0) && (
+          <div className="flex flex-wrap items-center gap-1.5 px-2 py-1.5 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[11px]">
+            {Object.values(clip.speakers || {}).map((spk) => (
+              <div
+                key={spk.id}
+                className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[var(--bg-card)] border border-[var(--border-subtle)]"
+              >
+                <input
+                  type="color"
+                  value={spk.color || '#C6F32F'}
+                  onChange={(e) => {
+                    const nextSpk = { ...(clip.speakers || {}), [spk.id]: { ...spk, color: e.target.value } };
+                    onUpdateClip({ speakers: nextSpk });
+                  }}
+                  className="w-3.5 h-3.5 rounded-full cursor-pointer border-0 bg-transparent p-0"
+                  title={`Highlight color for ${spk.name}`}
+                />
+                {editingSpeakerId === spk.id ? (
+                  <input
+                    type="text"
+                    autoFocus
+                    value={spk.name}
+                    onChange={(e) => {
+                      const nextSpk = { ...(clip.speakers || {}), [spk.id]: { ...spk, name: e.target.value } };
+                      onUpdateClip({ speakers: nextSpk });
+                    }}
+                    onBlur={() => setEditingSpeakerId(null)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === 'Escape') setEditingSpeakerId(null);
+                    }}
+                    className="w-24 bg-[var(--bg-input)] border border-[var(--accent-primary)] rounded px-1 py-0 text-[10px] font-semibold text-[var(--text-primary)] outline-none"
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setEditingSpeakerId(spk.id)}
+                    className="font-semibold text-[var(--text-primary)] hover:text-[var(--accent-primary)]"
+                    title="Click to rename speaker"
+                  >
+                    {spk.name}
+                  </button>
+                )}
+              </div>
+            ))}
+            {diarizeMsg && (
+              <span className="ml-auto text-[10px] font-mono text-[var(--accent-primary)]">{diarizeMsg}</span>
+            )}
+          </div>
+        )}
+
+        {/* Bilingual Stacked Captions Control Bar */}
+        <div className="flex flex-wrap items-center gap-2 px-2 py-1.5 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[11px]">
+          <span className="font-semibold text-[var(--text-secondary)] flex items-center gap-1">
+            <Globe className="w-3 h-3 text-[var(--accent-primary)]" />
+            Bilingual:
+          </span>
+          <select
+            value={clip.secondary_language || bilingualLang}
+            onChange={(e) => setBilingualLang(e.target.value)}
+            aria-label="Secondary caption language"
+            className="bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded px-2 py-0.5 text-[11px] font-semibold text-[var(--text-primary)] outline-none"
+          >
+            {['Spanish', 'Hindi', 'Telugu', 'French', 'German', 'Portuguese', 'Japanese', 'Korean', 'Arabic', 'English'].map((lang) => (
+              <option key={lang} value={lang}>{lang}</option>
+            ))}
+          </select>
+          <button
+            type="button"
+            disabled={isTranslating || words.length === 0}
+            onClick={async () => {
+              if (!clip) return;
+              const target = clip.secondary_language && bilingualLang === 'Spanish' ? clip.secondary_language : bilingualLang;
+              try {
+                setIsTranslating(true);
+                setTranslateMsg(null);
+                const res = await api.translateClip(projectId ?? clip.project_id, clip.id, target);
+                onUpdateClip({
+                  transcript_words: res.clip.transcript_words,
+                  bilingual_enabled: true,
+                  secondary_language: res.target_language,
+                });
+                setTranslateMsg(`Stacked ${res.target_language} (${res.source})`);
+              } catch (err: any) {
+                setTranslateMsg(err?.message || 'Translation failed');
+              } finally {
+                setIsTranslating(false);
+              }
+            }}
+            className="px-2 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] font-semibold text-[10px] text-[var(--text-primary)] transition disabled:opacity-50"
+          >
+            {isTranslating ? 'Translating...' : 'Translate & Stack'}
+          </button>
+          <button
+            type="button"
+            onClick={() => onUpdateClip({ bilingual_enabled: !(clip.bilingual_enabled ?? false) })}
+            className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${clip.bilingual_enabled
+              ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+              : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+              }`}
+          >
+            {clip.bilingual_enabled ? '✓ Stacked ON' : 'Stacked OFF'}
+          </button>
+          {translateMsg && (
+            <span className="ml-auto text-[10px] font-mono text-[var(--accent-primary)]">{translateMsg}</span>
+          )}
+        </div>
+
+        {/* Animated Mini-Chapter Pills (Glassmorphic Corner Badges) */}
+        <div className="mb-3 p-2.5 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] space-y-2">
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <span className="font-semibold text-[var(--text-primary)] flex items-center gap-1">
+              <Sparkles className="w-3 h-3 text-[var(--accent-primary)]" />
+              Mini-Chapter Pills
+            </span>
+            <button
+              type="button"
+              disabled={isGeneratingChapters || !clip}
+              onClick={async () => {
+                if (!clip) return;
+                try {
+                  setIsGeneratingChapters(true);
+                  setChapterMsg(null);
+                  const res = await api.generateChapters(projectId ?? clip.project_id, clip.id, 4, true);
+                  onUpdateClip({
+                    chapters: res.chapters,
+                    chapters_enabled: true,
+                  });
+                  setChapterMsg(`Generated ${res.chapters.length} chapters`);
+                } catch (err: any) {
+                  setChapterMsg(err?.message || 'Failed');
+                } finally {
+                  setIsGeneratingChapters(false);
+                }
+              }}
+              className="px-2 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] font-semibold text-[10px] text-[var(--text-primary)] transition disabled:opacity-50"
+            >
+              {isGeneratingChapters ? 'Detecting...' : 'Generate Chapters'}
+            </button>
+            <button
+              type="button"
+              onClick={() => onUpdateClip({ chapters_enabled: !(clip.chapters_enabled ?? false) })}
+              className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${
+                clip.chapters_enabled
+                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                  : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+              }`}
+            >
+              {clip.chapters_enabled ? '✓ Pills ON' : 'Pills OFF'}
+            </button>
+            {chapterMsg && (
+              <span className="ml-auto text-[10px] font-mono text-[var(--accent-primary)]">{chapterMsg}</span>
+            )}
+          </div>
+
+          {(clip.chapters || []).length > 0 && (
+            <div className="space-y-1.5 max-h-[120px] overflow-y-auto pr-1">
+              {(clip.chapters || []).map((ch, cIdx) => (
+                <div
+                  key={ch.id || `ch_${cIdx}`}
+                  className="flex items-center gap-1.5 text-[10px] bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-lg px-2 py-1"
+                >
+                  <button
+                    type="button"
+                    onClick={() => onSeekTimestamp?.(Number(ch.start || 0))}
+                    className="font-mono text-[var(--accent-primary)] hover:underline shrink-0"
+                    title="Seek preview to chapter start"
+                  >
+                    {Number(ch.start || 0).toFixed(1)}s–{Number(ch.end || 0).toFixed(1)}s
+                  </button>
+                  <input
+                    type="text"
+                    value={ch.title || ''}
+                    onChange={(e) => {
+                      const next = (clip.chapters || []).map((item, i) =>
+                        i === cIdx ? { ...item, title: e.target.value } : item
+                      );
+                      onUpdateClip({ chapters: next });
+                    }}
+                    className="flex-1 min-w-0 bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded px-1.5 py-0.5 text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                    placeholder={`Part ${cIdx + 1}`}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = (clip.chapters || []).filter((_, i) => i !== cIdx);
+                      onUpdateClip({ chapters: next });
+                    }}
+                    className="p-0.5 text-[var(--text-muted)] hover:text-red-400"
+                    title="Remove chapter"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Flowing Inline Paragraph Surface */}
@@ -311,20 +556,24 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     w.cut_from_video
                       ? `${formatTimestamp(w.start)} — Cut from video & audio`
                       : w.deleted
-                      ? `${formatTimestamp(w.start)} — Hidden from captions only`
-                      : `${formatTimestamp(w.start)} — Click to seek, double-click to edit`
+                        ? `${formatTimestamp(w.start)} — Hidden from captions only`
+                        : `${formatTimestamp(w.start)} — Click to seek, double-click to edit`
                   }
-                  className={`px-1.5 py-0.5 rounded-md text-xs transition cursor-pointer ${
-                    w.cut_from_video
-                      ? 'bg-red-500/15 border border-red-500/40 text-red-400 line-through hover:opacity-80'
-                      : w.deleted
+                  style={
+                    w.speaker_id && clip.speakers?.[w.speaker_id]?.color
+                      ? { borderBottom: `2px solid ${clip.speakers[w.speaker_id].color}` }
+                      : undefined
+                  }
+                  className={`px-1.5 py-0.5 rounded-md text-xs transition cursor-pointer ${w.cut_from_video
+                    ? 'bg-red-500/15 border border-red-500/40 text-red-400 line-through hover:opacity-80'
+                    : w.deleted
                       ? 'line-through opacity-40 text-[var(--text-secondary)] hover:opacity-70'
                       : isPlaybackActive
-                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold shadow-sm'
-                      : isSelected
-                      ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)] font-semibold'
-                      : 'text-[var(--text-primary)] hover:bg-[var(--bg-card)]'
-                  }`}
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold shadow-sm'
+                        : isSelected
+                          ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)] font-semibold'
+                          : 'text-[var(--text-primary)] hover:bg-[var(--bg-card)]'
+                    }`}
                 >
                   {w.word}
                 </button>
@@ -365,11 +614,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
               <button
                 type="button"
                 onClick={() => handleToggleDeleteWord(selectedWordIdx)}
-                className={`px-2.5 py-1 rounded-md border text-[11px] font-semibold flex items-center gap-1 transition ${
-                  selectedWord.deleted
-                    ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
+                className={`px-2.5 py-1 rounded-md border text-[11px] font-semibold flex items-center gap-1 transition ${selectedWord.deleted
+                  ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
               >
                 {selectedWord.deleted ? (
                   <>
@@ -384,11 +632,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
               <button
                 type="button"
                 onClick={() => handleToggleCutWord(selectedWordIdx)}
-                className={`px-2.5 py-1 rounded-md border text-[11px] font-semibold flex items-center gap-1 transition ${
-                  selectedWord.cut_from_video
-                    ? 'bg-red-500/20 border-red-500/50 text-red-400'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-red-400 hover:border-red-500/40'
-                }`}
+                className={`px-2.5 py-1 rounded-md border text-[11px] font-semibold flex items-center gap-1 transition ${selectedWord.cut_from_video
+                  ? 'bg-red-500/20 border-red-500/50 text-red-400'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-red-400 hover:border-red-500/40'
+                  }`}
               >
                 <Scissors className="w-3 h-3" />
                 <span>{selectedWord.cut_from_video ? 'Restore Video Cut' : 'Cut From Video'}</span>
@@ -421,11 +668,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
               key={tab.id}
               type="button"
               onClick={() => setSubTab(tab.id as any)}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg text-xs font-semibold transition whitespace-nowrap ${
-                active
-                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-sm'
-                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-              }`}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg text-xs font-semibold transition whitespace-nowrap ${active
+                ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-sm'
+                : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
             >
               <Icon className="w-3.5 h-3.5 shrink-0" />
               <span className="truncate">{tab.label}</span>
@@ -443,22 +689,20 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
               <button
                 type="button"
                 onClick={() => onUpdateClip({ burn_captions: true })}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition ${
-                  clip.burn_captions
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                    : 'text-[var(--text-secondary)]'
-                }`}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition ${clip.burn_captions
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                  : 'text-[var(--text-secondary)]'
+                  }`}
               >
                 Captions ON
               </button>
               <button
                 type="button"
                 onClick={() => onUpdateClip({ burn_captions: false })}
-                className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition ${
-                  !clip.burn_captions
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                    : 'text-[var(--text-secondary)]'
-                }`}
+                className={`px-2.5 py-1 rounded-md text-[11px] font-bold transition ${!clip.burn_captions
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                  : 'text-[var(--text-secondary)]'
+                  }`}
               >
                 Captions OFF
               </button>
@@ -542,19 +786,17 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                   key={s.name}
                   type="button"
                   onClick={() => handleApplyPreset(s)}
-                  className={`h-[76px] p-2.5 rounded-xl border text-center transition flex flex-col items-center justify-between ${
-                    isSelected
-                      ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]/40'
-                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/40'
-                  }`}
+                  className={`h-[76px] p-2.5 rounded-xl border text-center transition flex flex-col items-center justify-between ${isSelected
+                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]/40'
+                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/40'
+                    }`}
                 >
                   <span className="text-[10px] font-medium text-[var(--text-secondary)] truncate w-full">
                     {s.name}
                   </span>
                   <div
-                    className={`my-auto text-xs truncate max-w-full px-1.5 py-0.5 rounded ${
-                      s.box ? 'bg-zinc-900/90' : s.block ? 'bg-[var(--accent-primary)]' : ''
-                    } ${s.bold ? 'font-black' : 'font-semibold'} ${s.italic ? 'italic' : ''}`}
+                    className={`my-auto text-xs truncate max-w-full px-1.5 py-0.5 rounded ${s.box ? 'bg-zinc-900/90' : s.block ? 'bg-[var(--accent-primary)]' : ''
+                      } ${s.bold ? 'font-black' : 'font-semibold'} ${s.italic ? 'italic' : ''}`}
                     style={{
                       fontFamily: s.font,
                       color: s.block ? '#000000' : s.active,
@@ -635,33 +877,30 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                 <button
                   type="button"
                   onClick={() => onUpdateClip({ bold: !clip.bold })}
-                  className={`py-1.5 rounded-md font-bold text-xs transition ${
-                    clip.bold
-                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                  }`}
+                  className={`py-1.5 rounded-md font-bold text-xs transition ${clip.bold
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
                 >
                   Bold
                 </button>
                 <button
                   type="button"
                   onClick={() => onUpdateClip({ italic: !clip.italic })}
-                  className={`py-1.5 rounded-md italic text-xs font-medium transition ${
-                    clip.italic
-                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                  }`}
+                  className={`py-1.5 rounded-md italic text-xs font-medium transition ${clip.italic
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
                 >
                   Italic
                 </button>
                 <button
                   type="button"
                   onClick={() => onUpdateClip({ all_caps: !clip.all_caps })}
-                  className={`py-1.5 rounded-md font-mono font-bold text-xs transition ${
-                    clip.all_caps
-                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                  }`}
+                  className={`py-1.5 rounded-md font-mono font-bold text-xs transition ${clip.all_caps
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
                 >
                   UPPERCASE
                 </button>
@@ -685,11 +924,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                       key={a.id}
                       type="button"
                       onClick={() => onUpdateClip({ text_align: a.id as any })}
-                      className={`py-1.5 rounded-md flex items-center justify-center gap-1.5 text-xs font-medium transition ${
-                        active
-                          ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold'
-                          : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
+                      className={`py-1.5 rounded-md flex items-center justify-center gap-1.5 text-xs font-medium transition ${active
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
                     >
                       <Icon className="w-3.5 h-3.5" />
                       <span>{a.id}</span>
@@ -751,11 +989,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     key={shape.id}
                     type="button"
                     onClick={() => onUpdateClip({ highlight_shape: shape.id as any })}
-                    className={`py-1 rounded-md text-[11px] font-bold transition ${
-                      clip.highlight_shape === shape.id
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
+                    className={`py-1 rounded-md text-[11px] font-bold transition ${clip.highlight_shape === shape.id
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                      }`}
                   >
                     {shape.label}
                   </button>
@@ -767,11 +1004,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
               <button
                 type="button"
                 onClick={() => onUpdateClip({ emoji_enabled: !clip.emoji_enabled })}
-                className={`px-3 py-2 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${
-                  clip.emoji_enabled
-                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
-                }`}
+                className={`px-3 py-2 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${clip.emoji_enabled
+                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
               >
                 <span>Auto-Emoji</span>
                 <span className="text-[10px] font-bold">{clip.emoji_enabled ? 'ON' : 'OFF'}</span>
@@ -782,11 +1018,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                 onClick={() =>
                   onUpdateClip({ highlight_power_words: !clip.highlight_power_words })
                 }
-                className={`px-2.5 py-2 rounded-lg border flex items-center justify-between gap-1.5 text-[11px] font-semibold transition ${
-                  clip.highlight_power_words
-                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
-                }`}
+                className={`px-2.5 py-2 rounded-lg border flex items-center justify-between gap-1.5 text-[11px] font-semibold transition ${clip.highlight_power_words
+                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
                 title="Auto-Highlight Power Words (1.08x + highlight accent)"
               >
                 <span className="truncate">Auto-Highlight Power Words</span>
@@ -803,11 +1038,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                       clip.how_phrase_arrives === 'Word by word' ? 'All at once' : 'Word by word'
                   })
                 }
-                className={`px-3 py-2 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${
-                  clip.how_phrase_arrives === 'Word by word'
-                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
-                }`}
+                className={`px-3 py-2 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${clip.how_phrase_arrives === 'Word by word'
+                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
               >
                 <span>Word-by-Word</span>
                 <span className="text-[10px] font-bold">
@@ -943,11 +1177,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     onClick={() =>
                       onUpdateClip({ position_grid: pos.id, position_x: pos.x, position_y: pos.y })
                     }
-                    className={`rounded-md transition flex items-center justify-center ${
-                      clip.position_grid === pos.id
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-sm'
-                        : 'bg-[var(--bg-card)] hover:bg-[var(--accent-subtle)] text-[var(--text-secondary)]'
-                    }`}
+                    className={`rounded-md transition flex items-center justify-center ${clip.position_grid === pos.id
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-sm'
+                      : 'bg-[var(--bg-card)] hover:bg-[var(--accent-subtle)] text-[var(--text-secondary)]'
+                      }`}
                     title={pos.label}
                   >
                     <div className="w-1.5 h-1.5 rounded-full bg-current" />
@@ -989,6 +1222,24 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
                   />
                 </div>
+
+                <button
+                  type="button"
+                  onClick={() => onUpdateClip({ face_safe_captions: !(clip.face_safe_captions ?? true) })}
+                  className={`w-full px-2.5 py-1.5 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${(clip.face_safe_captions ?? true)
+                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
+                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                    }`}
+                  title="Automatically dodge speaker face bounding boxes so captions never cover the subject's eyes or mouth"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                    <span>Smart Face-Safe Placement</span>
+                  </span>
+                  <span className="text-[10px] font-bold">
+                    {(clip.face_safe_captions ?? true) ? 'ON' : 'OFF'}
+                  </span>
+                </button>
               </div>
             </div>
           </div>
@@ -1006,11 +1257,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     key={anim}
                     type="button"
                     onClick={() => onUpdateClip({ caption_animation: anim })}
-                    className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${
-                      clip.caption_animation === anim
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
+                    className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${clip.caption_animation === anim
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                      }`}
                   >
                     {anim}
                   </button>
@@ -1028,11 +1278,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     key={anim}
                     type="button"
                     onClick={() => onUpdateClip({ caption_animation: anim })}
-                    className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${
-                      clip.caption_animation === anim
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
+                    className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${clip.caption_animation === anim
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                      }`}
                   >
                     {anim}
                   </button>

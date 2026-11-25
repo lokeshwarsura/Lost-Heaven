@@ -4,7 +4,7 @@ import {
   Trash2, ArrowRight, CheckCircle2, Layers, Globe, FileVideo,
   AlertCircle, RefreshCw, Cpu, Zap
 } from 'lucide-react';
-import { Project } from '../types';
+import { Project, AnalyticsFormulaReport } from '../types';
 import { api } from '../api/client';
 
 const YouTubeIcon: React.FC<{ className?: string }> = ({ className = "w-4 h-4" }) => (
@@ -47,11 +47,13 @@ export const HomeView: React.FC<HomeViewProps> = ({
   // Recent Projects
   const [recentProjects, setRecentProjects] = useState<Project[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
+  const [formulaReport, setFormulaReport] = useState<AnalyticsFormulaReport | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     loadRecentProjects();
+    api.getAnalyticsFormula().then(setFormulaReport).catch(() => null);
   }, []);
 
   const loadRecentProjects = async () => {
@@ -552,6 +554,38 @@ export const HomeView: React.FC<HomeViewProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Local Style Intelligence Card */}
+        {formulaReport && (
+          <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 shadow-sm">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-xl bg-[var(--accent-subtle)] border border-[var(--accent-primary)]/40 flex items-center justify-center shrink-0">
+                <Sparkles className="w-4 h-4 text-[var(--accent-primary)]" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--accent-primary)]">
+                  Your Top Performing Formula
+                  {formulaReport.sample_count > 0 ? ` · ${formulaReport.sample_count} tracked` : ''}
+                </div>
+                <div className="text-xs font-semibold text-[var(--text-primary)] truncate">
+                  {formulaReport.headline}
+                </div>
+              </div>
+            </div>
+            {formulaReport.has_data && (
+              <div className="flex items-center gap-3 text-[11px] font-mono text-[var(--text-secondary)] shrink-0">
+                {formulaReport.avg_views > 0 && (
+                  <span>{formulaReport.avg_views.toLocaleString()} avg views</span>
+                )}
+                {formulaReport.avg_retention_pct > 0 && (
+                  <span className="text-emerald-400 font-bold">
+                    {formulaReport.avg_retention_pct}% avg retention
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Recent Projects Grid */}
         <div className="space-y-4">

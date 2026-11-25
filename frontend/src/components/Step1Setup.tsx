@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  Cpu, Zap, ChevronDown, ChevronUp, Sparkles, Scissors, ZoomIn, MessageSquareQuote, RotateCcw, Loader2, Check
+  Cpu, Zap, ChevronDown, ChevronUp, Sparkles, Scissors, ZoomIn, MessageSquareQuote, RotateCcw, Loader2, Check, Layers
 } from 'lucide-react';
 import { ViralClip, Project, HookVariant } from '../types';
 import { api } from '../api/client';
@@ -514,6 +514,86 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
               />
             </div>
+          </div>
+
+          {/* Virtual Studio Backdrop (AI Person Segmentation) */}
+          <div className="pt-3 border-t border-[var(--border-subtle)] space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="font-bold text-xs text-[var(--text-primary)] flex items-center gap-1.5 uppercase tracking-wide">
+                <Layers className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                Virtual Studio Backdrop
+              </span>
+              <span className="text-[10px] text-[var(--text-secondary)]">AI subject cutout</span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+              {[
+                { id: 'none', label: 'Original' },
+                { id: 'studio_blur', label: 'Studio Bokeh' },
+                { id: 'solid_charcoal', label: 'Charcoal' },
+                { id: 'accent_gradient', label: 'Gradient' },
+                { id: 'gameplay_blur', label: 'Game Blur' }
+              ].map((preset) => {
+                const active = (clip.backdrop_mode || 'none') === preset.id;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => onUpdateClip({ backdrop_mode: preset.id })}
+                    className={`py-1.5 px-2 rounded-lg border text-[10px] font-semibold transition truncate ${
+                      active
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {(clip.backdrop_mode === 'studio_blur' || clip.backdrop_mode === 'gameplay_blur') && (
+              <div>
+                <div className="flex justify-between text-[10px] text-[var(--text-secondary)] mb-1">
+                  <span>Bokeh Blur Intensity</span>
+                  <span className="font-mono text-[var(--accent-primary)] font-bold">
+                    {Math.round(clip.backdrop_blur_intensity ?? 18)}
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={6}
+                  max={45}
+                  step={2}
+                  value={clip.backdrop_blur_intensity ?? 18}
+                  onChange={(e) => onUpdateClip({ backdrop_blur_intensity: parseFloat(e.target.value) })}
+                  className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
+                />
+              </div>
+            )}
+
+            {(clip.backdrop_mode === 'solid_charcoal' || clip.backdrop_mode === 'accent_gradient') && (
+              <div className="flex items-center justify-between gap-2 bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5">
+                <span className="text-[11px] text-[var(--text-secondary)]">Backdrop Studio Color</span>
+                <div className="flex items-center gap-2">
+                  {['#18181B', '#0F172A', '#6366F1', '#10B981'].map((col) => (
+                    <button
+                      key={col}
+                      type="button"
+                      onClick={() => onUpdateClip({ backdrop_color: col })}
+                      className="w-4 h-4 rounded-full border border-white/25"
+                      style={{ backgroundColor: col }}
+                      title={col}
+                    />
+                  ))}
+                  <input
+                    type="color"
+                    value={clip.backdrop_color || '#18181B'}
+                    onChange={(e) => onUpdateClip({ backdrop_color: e.target.value })}
+                    className="w-6 h-5 rounded cursor-pointer border-0 bg-transparent p-0"
+                  />
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

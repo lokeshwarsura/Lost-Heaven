@@ -513,6 +513,31 @@ export const api = {
     outro_cta_enabled?: boolean;
     outro_cta_text?: string;
     words?: any[];
+    keep_segments?: [number, number][];
+    merge_crossfade_sec?: number;
+    speakers?: Record<string, any>;
+    speaker_lower_thirds?: boolean;
+    face_safe_captions?: boolean;
+    callout_cards?: any[];
+    auto_callouts?: boolean;
+    bilingual_enabled?: boolean;
+    secondary_language?: string;
+    backdrop_mode?: string;
+    backdrop_blur_intensity?: number;
+    backdrop_color?: string;
+    privacy_blur_boxes?: any[];
+    beat_sync_enabled?: boolean;
+    spectrum_enabled?: boolean;
+    spectrum_position?: string;
+    spectrum_color?: string;
+    chapters_enabled?: boolean;
+    chapters?: any[];
+    handle_watermark_enabled?: boolean;
+    handle_text?: string;
+    handle_platform_icon?: string;
+    handle_corner?: string;
+    handle_opacity?: number;
+    handle_display_mode?: string;
   }): Promise<PreviewFrameResponse> {
     const res = await fetch(`${API_BASE}/preview-frame`, {
       method: 'POST',
@@ -639,6 +664,8 @@ export const api = {
     rms?: number[];
     speech_density?: number[];
     is_silence?: boolean[];
+    keep_segments?: [number, number][];
+    merge_crossfade_sec?: number;
     window_start: number;
     window_end: number;
     clip_start: number;
@@ -724,6 +751,278 @@ export const api = {
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: 'Failed to trim clip' }));
       throw new Error(err.detail || 'Failed to trim clip');
+    }
+    return res.json();
+  },
+
+  async updateClipSegments(
+    projectId: number,
+    clipId: number,
+    keepSegments: [number, number][],
+    crossfadeSec?: number
+  ): Promise<{ status: string; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/segments`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        keep_segments: keepSegments,
+        ...(crossfadeSec !== undefined ? { crossfade_sec: crossfadeSec } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to update clip segments' }));
+      throw new Error(err.detail || 'Failed to update clip segments');
+    }
+    return res.json();
+  },
+
+  async mergeClips(
+    projectId: number,
+    payload: {
+      clip_ids: number[];
+      smooth_transition?: boolean;
+      transition_duration?: number;
+      title?: string;
+    }
+  ): Promise<{ status: string; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/clips/merge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to merge clips' }));
+      throw new Error(err.detail || 'Failed to merge clips');
+    }
+    return res.json();
+  },
+
+  async getRetentionAudit(projectId: number, clipId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/retention-audit`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to audit retention' }));
+      throw new Error(err.detail || 'Failed to audit retention');
+    }
+    return res.json();
+  },
+
+  async diarizeClip(
+    projectId: number,
+    clipId: number,
+    numSpeakers = 0
+  ): Promise<{ status: string; speakers: Record<string, any>; words: any[]; speaker_count: number; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/diarize`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ num_speakers: numSpeakers }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Speaker diarization failed' }));
+      throw new Error(err.detail || 'Speaker diarization failed');
+    }
+    return res.json();
+  },
+
+  async updateClipSpeakers(
+    projectId: number,
+    clipId: number,
+    speakers: Record<string, any>,
+    transcriptWords?: any[]
+  ): Promise<{ status: string; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/speakers`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        speakers,
+        ...(transcriptWords !== undefined ? { transcript_words: transcriptWords } : {}),
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to save speakers' }));
+      throw new Error(err.detail || 'Failed to save speakers');
+    }
+    return res.json();
+  },
+
+  async extractCalloutCards(
+    projectId: number,
+    clipId: number,
+    maxCards = 3
+  ): Promise<{ status: string; callout_cards: any[]; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/callouts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_cards: maxCards }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to extract callouts' }));
+      throw new Error(err.detail || 'Failed to extract callouts');
+    }
+    return res.json();
+  },
+
+  async translateClip(
+    projectId: number,
+    clipId: number,
+    targetLanguage: string
+  ): Promise<{ status: string; target_language: string; source: string; translations: string[]; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/translate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target_language: targetLanguage }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Translation failed' }));
+      throw new Error(err.detail || 'Translation failed');
+    }
+    return res.json();
+  },
+
+  async dubClip(
+    projectId: number,
+    clipId: number,
+    payload: { target_language: string; voice?: string; original_bed_volume?: number }
+  ): Promise<{ status: string; dubbed_audio_path: string; tts_backend: string; segment_count: number; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/dub`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Voice dubbing failed' }));
+      throw new Error(err.detail || 'Voice dubbing failed');
+    }
+    return res.json();
+  },
+
+  async compileTrailer(
+    projectId: number,
+    payload?: { title?: string; max_moments?: number; target_duration_sec?: number }
+  ): Promise<{ status: string; clip: ViralClip }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/compile-trailer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Trailer compilation failed' }));
+      throw new Error(err.detail || 'Trailer compilation failed');
+    }
+    return res.json();
+  },
+
+  async generateThumbnail(
+    projectId: number,
+    clipId: number,
+    payload: {
+      timestamp?: number;
+      headline?: string;
+      format?: '9:16' | '16:9';
+      depth_layer?: boolean;
+      accent_color?: string;
+      rim_glow?: boolean;
+      badge_text?: string;
+    }
+  ): Promise<{
+    status: string;
+    thumbnail_url: string;
+    jpg_url: string;
+    width: number;
+    height: number;
+    timestamp: number;
+    depth_layer: boolean;
+  }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/generate-thumbnail`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Thumbnail generation failed' }));
+      throw new Error(err.detail || 'Thumbnail generation failed');
+    }
+    return res.json();
+  },
+
+  async generateChapters(
+    projectId: number,
+    clipId: number,
+    maxChapters = 4,
+    enable = true
+  ): Promise<{
+    status: string;
+    clip_id: number;
+    chapters_enabled: boolean;
+    chapters: Array<{ id: string; start: number; end: number; title: string }>;
+  }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/generate-chapters`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_chapters: maxChapters, enable }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Chapter generation failed' }));
+      throw new Error(err.detail || 'Chapter generation failed');
+    }
+    return res.json();
+  },
+
+  async getClipPreflight(projectId: number, clipId: number): Promise<{
+    clip_id: number;
+    readiness_score: number;
+    status: 'pass' | 'warn' | 'risk';
+    checks: Array<{
+      id: string;
+      title: string;
+      status: 'pass' | 'warn' | 'fail';
+      detail: string;
+      fix_label?: string;
+      fix_patch?: Record<string, any>;
+    }>;
+  }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/preflight`);
+    if (!res.ok) {
+      throw new Error('Failed to run preflight safety scan');
+    }
+    return res.json();
+  },
+
+  async importAnalyticsCsv(csvText: string): Promise<{
+    status: string;
+    imported_rows: number;
+    matched_clips: number;
+    formula: any;
+  }> {
+    const res = await fetch(`${API_BASE}/analytics/import-csv`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ csv_text: csvText }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'CSV import failed' }));
+      throw new Error(err.detail || 'CSV import failed');
+    }
+    return res.json();
+  },
+
+  async getAnalyticsFormula(): Promise<{
+    has_data: boolean;
+    sample_count: number;
+    headline: string;
+    preferred_aspect_ratio: string;
+    preferred_caption_style: string;
+    preferred_frame_layout: string;
+    preferred_duration_band: string;
+    preferred_duration_bounds: [number, number];
+    hook_banner_recommended: boolean;
+    beat_sync_recommended: boolean;
+    avg_views: number;
+    avg_retention_pct: number;
+    prompt_guidance: string;
+  }> {
+    const res = await fetch(`${API_BASE}/analytics/formula`);
+    if (!res.ok) {
+      throw new Error('Failed to fetch analytics formula');
     }
     return res.json();
   },

@@ -6,6 +6,8 @@ export type EditableClipSnapshot = Pick<
   | 'start_time'
   | 'end_time'
   | 'duration'
+  | 'keep_segments'
+  | 'merge_crossfade_sec'
   | 'transcript_words'
   | 'selected_title'
   | 'hook_headline'
@@ -88,6 +90,34 @@ export type EditableClipSnapshot = Pick<
   | 'retention_bar_color'
   | 'outro_cta_enabled'
   | 'outro_cta_text'
+  | 'speakers'
+  | 'speaker_lower_thirds'
+  | 'face_safe_captions'
+  | 'callout_cards'
+  | 'auto_callouts'
+  | 'bilingual_enabled'
+  | 'secondary_language'
+  | 'dubbing_enabled'
+  | 'dubbing_language'
+  | 'dubbing_voice'
+  | 'dubbing_bed_volume'
+  | 'dubbed_audio_path'
+  | 'backdrop_mode'
+  | 'backdrop_blur_intensity'
+  | 'backdrop_color'
+  | 'privacy_blur_boxes'
+  | 'beat_sync_enabled'
+  | 'spectrum_enabled'
+  | 'spectrum_position'
+  | 'spectrum_color'
+  | 'chapters_enabled'
+  | 'chapters'
+  | 'handle_watermark_enabled'
+  | 'handle_text'
+  | 'handle_platform_icon'
+  | 'handle_corner'
+  | 'handle_opacity'
+  | 'handle_display_mode'
 >;
 
 interface HistoryStack {
@@ -103,6 +133,10 @@ export function extractEditableSnapshot(clip: ViralClip): EditableClipSnapshot {
     start_time: clip.start_time,
     end_time: clip.end_time,
     duration: clip.duration,
+    keep_segments: Array.isArray(clip.keep_segments)
+      ? clip.keep_segments.map((seg) => [seg[0], seg[1]] as [number, number])
+      : undefined,
+    merge_crossfade_sec: clip.merge_crossfade_sec,
     transcript_words: Array.isArray(clip.transcript_words)
       ? clip.transcript_words.map((w) => ({ ...w }))
       : [],
@@ -187,6 +221,40 @@ export function extractEditableSnapshot(clip: ViralClip): EditableClipSnapshot {
     retention_bar_color: clip.retention_bar_color,
     outro_cta_enabled: clip.outro_cta_enabled,
     outro_cta_text: clip.outro_cta_text,
+    speakers: clip.speakers ? JSON.parse(JSON.stringify(clip.speakers)) : undefined,
+    speaker_lower_thirds: clip.speaker_lower_thirds,
+    face_safe_captions: clip.face_safe_captions,
+    callout_cards: Array.isArray(clip.callout_cards)
+      ? clip.callout_cards.map((c) => ({ ...c }))
+      : undefined,
+    auto_callouts: clip.auto_callouts,
+    bilingual_enabled: clip.bilingual_enabled,
+    secondary_language: clip.secondary_language,
+    dubbing_enabled: clip.dubbing_enabled,
+    dubbing_language: clip.dubbing_language,
+    dubbing_voice: clip.dubbing_voice,
+    dubbing_bed_volume: clip.dubbing_bed_volume,
+    dubbed_audio_path: clip.dubbed_audio_path,
+    backdrop_mode: clip.backdrop_mode,
+    backdrop_blur_intensity: clip.backdrop_blur_intensity,
+    backdrop_color: clip.backdrop_color,
+    privacy_blur_boxes: Array.isArray(clip.privacy_blur_boxes)
+      ? clip.privacy_blur_boxes.map((b) => ({ ...b }))
+      : undefined,
+    beat_sync_enabled: clip.beat_sync_enabled,
+    spectrum_enabled: clip.spectrum_enabled,
+    spectrum_position: clip.spectrum_position,
+    spectrum_color: clip.spectrum_color,
+    chapters_enabled: clip.chapters_enabled,
+    chapters: Array.isArray(clip.chapters)
+      ? clip.chapters.map((c) => ({ ...c }))
+      : undefined,
+    handle_watermark_enabled: clip.handle_watermark_enabled,
+    handle_text: clip.handle_text,
+    handle_platform_icon: clip.handle_platform_icon,
+    handle_corner: clip.handle_corner,
+    handle_opacity: clip.handle_opacity,
+    handle_display_mode: clip.handle_display_mode,
   };
 }
 
