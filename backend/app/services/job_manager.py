@@ -20,7 +20,12 @@ from app.services.proxy import probe_video, create_gemini_proxy, get_ffmpeg_cmd,
 from app.services.renderer import render_clip_ultra
 
 _DEFAULT_ENGINE = engine
-from app.services.transcriber import transcribe_clip, extract_audio_segment, transcribe_audio_full
+from app.services.transcriber import (
+    transcribe_clip,
+    extract_audio_segment,
+    transcribe_audio_full,
+    get_whisper_runtime_info,
+)
 from app.services.gemini_clipper import (
     extract_viral_clips,
     GeminiAuthError,
@@ -182,13 +187,103 @@ def save_persisted_settings(data: Dict[str, Any]):
         except Exception as e:
             logger.warning(f"Failed to save settings to {p}: {e}")
 
-STAGES_CONFIG = [
-    {"id": "ingest", "name": "Media Prep", "desc": "Probing video stream & FFprobe metadata", "min": 0, "max": 15},
-    {"id": "audio", "name": "Voice Extraction", "desc": "Extracting 16kHz WAV & 480p proxy", "min": 15, "max": 30},
-    {"id": "transcribe", "name": "Voice Recognition", "desc": "Recognizing speech with faster-whisper VAD", "min": 30, "max": 65},
-    {"id": "gemini", "name": "AI Viral Detection", "desc": "Analyzing virality with Gemini multimodal API", "min": 65, "max": 90},
-    {"id": "ready", "name": "Caption Sync & Finalize", "desc": "Generating timeline & saving clips", "min": 90, "max": 100},
-]
+def resolve_ai_mode(
+    persisted: Dict[str, Any],
+    explicit_ai_mode: Optional[str] = None,
+    force_offline: bool = False,
+) -> str:
+    """
+    Resolve explicit pipeline AI mode cleanly:
+      - 'offline': explicitly chosen offline mode, disabled Gemini boost, or force_offline
+      - 'gemini': valid Gemini API key available and enabled
+      - 'needs_api_key_or_offline_choice': key missing and offline not explicitly selected
+    """
+    if force_offline:
+        return "offline"
+    raw_mode = (explicit_ai_mode or persisted.get("ai_mode") or "").strip().lower()
+    if raw_mode == "offline":
+        return "offline"
+    ai_provider = str(persisted.get("ai_provider") or settings.AI_PROVIDER or "gemini").strip().lower()
+    if ai_provider == "offline":
+        return "offline"
+    gem_enabled = persisted.get("gemini_enabled", persisted.get("gemini_boost_enabled", True))
+    if gem_enabled is False:
+        return "offline"
+    key = persisted.get("gemini_api_key") or settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
+    if ai_provider == "ollama":
+        return "gemini"  # Uses Stage 4 local LLM branch cleanly
+    if _is_valid_api_key(key):
+        return "gemini"
+    return "needs_api_key_or_offline_choice"
+
+
+def _build_dynamic_stages(
+    needs_proxy: bool = False,
+    ai_mode: str = "gemini",
+    ai_provider: str = "gemini",
+) -> List[Dict[str, Any]]:
+    is_offline = ai_mode == "offline" or ai_provider == "offline"
+    return [
+        {
+            "id": "ingest",
+            "name": "Media Prep",
+            "desc": "Probing video stream & FFprobe metadata",
+            "min": 0,
+            "max": 15,
+        },
+        {
+            "id": "audio",
+            "name": "480p Proxy" if needs_proxy else "Fast Audio Extract",
+            "desc": "16kHz WAV & 480p proxy" if needs_proxy else "16kHz mono WAV (proxy skipped)",
+            "min": 15,
+            "max": 30,
+        },
+        {
+            "id": "transcribe",
+            "name": "Whisper VAD",
+            "desc": "Batched faster-whisper speech sync",
+            "min": 30,
+            "max": 65,
+        },
+        {
+            "id": "gemini",
+            "name": "Offline Multimodal AI" if is_offline else ("Ollama Local AI" if ai_provider == "ollama" else "Gemini Multimodal AI"),
+            "desc": "Local facial, vocal & arc scoring" if is_offline else ("Local LLM highlight ranking" if ai_provider == "ollama" else "Cloud Gemini multimodal highlights"),
+            "min": 65,
+            "max": 90,
+        },
+        {
+            "id": "ready",
+            "name": "Sync & Ready",
+            "desc": "Generating timeline & saving clips",
+            "min": 90,
+            "max": 100,
+        },
+    ]
+
+
+def _sync_stage_labels(
+    existing_stages: List[Dict[str, Any]],
+    *,
+    needs_proxy: bool,
+    ai_mode: str,
+    ai_provider: str,
+) -> List[Dict[str, Any]]:
+    tmpl = {s["id"]: s for s in _build_dynamic_stages(needs_proxy=needs_proxy, ai_mode=ai_mode, ai_provider=ai_provider)}
+    updated: List[Dict[str, Any]] = []
+    for st in existing_stages:
+        sid = st.get("id")
+        if sid in tmpl:
+            merged = dict(st)
+            merged["name"] = tmpl[sid]["name"]
+            merged["desc"] = tmpl[sid]["desc"]
+            updated.append(merged)
+        else:
+            updated.append(st)
+    return updated
+
+
+STAGES_CONFIG = _build_dynamic_stages(needs_proxy=False, ai_mode="gemini", ai_provider="gemini")
 
 class JobManager:
     """
@@ -201,8 +296,24 @@ class JobManager:
     def __init__(self):
         self._jobs: Dict[int, Dict[str, Any]] = {}
         self._cancel_flags: Dict[int, threading.Event] = {}
+        self._active_procs: Dict[int, List[Any]] = {}
         self._lock = threading.RLock()
         self._broadcast_callback = None
+
+    def _register_proc(self, project_id: int, proc: Any) -> None:
+        with self._lock:
+            lst = self._active_procs.setdefault(project_id, [])
+            lst.append(proc)
+
+    def _terminate_active_procs(self, project_id: int) -> None:
+        with self._lock:
+            procs = self._active_procs.pop(project_id, [])
+        for p in procs:
+            try:
+                if p is not None and p.poll() is None:
+                    p.kill()
+            except Exception:
+                pass
 
     def set_broadcast_callback(self, cb):
         self._broadcast_callback = cb
@@ -234,7 +345,8 @@ class JobManager:
         clip_count: int = 5,
         caption_language: str = "As spoken",
         topic_focus: Optional[str] = None,
-        hardware_mode: str = "gpu"
+        hardware_mode: str = "gpu",
+        ai_mode: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             cancel_event = threading.Event()
@@ -264,6 +376,23 @@ class JobManager:
             else:
                 hw_badge = "CPU Multi-Core (libx264)"
 
+            try:
+                whisper_rt = get_whisper_runtime_info()
+                whisper_badge = str(whisper_rt.get("badge") or "CPU int8")
+            except Exception:
+                whisper_badge = "CPU int8"
+
+            persisted = get_persisted_settings()
+            ai_provider = str(persisted.get("ai_provider") or settings.AI_PROVIDER or "gemini")
+            resolved_mode = resolve_ai_mode(persisted, explicit_ai_mode=ai_mode)
+            gem_analysis_mode = str(persisted.get("gemini_analysis_mode") or settings.GEMINI_ANALYSIS_MODE or "transcript")
+            needs_proxy = (resolved_mode == "gemini" and ai_provider == "gemini" and gem_analysis_mode == "multimodal")
+
+            dyn_stages = _build_dynamic_stages(
+                needs_proxy=needs_proxy,
+                ai_mode=resolved_mode,
+                ai_provider=ai_provider,
+            )
             stages = [
                 {
                     "id": s["id"],
@@ -272,7 +401,7 @@ class JobManager:
                     "status": "running" if i == 0 else "pending",
                     "percent": 0
                 }
-                for i, s in enumerate(STAGES_CONFIG)
+                for i, s in enumerate(dyn_stages)
             ]
 
             now_iso = utc_now_iso()
@@ -294,6 +423,11 @@ class JobManager:
                 "file_size_bytes": file_size,
                 "file_size_formatted": format_size(file_size),
                 "hardware_badge": hw_badge,
+                "whisper_badge": whisper_badge,
+                "ai_mode": resolved_mode,
+                "ai_provider": ai_provider,
+                "needs_api_key_or_offline_choice": resolved_mode == "needs_api_key_or_offline_choice",
+                "needs_proxy": needs_proxy,
                 "duration_preset": duration_preset,
                 "aspect_ratio": aspect_ratio,
                 "clip_count": clip_count,
@@ -306,7 +440,7 @@ class JobManager:
                         "timestamp": now_iso,
                         "stage": "INGEST",
                         "level": "INFO",
-                        "message": f"Job initialized for '{title}'. Hardware acceleration: {hw_badge}."
+                        "message": f"Job initialized for '{title}'. Hardware: {hw_badge} · Whisper: {whisper_badge}."
                     }
                 ],
                 "error_detail": None,
@@ -325,7 +459,8 @@ class JobManager:
         stage_label: str,
         message: Optional[str] = None,
         level: str = "INFO",
-        eta_seconds: Optional[int] = None
+        eta_seconds: Optional[int] = None,
+        log_stage: Optional[str] = None,
     ):
         with self._lock:
             job = self._jobs.get(project_id)
@@ -359,9 +494,10 @@ class JobManager:
                     st["percent"] = 0
 
             if message:
+                tag = (log_stage or stage).strip().upper()
                 log_entry = {
                     "timestamp": utc_now_iso(),
-                    "stage": stage.upper(),
+                    "stage": tag,
                     "level": level,
                     "message": message
                 }
@@ -480,6 +616,7 @@ class JobManager:
             evt = self._cancel_flags.get(project_id)
             if evt:
                 evt.set()
+            self._terminate_active_procs(project_id)
 
             job = self._jobs.get(project_id) or self.get_progress(project_id)
             if job:
@@ -516,38 +653,68 @@ class JobManager:
 
     def cleanup_orphan_jobs(self):
         """
-        On server startup, scan SQLite for any projects stuck in status='processing'
-        (which have no running worker thread after a server restart) and mark them status='error'
-        with clear recovery instructions.
+        On server startup, scan SQLite AND storage project.json files for any projects stuck in
+        'processing' or 'running' from a prior session, mark them interrupted so timers never keep ticking,
+        and mark any active running stages as failed for clean Retry recovery.
         """
         try:
+            recovered_ids = set()
             with Session(engine) as session:
                 stuck_projects = session.exec(
-                    select(Project).where(Project.status == "processing")
+                    select(Project).where(Project.status.in_(["processing", "running"]))
                 ).all()
                 for p in stuck_projects:
+                    recovered_ids.add(p.id)
                     p.status = "error"
-                    p.error_message = "Server restarted while job was running. Click Retry Job to resume from saved checkpoints."
+                    p.error_message = "Server restarted — interrupted by restart. Click Retry to resume from saved checkpoints."
                     session.add(p)
 
                     job = self.get_progress(p.id)
                     if job:
                         job["status"] = "error"
-                        job["stage_label"] = "Interrupted by server restart"
-                        job["error_detail"] = "Server restarted while job was running. Click Retry Job to resume from saved checkpoints."
+                        job["stage_label"] = "Interrupted by server restart — click Retry"
+                        job["error_detail"] = "Interrupted by server restart — click Retry"
                         job["updated_at"] = utc_now_iso()
                         _freeze_timer(job)
+                        for st in job.get("stages", []):
+                            if st.get("status") == "running":
+                                st["status"] = "failed"
                         job.setdefault("logs", []).append({
                             "timestamp": utc_now_iso(),
                             "stage": "SYSTEM",
                             "level": "WARN",
-                            "message": "Server restarted while job was running. Click 'Retry Job' to resume from saved checkpoints."
+                            "message": "Interrupted by server restart — click Retry to resume from saved checkpoints."
                         })
                         self._jobs[p.id] = job
                         self._save_project_json(p.id, job)
                 session.commit()
-                if stuck_projects:
-                    logger.info(f"Cleaned up {len(stuck_projects)} orphan jobs on startup.")
+
+            # Also sweep any disk project.json orphaned in 'running'/'processing' state
+            projects_root = Path(settings.STORAGE_DIR) / "projects"
+            if projects_root.exists():
+                for pjson in projects_root.glob("*/project.json"):
+                    try:
+                        pid = int(pjson.parent.name)
+                        if pid in recovered_ids:
+                            continue
+                        data = json.loads(pjson.read_text(encoding="utf-8"))
+                        if isinstance(data, dict) and data.get("status") in ("running", "processing"):
+                            data["status"] = "error"
+                            data["stage_label"] = "Interrupted by server restart — click Retry"
+                            data["error_detail"] = "Interrupted by server restart — click Retry"
+                            data["updated_at"] = utc_now_iso()
+                            _freeze_timer(data)
+                            for st in data.get("stages", []):
+                                if st.get("status") == "running":
+                                    st["status"] = "failed"
+                            self._jobs[pid] = data
+                            self._save_project_json(pid, data)
+                            recovered_ids.add(pid)
+                    except Exception:
+                        pass
+
+            if recovered_ids:
+                logger.info(f"Cleaned up {len(recovered_ids)} orphan jobs on startup.")
         except Exception as e:
             logger.error(f"Failed to clean up orphan jobs: {e}")
 
@@ -572,6 +739,9 @@ class JobManager:
             job["stage_label"] = "Gemini API Key Required" if reason == "missing" else "Gemini API Key Not Recognized"
             job["api_key_reason"] = reason
             job["api_key_message"] = clean_msg
+            job["needs_api_key_or_offline_choice"] = True
+            if reason == "missing":
+                job["ai_mode"] = "needs_api_key_or_offline_choice"
             job["updated_at"] = utc_now_iso()
             _freeze_timer(job)
 
@@ -632,8 +802,12 @@ class JobManager:
 
             if force_offline:
                 job["force_offline"] = True
+                job["ai_mode"] = "offline"
+                job["needs_api_key_or_offline_choice"] = False
                 job["api_key_reason"] = None
                 job["api_key_message"] = None
+            else:
+                job["needs_api_key_or_offline_choice"] = False
 
             start_stage = "ingest"
             start_percent = 5
@@ -842,8 +1016,13 @@ class JobManager:
 
         # Check live settings for Gemini Boost vs Offline Mode
         persisted = get_persisted_settings()
-        gemini_boost_enabled = persisted.get("gemini_enabled", persisted.get("gemini_boost_enabled", True))
         job = self.get_progress(project_id) or {}
+        effective_mode = resolve_ai_mode(
+            persisted,
+            explicit_ai_mode=job.get("ai_mode") if job.get("ai_mode") in ("offline", "gemini") else None,
+            force_offline=bool(force_offline or job.get("force_offline", False)),
+        )
+        gemini_boost_enabled = effective_mode != "offline"
         if force_offline or job.get("force_offline", False):
             gemini_boost_enabled = False
 
@@ -854,6 +1033,21 @@ class JobManager:
         ai_provider = persisted.get("ai_provider", settings.AI_PROVIDER) # "gemini", "ollama", "offline"
         ollama_endpoint = persisted.get("ollama_endpoint", settings.OLLAMA_ENDPOINT)
         ollama_model = persisted.get("ollama_model", settings.OLLAMA_MODEL)
+
+        with self._lock:
+            live_j = self._jobs.get(project_id)
+            if live_j:
+                needs_px_init = bool(gemini_boost_enabled and ai_provider == "gemini" and gemini_analysis_mode == "multimodal" and _is_valid_api_key(gemini_api_key))
+                live_j["ai_mode"] = effective_mode
+                live_j["ai_provider"] = ai_provider
+                live_j["needs_api_key_or_offline_choice"] = effective_mode == "needs_api_key_or_offline_choice"
+                live_j["needs_proxy"] = needs_px_init
+                live_j["stages"] = _sync_stage_labels(
+                    live_j.get("stages", []),
+                    needs_proxy=needs_px_init,
+                    ai_mode=effective_mode,
+                    ai_provider=ai_provider,
+                )
 
         try:
             # -------------------------------------------------------------
@@ -913,11 +1107,13 @@ class JobManager:
             else:
                 extract_audio_segment(project.source_path, 0.0, duration, str(audio_path))
 
-            # 2b. Proxy generation (Only needed when multimodal video proxy mode is chosen)
-            needs_proxy = (
-                gemini_boost_enabled and 
-                ai_provider == "gemini" and 
-                gemini_analysis_mode == "multimodal"
+            # 2b. Proxy generation (Only needed when multimodal Gemini video proxy mode is active & key configured)
+            needs_proxy = bool(
+                gemini_boost_enabled
+                and effective_mode == "gemini"
+                and ai_provider == "gemini"
+                and gemini_analysis_mode == "multimodal"
+                and _is_valid_api_key(gemini_api_key)
             )
 
             if not needs_proxy:
@@ -1039,6 +1235,131 @@ class JobManager:
             if not duration or duration <= 0:
                 duration = float(project.duration or 120.0)
 
+            # Multimodal Audio + Video Intelligence Pass (LUFS, Prosody, Sharpness, Cuts, Expression)
+            aud_analysis: Optional[Dict[str, Any]] = None
+            vid_analysis: Optional[Dict[str, Any]] = None
+            mm_analysis: Optional[Dict[str, Any]] = None
+            mm_ckpt_path = p_dir / "multimodal_analysis.json"
+            if mm_ckpt_path.exists() and mm_ckpt_path.stat().st_size > 100:
+                try:
+                    cached_mm = json.loads(mm_ckpt_path.read_text(encoding="utf-8"))
+                    if isinstance(cached_mm, dict) and (cached_mm.get("timeline") or cached_mm.get("summary")):
+                        mm_analysis = cached_mm
+                        self.update_progress(
+                            project_id, 69, "gemini", "Multimodal checkpoint loaded",
+                            message="Reused cached multimodal_analysis.json (< 0.1s)",
+                            eta_seconds=10,
+                            log_stage="ANALYSIS",
+                        )
+                        active_mm_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                        with Session(active_mm_engine) as msession:
+                            mp_row = msession.get(Project, project_id)
+                            if mp_row:
+                                mp_row.set_multimodal_analysis(mm_analysis)
+                                msession.add(mp_row)
+                                msession.commit()
+                except Exception as c_mm_err:
+                    logger.warning(f"Ignoring corrupt multimodal_analysis checkpoint for project {project_id}: {c_mm_err}")
+                    mm_analysis = None
+
+            if mm_analysis is None and project.source_path and os.path.exists(project.source_path):
+                try:
+                    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+                    from app.services.audio_analyzer import analyze_audio_track
+                    from app.services.video_analyzer import analyze_video_track
+                    from app.services.multimodal_fusion import fuse_multimodal_tracks
+
+                    self.update_progress(
+                        project_id, 66, "gemini", "Analyzing acoustic prosody & LUFS...",
+                        message="Analyzing acoustic prosody & LUFS (EBU R128 + vectorized vocal DSP)...",
+                        eta_seconds=16,
+                        log_stage="ANALYSIS",
+                    )
+                    audio_src_mm = str(audio_path) if audio_path.exists() else project.source_path
+                    aud_analysis = analyze_audio_track(audio_src_mm, word_segments=transcript_words)
+
+                    if self.is_cancelled(project_id): return
+
+                    self.update_progress(
+                        project_id, 67, "gemini", "Streaming keyframes via sequential FFmpeg...",
+                        message="Streaming sequential downscaled keyframes (max 360 frames, 45s watchdog)...",
+                        eta_seconds=14,
+                        log_stage="ANALYSIS",
+                    )
+
+                    def on_vision_progress(pct: int, scanned: int, total_fr: int):
+                        mapped = 67 + int(round((pct / 100.0) * 2.0))
+                        self.update_progress(
+                            project_id,
+                            min(69, mapped),
+                            "gemini",
+                            f"Scanning keyframes ({pct}%)...",
+                            message=f"Scanned {scanned:,} / {total_fr:,} keyframes ({pct}%)...",
+                            eta_seconds=max(4, int(14 * (1 - pct / 100.0))),
+                            log_stage="ANALYSIS",
+                        )
+
+                    cancel_ev = self._cancel_flags.get(project_id)
+                    with ThreadPoolExecutor(max_workers=1) as vpool:
+                        fut = vpool.submit(
+                            analyze_video_track,
+                            project.source_path,
+                            sample_fps=1.2,
+                            on_progress=on_vision_progress,
+                            max_frames=360,
+                            watchdog_sec=45.0,
+                            cancel_event=cancel_ev,
+                            on_proc=lambda pr: self._register_proc(project_id, pr),
+                        )
+                        try:
+                            vid_analysis = fut.result(timeout=47.0)
+                        except FuturesTimeoutError:
+                            logger.warning(f"Project {project_id}: vision scan exceeded 45s watchdog; terminating stream and continuing with heuristic telemetry.")
+                            self._terminate_active_procs(project_id)
+                            vid_analysis = {
+                                "summary": {
+                                    "duration": round(float(duration or 120.0), 3),
+                                    "frame_count": 0,
+                                    "avg_sharpness": 50.0,
+                                    "avg_exposure": 50.0,
+                                    "avg_action": 25.0,
+                                    "face_presence_ratio": 0.0,
+                                    "dominant_emotion": "neutral",
+                                    "timed_out": True,
+                                },
+                                "scene_cuts": [],
+                                "black_intervals": [],
+                                "graphic_events": [],
+                                "micro_expression_spikes": [],
+                                "frames": [],
+                            }
+                            self.update_progress(
+                                project_id, 69, "gemini", "Vision watchdog fallback — continuing...",
+                                message="Vision scan exceeded 45s limit — continuing immediately with acoustic + transcript intelligence",
+                                eta_seconds=10,
+                                log_stage="ANALYSIS",
+                            )
+
+                    mm_analysis = fuse_multimodal_tracks(
+                        aud_analysis,
+                        vid_analysis,
+                        word_segments=transcript_words,
+                        duration=duration,
+                    )
+                    try:
+                        _atomic_write_json(mm_ckpt_path, mm_analysis)
+                    except Exception:
+                        pass
+                    active_mm_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                    with Session(active_mm_engine) as msession:
+                        mp_row = msession.get(Project, project_id)
+                        if mp_row:
+                            mp_row.set_multimodal_analysis(mm_analysis)
+                            msession.add(mp_row)
+                            msession.commit()
+                except Exception as mm_err:
+                    logger.warning(f"Multimodal analysis skipped for project {project_id}: {mm_err}")
+
             words_loaded_note = f"Loaded {len(transcript_words):,} cached words from transcript.json. " if transcript_words else ""
 
             formula_weights = None
@@ -1048,11 +1369,29 @@ class JobManager:
             except Exception:
                 formula_weights = None
 
-            if not gemini_boost_enabled or ai_provider == "offline":
+            fresh_mode = resolve_ai_mode(
+                fresh_settings,
+                explicit_ai_mode=job.get("ai_mode") if job.get("ai_mode") in ("offline", "gemini") else None,
+                force_offline=bool(force_offline or job.get("force_offline", False)),
+            )
+
+            if not gemini_boost_enabled or fresh_mode == "offline" or ai_provider == "offline":
+                with self._lock:
+                    live_j4 = self._jobs.get(project_id)
+                    if live_j4:
+                        live_j4["ai_mode"] = "offline"
+                        live_j4["needs_api_key_or_offline_choice"] = False
+                        live_j4["stages"] = _sync_stage_labels(
+                            live_j4.get("stages", []),
+                            needs_proxy=bool(live_j4.get("needs_proxy", False)),
+                            ai_mode="offline",
+                            ai_provider="offline",
+                        )
                 self.update_progress(
-                    project_id, 70, "gemini", "Offline Viral Detection",
-                    message=f"{words_loaded_note}Running 100% offline acoustic excitement & silence segmentation...",
-                    eta_seconds=10
+                    project_id, 70, "gemini", "Offline Multimodal AI",
+                    message=f"{words_loaded_note}Running 100% offline facial, vocal emotion & narrative arc detection...",
+                    eta_seconds=10,
+                    log_stage="OFFLINE AI",
                 )
                 raw_clips = extract_viral_clips_offline(
                     audio_wav_path=str(audio_path),
@@ -1062,17 +1401,20 @@ class JobManager:
                     clip_count=project.clip_count or 5,
                     topic_focus=project.topic_focus,
                     formula_weights=formula_weights,
+                    multimodal_context=mm_analysis,
                 )
                 self.update_progress(
                     project_id, 88, "gemini", "Offline blueprints extracted",
-                    message=f"Extracted {len(raw_clips)} viral moments 100% locally with acoustic energy & silence segmentation",
-                    eta_seconds=8
+                    message=f"Extracted {len(raw_clips)} viral moments locally with Offline Multimodal AI",
+                    eta_seconds=8,
+                    log_stage="OFFLINE AI",
                 )
             elif ai_provider == "ollama":
                 self.update_progress(
                     project_id, 70, "gemini", f"Local Ollama AI ({ollama_model})",
                     message=f"{words_loaded_note}Connecting to local Ollama on {ollama_endpoint}...",
-                    eta_seconds=15
+                    eta_seconds=15,
+                    log_stage="OLLAMA",
                 )
                 try:
                     raw_clips = extract_viral_clips_ollama(
@@ -1083,14 +1425,15 @@ class JobManager:
                         topic_focus=project.topic_focus,
                         endpoint=ollama_endpoint,
                         model=ollama_model,
-                        on_log=lambda stage, msg: self.update_progress(project_id, 75, "gemini", "Ollama LLM", message=msg, eta_seconds=10)
+                        on_log=lambda stage, msg: self.update_progress(project_id, 75, "gemini", "Ollama LLM", message=msg, eta_seconds=10, log_stage="OLLAMA")
                     )
                 except Exception as o_err:
                     logger.warning(f"Ollama extraction failed: {o_err}. Seamlessly falling back to 100% offline engine.")
                     self.update_progress(
-                        project_id, 75, "gemini", "Ollama Offline Fallback",
-                        message=f"Ollama unreachable ({str(o_err)[:60]}) — seamlessly falling back to local acoustic energy engine",
-                        level="WARN"
+                        project_id, 75, "gemini", "Offline Multimodal AI",
+                        message=f"Ollama unreachable ({str(o_err)[:60]}) — seamlessly switching to Offline Multimodal AI",
+                        level="WARN",
+                        log_stage="OFFLINE AI",
                     )
                     raw_clips = extract_viral_clips_offline(
                         audio_wav_path=str(audio_path),
@@ -1100,31 +1443,34 @@ class JobManager:
                         clip_count=project.clip_count or 5,
                         topic_focus=project.topic_focus,
                         formula_weights=formula_weights,
+                        multimodal_context=mm_analysis,
                     )
                     for c in raw_clips:
                         c["analysis_source"] = "offline_fallback"
             else:
                 # Cloud Gemini with 4-Model Cascade & Auto-Offline Fallback
                 clean_key = (gemini_api_key or "").strip()
-                if not clean_key or clean_key == "your_gemini_api_key_here":
+                if not _is_valid_api_key(clean_key):
                     self.pause_job_for_api_key(
                         project_id,
                         reason="missing",
-                        message="A Google Gemini API key is required for AI Boost analysis. Paste your API key to continue, or switch to 100% Offline Mode."
+                        message="A Google Gemini API key is required for Gemini AI mode. Paste your API key to continue, or switch to 100% Offline Multimodal AI Mode."
                     )
                     return
 
                 self.update_progress(
                     project_id, 68, "gemini", "Analyzing virality & hooks with Gemini...",
-                    message=f"{words_loaded_note}Sending transcript to {gemini_model} (timeout: 60s)...",
-                    eta_seconds=15
+                    message=f"{words_loaded_note}Sending transcript + affective telemetry to {gemini_model} (timeout: 60s)...",
+                    eta_seconds=15,
+                    log_stage="GEMINI",
                 )
 
                 def on_gemini_log(stage: str, msg: str):
                     self.update_progress(
                         project_id, 75, "gemini", "Gemini AI Analysis",
                         message=msg,
-                        eta_seconds=12
+                        eta_seconds=12,
+                        log_stage="GEMINI",
                     )
 
                 try:
@@ -1139,6 +1485,7 @@ class JobManager:
                         preferred_model=gemini_model,
                         on_log=on_gemini_log,
                         formula_weights=formula_weights,
+                        multimodal_context=mm_analysis,
                     )
                 except GeminiAuthError as ae:
                     logger.warning(f"Project {project_id} paused due to Gemini auth error: {ae.message}")
@@ -1151,9 +1498,10 @@ class JobManager:
                     summary_reason = "503/429 high demand" if is_overload else f"errors ({msg[:110]})"
                     if auto_fallback_offline:
                         self.update_progress(
-                            project_id, 75, "gemini", "Auto-Fallback to Offline Engine",
-                            message=f"Gemini cascade exhausted ({summary_reason}) — seamlessly completing Stage 4 with local Offline Viral Engine",
-                            level="WARN"
+                            project_id, 75, "gemini", "Offline Multimodal AI Fallback",
+                            message=f"Gemini cascade exhausted ({summary_reason}) — seamlessly completing Stage 4 with Offline Multimodal AI",
+                            level="WARN",
+                            log_stage="OFFLINE AI",
                         )
                         raw_clips = extract_viral_clips_offline(
                             audio_wav_path=str(audio_path),
@@ -1163,6 +1511,7 @@ class JobManager:
                             clip_count=project.clip_count or 5,
                             topic_focus=project.topic_focus,
                             formula_weights=formula_weights,
+                            multimodal_context=mm_analysis,
                         )
                         for c in raw_clips:
                             c["analysis_source"] = "offline_fallback"
@@ -1177,7 +1526,8 @@ class JobManager:
                 self.update_progress(
                     project_id, 88, "gemini", "Viral blueprints extracted",
                     message=f"Extracted {len(raw_clips)} viral moments with hook headlines & retention scoring",
-                    eta_seconds=8
+                    eta_seconds=8,
+                    log_stage="GEMINI",
                 )
 
             # -------------------------------------------------------------
@@ -1309,6 +1659,42 @@ class JobManager:
                     )
                     clip.set_titles(item.get("youtube_titles", []))
                     clip.set_transcript(clip_words)
+                    affect_opts = {}
+                    for k in (
+                        "narrative_arc",
+                        "arc_label",
+                        "dominant_emotion",
+                        "vocal_emotion",
+                        "emotion_arousal",
+                        "emotion_valence",
+                        "acoustic_events",
+                    ):
+                        if item.get(k) is not None:
+                            affect_opts[k] = item[k]
+                    if affect_opts:
+                        affect_opts["offline_multimodal_active"] = str(item.get("analysis_source", "")).startswith("offline")
+                        clip.set_options(affect_opts)
+
+                    # Stage 5 Smart Auto-Frame AI Router (corner cam / dual podcast / talking head / pure gameplay)
+                    if project.source_path and os.path.exists(project.source_path):
+                        try:
+                            from app.services.vision_analyzer import analyze_clip_visuals
+                            from app.services.auto_framer import recommend_optimal_framing
+
+                            vmap = analyze_clip_visuals(
+                                video_path=project.source_path,
+                                start_time=float(clip.start_time or 0.0),
+                                end_time=float(clip.end_time or 0.0),
+                                use_cache=True,
+                            )
+                            rec = recommend_optimal_framing(vmap)
+                            clip.frame_layout = rec["frame_layout"]
+                            clip.webcam_corner = rec["webcam_corner"]
+                            clip.set_visual_map(vmap)
+                            if rec.get("source_webcam_region"):
+                                clip.set_source_webcam_region(rec["source_webcam_region"])
+                        except Exception as af_err:
+                            logger.debug(f"Stage 5 smart auto-frame skipped for clip: {af_err}")
 
                     session.add(clip)
                     saved_clips.append(clip)
@@ -1316,6 +1702,60 @@ class JobManager:
                 session.commit()
                 for c_obj in saved_clips:
                     session.refresh(c_obj)
+
+                # Extract Top 6 Best Frames per clip & auto-snap unhealthy clip openers forward (<= +0.6s)
+                if project.source_path and os.path.exists(project.source_path):
+                    try:
+                        from app.services.best_frame_engine import extract_best_frames
+
+                        bf_dir = Path(settings.STORAGE_DIR) / "assets" / "best_frames" / str(project_id)
+                        bf_dir.mkdir(parents=True, exist_ok=True)
+                        for c_obj in saved_clips:
+                            bf_res = extract_best_frames(
+                                video_path=project.source_path,
+                                video_analysis=vid_analysis,
+                                audio_analysis=aud_analysis,
+                                start_time=float(c_obj.start_time or 0.0),
+                                end_time=float(c_obj.end_time or 0.0),
+                                output_dir=str(bf_dir),
+                                clip_id=int(c_obj.id or 0),
+                                project_id=project_id,
+                            )
+                            sugg_start = bf_res.get("suggested_start_time")
+                            if sugg_start is not None and (float(c_obj.end_time) - float(sugg_start)) >= 1.2:
+                                new_s = round(float(sugg_start), 2)
+                                if new_s > float(c_obj.start_time) and (new_s - float(c_obj.start_time)) <= 0.65:
+                                    c_obj.start_time = new_s
+                                    c_obj.duration = round(float(c_obj.end_time) - new_s, 2)
+                                    c_obj.set_keep_segments([[new_s, float(c_obj.end_time)]])
+                                    if transcript_words:
+                                        re_words = []
+                                        for w in transcript_words:
+                                            ws = float(w.get("start", 0.0))
+                                            we = float(w.get("end", 0.0))
+                                            if ws >= (new_s - 0.15) and we <= (float(c_obj.end_time) + 0.25):
+                                                re_words.append({
+                                                    "word": w.get("word", ""),
+                                                    "start": round(max(0.0, ws - new_s), 3),
+                                                    "end": round(max(0.0, we - new_s), 3),
+                                                    "is_filler": w.get("is_filler", False),
+                                                    "deleted": False,
+                                                })
+                                        if re_words:
+                                            c_obj.set_transcript(re_words)
+                            c_obj.set_best_frames(bf_res.get("frames") or [])
+                            session.add(c_obj)
+                        session.commit()
+                        for c_obj in saved_clips:
+                            session.refresh(c_obj)
+                        self.update_progress(
+                            project_id, 90, "ready", "Selected 6 best keyframes per clip",
+                            message=f"Selected 6 best keyframes per clip across {len(saved_clips)} clip(s)",
+                            eta_seconds=4
+                        )
+                    except Exception as bf_err:
+                        logger.debug(f"Stage 5 best-frame extraction skipped: {bf_err}")
+
                 saved_clip_ids = [c_obj.id for c_obj in saved_clips if c_obj.id is not None]
 
             # Pre-render fast_preview MP4s for ALL extracted clips (1..N)
@@ -1351,6 +1791,10 @@ class JobManager:
                             "frame_layout": c_row.frame_layout,
                             "webcam_corner": c_row.webcam_corner,
                             "webcam_split_ratio": c_row.webcam_split_ratio,
+                            "source_webcam_region": c_row.get_source_webcam_region(),
+                            "visual_map": c_row.get_visual_map(),
+                            "framing_override": c_row.get_framing_override(),
+                            "best_frames": c_row.get_best_frames(),
                             "pip_border_color": c_row.pip_border_color,
                             "zoom": c_row.zoom,
                             "pan_x_offset": c_row.pan_x_offset,
@@ -1406,6 +1850,10 @@ class JobManager:
                             "backdrop_mode": getattr(c_row, "backdrop_mode", "none") or "none",
                             "backdrop_blur_intensity": float(getattr(c_row, "backdrop_blur_intensity", 18.0) or 18.0),
                             "backdrop_color": getattr(c_row, "backdrop_color", "#18181B") or "#18181B",
+                            "camera_motion": str(getattr(c_row, "camera_motion", "steady") or "steady"),
+                            "whip_pan_cuts": bool(getattr(c_row, "whip_pan_cuts", False)),
+                            "broll_layout": str(getattr(c_row, "broll_layout", "fullscreen") or "fullscreen"),
+                            "depth_pop": float(getattr(c_row, "depth_pop", 0.0) or 0.0),
                             "privacy_blur_boxes": c_row.get_privacy_blur_boxes(),
                             "beat_sync_enabled": bool(getattr(c_row, "beat_sync_enabled", False)),
                             "spectrum_enabled": bool(getattr(c_row, "spectrum_enabled", False)),

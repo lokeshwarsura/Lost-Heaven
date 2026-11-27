@@ -347,12 +347,13 @@ def detect_punch_zoom_peaks(
 ) -> Dict[str, Any]:
     """
     Detect vocal excitement / acoustic energy peaks inside [start_sec, end_sec]
-    and construct smooth Punch-In Zoom FX keyframes & trigger timestamps.
+    and construct crisp 0.45s Punch-In Zoom FX intervals (`1.0x -> intensity -> 1.0x`).
+    Falls back to periodic 3.2s rhythm triggers when audio is uniform or silent.
     """
     dur = max(0.5, float(end_sec) - float(start_sec))
     base_z = max(1.0, min(2.5, float(base_zoom or 1.0)))
-    peak_z = max(1.04, min(2.5, max(base_z + 0.06, float(punch_intensity or 1.14))))
-    sample_fps = 4.0
+    peak_z = max(1.04, min(2.5, max(base_z + 0.04, float(punch_intensity or 1.14))))
+    sample_fps = 6.0
     rms_list = extract_audio_rms_profile(video_path, start_sec, end_sec, sample_fps=sample_fps)
 
     punch_times: List[float] = []
@@ -360,27 +361,33 @@ def detect_punch_zoom_peaks(
         arr = np.array(rms_list)
         mean_val = float(np.mean(arr))
         std_val = float(np.std(arr))
-        thresh = max(0.45, mean_val + 0.65 * std_val)
-        last_t = -3.0
+        thresh = max(0.42, mean_val + 0.55 * std_val)
+        last_t = -3.2
         for i in range(1, len(arr) - 1):
             t = i / sample_fps
-            if t < 0.8 or t > dur - 0.6:
+            if t < 0.6 or t > dur - 0.45:
                 continue
             if arr[i] >= thresh and arr[i] >= arr[i - 1] and arr[i] >= arr[i + 1]:
                 if t - last_t >= 3.2:
                     punch_times.append(round(t, 2))
                     last_t = t
-            if len(punch_times) >= 5:
+            if len(punch_times) >= 8:
                 break
 
-    # Always add subtle emphasis near the opening 0.6s hook if audio is quiet or no peaks found
-    if not punch_times and dur >= 2.5:
-        punch_times.append(0.8)
+    # Deterministic 3.2s fallback cadence when audio has no sharp isolated peaks
+    if not punch_times and dur >= 1.8:
+        cur_t = 0.8 if dur < 4.0 else 1.2
+        while cur_t <= dur - 0.45 and len(punch_times) < 8:
+            punch_times.append(round(cur_t, 2))
+            cur_t += 3.2
 
-    # Build piecewise punch intervals [(t_start, t_end, zoom_target)]
+    # Crisp 0.45s punch envelope centered on each peak [pt - 0.15, pt + 0.30]
     intervals: List[Tuple[float, float, float]] = []
     for pt in punch_times:
-        intervals.append((round(max(0.0, pt - 0.12), 2), round(min(dur, pt + 1.15), 2), round(peak_z, 3)))
+        t0 = round(max(0.0, pt - 0.15), 3)
+        t1 = round(min(dur, t0 + 0.45), 3)
+        if t1 > t0 + 0.12:
+            intervals.append((t0, t1, round(peak_z, 3)))
 
     return {
         "punch_timestamps": punch_times,
@@ -388,6 +395,63 @@ def detect_punch_zoom_peaks(
         "base_zoom": base_z,
         "peak_zoom": round(peak_z, 3),
     }
+
+
+def compute_punch_zoom_factor_at_t(
+    t_rel: float,
+    punch_intervals: Optional[List[Tuple[float, float, float]]],
+) -> float:
+    """
+    Single Source of Truth punch zoom multiplier at clip-relative timestamp `t_rel`.
+    Smoothly eases `1.0 -> pz` over the first 33% (~0.15s) and back to `1.0` over 67% (~0.30s).
+    """
+    if not punch_intervals:
+        return 1.0
+    t = max(0.0, float(t_rel or 0.0))
+    best_z = 1.0
+    for t0, t1, pz in punch_intervals:
+        if t0 <= t <= t1:
+            span = max(0.08, float(t1) - float(t0))
+            ramp_in = span * 0.34
+            ramp_out = max(0.04, span - ramp_in)
+            dz = max(0.0, float(pz) - 1.0)
+            if t <= t0 + ramp_in:
+                frac = max(0.0, min(1.0, (t - t0) / ramp_in))
+            else:
+                frac = max(0.0, min(1.0, 1.0 - (t - (t0 + ramp_in)) / ramp_out))
+            best_z = max(best_z, 1.0 + dz * frac)
+    return round(best_z, 4)
+
+
+def compute_punch_focus_anchor(
+    face_track_data: Optional[Dict[str, Any]],
+    t_rel: Optional[float] = None,
+    framing_override: Optional[Dict[str, Any]] = None,
+) -> Tuple[float, float]:
+    """
+    Determine normalized `(fx, fy)` crop anchor in `[0.15, 0.85]` centered on active speaker/focus target.
+    """
+    if isinstance(framing_override, dict):
+        fa = framing_override.get("focus_anchor")
+        if isinstance(fa, dict) and fa.get("x") is not None:
+            return (
+                max(0.15, min(0.85, float(fa["x"]))),
+                max(0.15, min(0.85, float(fa.get("y", 0.42)))),
+            )
+    kfs = (face_track_data or {}).get("keyframes") or []
+    if kfs:
+        valid = [k for k in kfs if int(k.get("face_count", 1) or 0) > 0 and k.get("cx") is not None]
+        pool = valid or kfs
+        if t_rel is not None:
+            near = min(pool, key=lambda k: abs(float(k.get("t", 0.0)) - float(t_rel)))
+            return (
+                max(0.15, min(0.85, float(near.get("cx", 0.5)))),
+                max(0.15, min(0.85, float(near.get("cy", 0.42)))),
+            )
+        med_cx = float(np.median([float(k.get("cx", 0.5)) for k in pool]))
+        med_cy = float(np.median([float(k.get("cy", 0.42)) for k in pool]))
+        return max(0.15, min(0.85, med_cx)), max(0.15, min(0.85, med_cy))
+    return 0.5, 0.42
 
 
 def snap_clip_boundaries_to_scenes(
@@ -486,8 +550,8 @@ def _smooth_step(
     prev_val: Tuple[float, float],
     raw_val: Tuple[float, float],
     is_cut: bool,
-    deadzone: float = 0.035,
-    alpha: float = 0.22,
+    deadzone: float = 0.03,
+    alpha: float = 0.14,
 ) -> Tuple[float, float]:
     if is_cut:
         return raw_val
@@ -711,6 +775,177 @@ def track_faces_in_clip(
     return result
 
 
+def detect_webcam_corner_in_frame(
+    frame_bgr: np.ndarray,
+    next_frame_bgr: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """
+    Scan all 4 corners of a source frame (~30% W x 34% H each) with face detection,
+    skin-tone estimation, and motion variance to locate a genuine streamer webcam
+    and compute a tight 4:3 crop box. If no corner contains a webcam, returns
+    has_webcam=False and an action-energy focal point for graceful fallback.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return {
+            "has_webcam": False,
+            "corner": None,
+            "norm_box": None,
+            "action_cx": 0.5,
+            "action_cy": 0.45,
+        }
+
+    h, w = frame_bgr.shape[:2]
+    roi_w = max(32, int(round(w * 0.30)))
+    roi_h = max(32, int(round(h * 0.34)))
+
+    corners = {
+        "top_left": (0, 0, roi_w, roi_h),
+        "top_right": (w - roi_w, 0, roi_w, roi_h),
+        "bottom_left": (0, h - roi_h, roi_w, roi_h),
+        "bottom_right": (w - roi_w, h - roi_h, roi_w, roi_h),
+    }
+
+    best_score = -1.0
+    best_corner: Optional[str] = None
+    best_face: Optional[Dict[str, float]] = None
+
+    for c_name, (rx0, ry0, rw, rh) in corners.items():
+        roi = frame_bgr[ry0:ry0 + rh, rx0:rx0 + rw]
+        if roi.size == 0:
+            continue
+
+        # Upscale small corner ROIs slightly so Haar/MediaPipe detects compact facecams cleanly
+        det_img = roi
+        if roi.shape[1] < 280:
+            up_scale = 280.0 / float(max(1, roi.shape[1]))
+            det_img = cv2.resize(roi, (280, max(32, int(round(roi.shape[0] * up_scale)))))
+
+        roi_faces = detect_faces_offline(det_img)
+
+        # Skin ratio in YCrCb & luma contrast
+        ycrcb = cv2.cvtColor(roi, cv2.COLOR_BGR2YCrCb)
+        skin_mask = (
+            (ycrcb[:, :, 1] >= 133) & (ycrcb[:, :, 1] <= 173)
+            & (ycrcb[:, :, 2] >= 77) & (ycrcb[:, :, 2] <= 127)
+        )
+        skin_ratio = float(np.mean(skin_mask))
+        luma_std = float(np.std(ycrcb[:, :, 0]))
+
+        motion_score = 0.0
+        if next_frame_bgr is not None and next_frame_bgr.shape[:2] == frame_bgr.shape[:2]:
+            nroi = next_frame_bgr[ry0:ry0 + rh, rx0:rx0 + rw]
+            motion_score = float(np.mean(np.abs(roi.astype(np.float32) - nroi.astype(np.float32))))
+
+        if roi_faces:
+            top_f = max(roi_faces, key=lambda f: f.get("w", 0.0) * f.get("h", 0.0))
+            area = float(top_f.get("w", 0.15) * top_f.get("h", 0.15))
+            score = 100.0 + area * 350.0 + skin_ratio * 25.0 + min(15.0, motion_score)
+            abs_fcx = (rx0 + float(top_f["cx"]) * rw) / float(w)
+            abs_fcy = (ry0 + float(top_f["cy"]) * rh) / float(h)
+            abs_fw = (float(top_f["w"]) * rw) / float(w)
+            abs_fh = (float(top_f["h"]) * rh) / float(h)
+            cand_face = {"cx": abs_fcx, "cy": abs_fcy, "w": abs_fw, "h": abs_fh}
+        elif skin_ratio >= 0.16 and luma_std >= 12.0:
+            # Skin-cluster centroid when face angle/lighting misses Haar/MP or streamer sits still
+            ys, xs = np.where(skin_mask)
+            if len(xs) >= 16:
+                abs_fcx = (rx0 + float(np.mean(xs))) / float(w)
+                abs_fcy = (ry0 + float(np.mean(ys))) / float(h)
+                score = skin_ratio * 45.0 + min(25.0, motion_score)
+                cand_face = {"cx": abs_fcx, "cy": abs_fcy, "w": 0.12, "h": 0.18}
+            else:
+                score = -1.0
+                cand_face = None
+        else:
+            score = -1.0
+            cand_face = None
+
+        if cand_face is not None and score > best_score:
+            best_score = score
+            best_corner = c_name
+            best_face = cand_face
+
+    if best_corner is not None and best_face is not None:
+        # Tight 4:3 crop centered around detected webcam face inside the source frame
+        target_nw = max(0.24, min(0.34, best_face["w"] * 2.6))
+        # Preserve clean 4:3 geometry in normalized coords (nw * w) / (nh * h) = 4 / 3
+        target_nh = min(0.42, max(0.26, (target_nw * w * 3.0) / (4.0 * max(1, h))))
+        nx = max(0.0, min(1.0 - target_nw, best_face["cx"] - target_nw * 0.5))
+        ny = max(0.0, min(1.0 - target_nh, best_face["cy"] - target_nh * 0.44))
+        return {
+            "has_webcam": True,
+            "corner": best_corner,
+            "norm_box": {
+                "x": round(nx, 4),
+                "y": round(ny, 4),
+                "w": round(target_nw, 4),
+                "h": round(target_nh, 4),
+            },
+            "face_cx": round(best_face["cx"], 4),
+            "face_cy": round(best_face["cy"], 4),
+            "action_cx": 0.5,
+            "action_cy": 0.48,
+        }
+
+    # Pure gameplay fallback: compute edge/gradient energy centroid in central frame
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx * gx + gy * gy)
+    y0_c, y1_c = int(h * 0.15), int(h * 0.85)
+    x0_c, x1_c = int(w * 0.15), int(w * 0.85)
+    roi_mag = mag[y0_c:y1_c, x0_c:x1_c]
+    total_e = float(np.sum(roi_mag))
+    if total_e > 1e-3:
+        yy, xx = np.mgrid[y0_c:y1_c, x0_c:x1_c]
+        acx = float(np.sum(xx * roi_mag) / total_e) / float(w)
+        acy = float(np.sum(yy * roi_mag) / total_e) / float(h)
+    else:
+        acx, acy = 0.5, 0.48
+
+    return {
+        "has_webcam": False,
+        "corner": None,
+        "norm_box": None,
+        "action_cx": round(max(0.25, min(0.75, acx)), 4),
+        "action_cy": round(max(0.25, min(0.75, acy)), 4),
+    }
+
+
+def detect_webcam_corner_box(
+    video_path: str,
+    start_sec: float = 0.0,
+    end_sec: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Sample frames from video_path and detect which corner holds a streamer facecam."""
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return {"has_webcam": False, "corner": None, "norm_box": None, "action_cx": 0.5, "action_cy": 0.48}
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        dur = total_f / fps if total_f > 0 else 10.0
+        s0 = max(0.0, float(start_sec or 0.0))
+        s1 = min(dur, float(end_sec)) if end_sec else min(dur, s0 + 4.0)
+        sample_ts = sorted({s0, 0.5 * (s0 + s1)})
+
+        best_res: Optional[Dict[str, Any]] = None
+        for ts in sample_ts:
+            cap.set(cv2.CAP_PROP_POS_MSEC, ts * 1000.0)
+            ok1, fr1 = cap.read()
+            if not ok1 or fr1 is None:
+                continue
+            ok2, fr2 = cap.read()
+            res = detect_webcam_corner_in_frame(fr1, fr2 if ok2 else None)
+            if res.get("has_webcam"):
+                return res
+            if best_res is None:
+                best_res = res
+        return best_res or {"has_webcam": False, "corner": None, "norm_box": None, "action_cx": 0.5, "action_cy": 0.48}
+    finally:
+        cap.release()
+
+
 def compute_clamped_crop_coords(
     face_cx: float,
     face_cy: float,
@@ -728,13 +963,83 @@ def compute_clamped_crop_coords(
     max_y = max(0, src_h - crop_h)
 
     raw_x = (face_cx * src_w) + (pan_norm * src_w * 0.40) - (crop_w / 2.0)
-    raw_y = (face_cy * src_h) - (0.40 * crop_h)
+    # Rule-of-thirds eye/headroom placement (~36% down from top edge)
+    raw_y = (face_cy * src_h) - (0.36 * crop_h)
 
     cx = int(round(max(0.0, min(float(max_x), raw_x))))
     cy = int(round(max(0.0, min(float(max_y), raw_y))))
     cx = cx if cx % 2 == 0 else max(0, cx - 1)
     cy = cy if cy % 2 == 0 else max(0, cy - 1)
     return cx, cy
+
+
+def _compact_piecewise_points(
+    points: List[Tuple[float, int]],
+    min_val: int,
+    max_val: int,
+) -> List[Tuple[float, int]]:
+    """
+    Remove redundant flat middle vertices while preserving instantaneous hard-cut transitions
+    (`dt <= 0.015s`), clamping all values to `[min_val, max_val]`.
+    """
+    if not points:
+        return []
+    clamped = [(round(float(t), 4), max(min_val, min(max_val, int(v)))) for t, v in points]
+    if len(clamped) == 1:
+        return clamped
+
+    compact: List[Tuple[float, int]] = [clamped[0]]
+    for i in range(1, len(clamped) - 1):
+        t_prev, prev_v = compact[-1]
+        t_curr, curr_v = clamped[i]
+        t_next, next_v = clamped[i + 1]
+        is_cut_edge = (t_curr - t_prev) <= 0.015 or (t_next - t_curr) <= 0.015
+        if is_cut_edge or curr_v != prev_v or curr_v != next_v:
+            compact.append(clamped[i])
+    compact.append(clamped[-1])
+
+    if len(compact) > 64:
+        # Preserve cut-edge vertices while thinning smooth interiors
+        keep_indices = {0, len(compact) - 1}
+        for i in range(1, len(compact) - 1):
+            if (compact[i][0] - compact[i - 1][0]) <= 0.015 or (compact[i + 1][0] - compact[i][0]) <= 0.015:
+                keep_indices.add(i)
+        step = max(1, len(compact) // 56)
+        for i in range(0, len(compact), step):
+            keep_indices.add(i)
+        compact = [compact[i] for i in sorted(keep_indices)]
+    return compact
+
+
+def interpolate_piecewise_linear(
+    points: List[Tuple[float, int]],
+    t_sec: float,
+    min_val: int,
+    max_val: int,
+) -> int:
+    """
+    Evaluate the exact integer crop coordinate at `t_sec` matching FFmpeg's
+    `compile_piecewise_linear_expr(...)` segment math pixel-for-pixel.
+    """
+    compact = _compact_piecewise_points(points, min_val, max_val)
+    if not compact:
+        return min_val
+    if len(compact) == 1 or all(v == compact[0][1] for _, v in compact):
+        return compact[0][1]
+
+    t = float(t_sec)
+    for i in range(len(compact) - 1):
+        t0, v0 = compact[i]
+        t1, v1 = compact[i + 1]
+        if t < t1 - 1e-9:
+            if t1 <= t0 + 1e-4 or v0 == v1:
+                val = float(v0)
+            else:
+                val = v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+            clamped = int(max(min_val, min(max_val, round(val))))
+            return clamped if clamped % 2 == 0 else max(min_val, clamped - 1)
+    last_v = compact[-1][1]
+    return last_v if last_v % 2 == 0 else max(min_val, last_v - 1)
 
 
 def compile_piecewise_linear_expr(
@@ -745,44 +1050,23 @@ def compile_piecewise_linear_expr(
     """
     Compile [(t0, v0), (t1, v1), ...] into a piecewise-linear FFmpeg expression
     safe for filtergraph_script (`crop=w:h:x_expr:y_expr`).
-    Subsamples redundant stationary segments to keep expression concise.
     """
-    if not points:
+    compact = _compact_piecewise_points(points, min_val, max_val)
+    if not compact:
         return str(min_val)
-    if len(points) == 1:
-        return str(max(min_val, min(max_val, points[0][1])))
-
-    compact: List[Tuple[float, int]] = [points[0]]
-    for i in range(1, len(points) - 1):
-        prev_v = compact[-1][1]
-        curr_v = points[i][1]
-        next_v = points[i + 1][1]
-        if curr_v != prev_v or curr_v != next_v:
-            compact.append(points[i])
-    compact.append(points[-1])
-
-    if len(compact) > 60:
-        step = max(1, len(compact) // 60)
-        sampled = compact[::step]
-        if sampled[-1] != compact[-1]:
-            sampled.append(compact[-1])
-        compact = sampled
-
     if len(compact) == 1 or all(v == compact[0][1] for _, v in compact):
-        return str(max(min_val, min(max_val, compact[0][1])))
+        return str(compact[0][1])
 
-    expr = str(max(min_val, min(max_val, compact[-1][1])))
+    expr = str(compact[-1][1])
     for i in range(len(compact) - 2, -1, -1):
         t0, v0 = compact[i]
         t1, v1 = compact[i + 1]
-        v0 = max(min_val, min(max_val, v0))
-        v1 = max(min_val, min(max_val, v1))
         if t1 <= t0 + 1e-4 or v0 == v1:
             seg = str(v0)
         else:
             dt = t1 - t0
             dv = v1 - v0
-            seg = f"({v0}+({dv})*(t-{t0:.3f})/{dt:.3f})"
-        expr = f"if(lt(t,{t1:.3f}),{seg},{expr})"
+            seg = f"({v0}+({dv})*(t-{t0:.4f})/{dt:.4f})"
+        expr = f"if(lt(t,{t1:.4f}),{seg},{expr})"
 
     return f"clip({expr},{min_val},{max_val})"

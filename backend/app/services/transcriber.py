@@ -17,14 +17,43 @@ FILLER_WORDS = {
 }
 
 _whisper_model_instance = None
+_CUDA_DLLS_REGISTERED = False
+_whisper_runtime_info: Dict[str, Any] = {
+    "device": "cpu",
+    "compute_type": "int8",
+    "model_name": "base",
+    "batch_size": 4,
+    "badge": "CPU int8",
+}
+
+
+def _fmt_duration(sec: float) -> str:
+    s = max(0, int(round(sec)))
+    m, rem = divmod(s, 60)
+    if m > 0:
+        return f"{m}m {rem:02d}s"
+    return f"{rem}s"
+
+
+def _probe_wav_duration(audio_path: str) -> float:
+    try:
+        import wave
+        with wave.open(audio_path, "rb") as wf:
+            sr = max(1, wf.getframerate())
+            return float(wf.getnframes()) / float(sr)
+    except Exception:
+        return 0.0
+
 
 def register_cuda_dll_directories():
     """
     Register nvidia/cublas/bin and nvidia/cudnn/bin in site-packages
     and CUDA Toolkit paths on Windows using os.add_dll_directory before loading WhisperModel.
     """
-    if sys.platform != "win32":
+    global _CUDA_DLLS_REGISTERED
+    if _CUDA_DLLS_REGISTERED or sys.platform != "win32":
         return
+    _CUDA_DLLS_REGISTERED = True
 
     import site
     candidates = []
@@ -65,31 +94,78 @@ def register_cuda_dll_directories():
             if path not in os.environ.get("PATH", ""):
                 os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
 
+
+def _is_cuda_runtime_available() -> bool:
+    """Explicitly verify CUDA availability via `ctranslate2.get_cuda_device_count() > 0` first."""
+    register_cuda_dll_directories()
+    try:
+        import ctranslate2
+        if int(ctranslate2.get_cuda_device_count()) > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        import torch  # type: ignore
+        if torch.cuda.is_available() and int(torch.cuda.device_count()) > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def resolve_whisper_device_and_compute() -> tuple[str, str, str]:
     """
-    Dynamically select Whisper device, compute type, and model size based on real detected hardware:
-    - If detected NVIDIA VRAM >= 8 GB (e.g. RTX 5070 with 12GB), use cuda with float16 and large-v3-turbo (or configured model).
-    - If detected NVIDIA VRAM < 8 GB (e.g. RTX 3050 with 4GB), use cuda with int8_float16.
-    - If CUDA fails or no NVIDIA GPU, fallback to cpu with int8 and base.
+    Dynamically select Whisper device, compute type, and model size based on CTranslate2 + hardware detection:
+    - If VRAM >= 8 GB: cuda with `float16` and `large-v3-turbo` (`batch_size=16`).
+    - If 0 < VRAM < 8 GB: cuda with `int8_float16` (`batch_size=16`).
+    - If `ctranslate2.get_cuda_device_count() > 0` without VRAM cap: cuda with `float16` (`batch_size=16`).
+    - Otherwise (or WHISPER_DEVICE == 'cpu'): cpu with `int8`, `beam_size=1`, and `batch_size=4`.
     """
     from app.services.hardware import detect_hardware_specs
     hw = detect_hardware_specs()
-    vram_mb = hw.get("vram_mb", 0)
-    has_cuda = hw.get("has_cuda", False)
+    vram_mb = int(hw.get("vram_mb", 0) or 0)
+    has_cuda = bool(hw.get("has_cuda", False))
 
     if not has_cuda or settings.WHISPER_DEVICE == "cpu":
         return "cpu", "int8", settings.WHISPER_MODEL or "base"
 
+    # Also verify CTranslate2 CUDA count when CUDA hardware is detected (CPU-only builds fall back cleanly in get_whisper_model)
+    try:
+        register_cuda_dll_directories()
+        import ctranslate2
+        _ = int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        pass
+
     if vram_mb >= 8000:
         return "cuda", "float16", "large-v3-turbo"
-    else:
+    if 0 < vram_mb < 8000:
         return "cuda", "int8_float16", settings.WHISPER_MODEL or "base"
+    return "cuda", "float16", settings.WHISPER_MODEL or "base"
+
+
+def get_whisper_runtime_info() -> Dict[str, Any]:
+    """Return active/projected Whisper device, precision, model name, batch size, and badge."""
+    dev, compute, model_name = resolve_whisper_device_and_compute()
+    active_dev = _whisper_runtime_info.get("device") if _whisper_model_instance is not None else dev
+    active_comp = _whisper_runtime_info.get("compute_type") if _whisper_model_instance is not None else compute
+    active_model = _whisper_runtime_info.get("model_name") if _whisper_model_instance is not None else model_name
+    bs = 16 if active_dev == "cuda" else 4
+    badge = f"GPU: CUDA {active_comp}" if active_dev == "cuda" else f"CPU {active_comp}"
+    return {
+        "device": active_dev,
+        "compute_type": active_comp,
+        "model_name": active_model,
+        "batch_size": bs,
+        "badge": badge,
+    }
+
 
 def get_whisper_model(force_device: Optional[str] = None):
     """
     Robust singleton getter for faster-whisper model with dynamic VRAM scaling.
     """
-    global _whisper_model_instance
+    global _whisper_model_instance, _whisper_runtime_info
     if _whisper_model_instance is not None and not force_device:
         return _whisper_model_instance
 
@@ -108,10 +184,10 @@ def get_whisper_model(force_device: Optional[str] = None):
     # If models_dir already contains model.bin, use it directly (100% offline & fast)
     model_target = models_dir if os.path.exists(os.path.join(models_dir, "model.bin")) else model_name
 
-    # 1. Try CUDA if selected
-    if dev == "cuda":
+    # 1. Try CUDA if selected and runtime CUDA device confirmed
+    if dev == "cuda" and _is_cuda_runtime_available():
         try:
-            logger.info(f"Loading faster-whisper from '{model_target}' on CUDA ({compute})...")
+            logger.info(f"Loading faster-whisper '{model_name}' from '{model_target}' on CUDA ({compute}, batch_size=16)...")
             model = WhisperModel(
                 model_target,
                 device="cuda",
@@ -124,6 +200,13 @@ def get_whisper_model(force_device: Optional[str] = None):
             list(model.transcribe(dummy_pcm, beam_size=1)[0])
             logger.info(f"faster-whisper CUDA ({compute}) initialization verified successfully!")
             _whisper_model_instance = model
+            _whisper_runtime_info = {
+                "device": "cuda",
+                "compute_type": compute,
+                "model_name": model_name,
+                "batch_size": 16,
+                "badge": f"GPU: CUDA {compute}",
+            }
             return _whisper_model_instance
         except Exception as cuda_err:
             logger.warning(
@@ -131,7 +214,7 @@ def get_whisper_model(force_device: Optional[str] = None):
                 f"Cleanly falling back to CPU (int8)..."
             )
             try:
-                import torch
+                import torch  # type: ignore
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -139,7 +222,7 @@ def get_whisper_model(force_device: Optional[str] = None):
 
     # 2. CPU fallback with int8
     try:
-        logger.info(f"Loading faster-whisper from '{model_target}' on CPU (int8)...")
+        logger.info(f"Loading faster-whisper '{model_name}' from '{model_target}' on CPU (int8, batch_size=4)...")
         model = WhisperModel(
             model_target,
             device="cpu",
@@ -149,6 +232,13 @@ def get_whisper_model(force_device: Optional[str] = None):
         )
         logger.info("faster-whisper CPU initialization verified successfully!")
         _whisper_model_instance = model
+        _whisper_runtime_info = {
+            "device": "cpu",
+            "compute_type": "int8",
+            "model_name": model_name,
+            "batch_size": 4,
+            "badge": "CPU int8",
+        }
         return _whisper_model_instance
     except Exception as cpu_err:
         logger.error(f"Failed to load faster-whisper on CPU: {cpu_err}\n{traceback.format_exc()}")
@@ -296,20 +386,69 @@ def transcribe_clip(video_path: str, start_time: float, duration: float, languag
 
     return words_list
 
+def _run_batched_or_standard_transcribe(
+    model: Any,
+    audio_path: str,
+    *,
+    language: Optional[str],
+    initial_prompt: Optional[str],
+    word_timestamps: bool,
+    vad_filter: bool,
+    batch_size: int,
+    beam_size: int = 1,
+):
+    """
+    Execute faster-whisper BatchedInferencePipeline (`batch_size=16` GPU float16 / `batch_size=4, beam_size=1` CPU int8)
+    with transparent fallback to standard `model.transcribe(...)` when needed.
+    """
+    vad_params = dict(min_silence_duration_ms=400) if vad_filter else None
+    try:
+        from faster_whisper import BatchedInferencePipeline
+        batched = BatchedInferencePipeline(model=model)
+        kwargs: Dict[str, Any] = {
+            "language": language,
+            "initial_prompt": initial_prompt,
+            "word_timestamps": word_timestamps,
+            "vad_filter": vad_filter,
+            "batch_size": batch_size,
+            "beam_size": beam_size,
+        }
+        if vad_params:
+            kwargs["vad_parameters"] = vad_params
+        return batched.transcribe(audio_path, **kwargs)
+    except Exception as batch_err:
+        logger.debug(f"BatchedInferencePipeline unavailable/bypassed ({batch_err}); using direct model.transcribe")
+        kwargs = {
+            "language": language,
+            "initial_prompt": initial_prompt,
+            "word_timestamps": word_timestamps,
+            "vad_filter": vad_filter,
+            "beam_size": beam_size,
+        }
+        if vad_params:
+            kwargs["vad_parameters"] = vad_params
+        return model.transcribe(audio_path, **kwargs)
+
+
 def transcribe_audio_full(
     audio_path: str,
     language: Optional[str] = None,
     on_progress: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """
-    Transcribe a full 16kHz mono audio WAV using faster-whisper with millisecond word timestamps.
-    Returns real word dictionaries: [{'word': '...', 'start': 0.12, 'end': 0.45, 'is_filler': False, 'deleted': False}].
-    Logs real decoding progress and cleanly falls back to CPU if CUDA fails.
+    Transcribe a full 16kHz mono audio WAV using faster-whisper BatchedInferencePipeline
+    (`batch_size=16` on CUDA float16, `batch_size=4, beam_size=1` on CPU int8) with millisecond word timestamps
+    and ~15% incremental console progress updates.
     """
     if not os.path.exists(audio_path):
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
     model = get_whisper_model()
+    rt = get_whisper_runtime_info()
+    batch_size = int(rt.get("batch_size", 4))
+    active_dev = str(rt.get("device", "cpu")).lower()
+    active_comp = str(rt.get("compute_type", "int8"))
+    beam_size = 1 if active_dev != "cuda" else 1
 
     whisper_lang = None
     initial_prompt = None
@@ -325,88 +464,94 @@ def transcribe_audio_full(
             }
             whisper_lang = lang_map.get(language)
 
+    dev_banner = f"{active_dev.upper()} {active_comp}"
+    active_log = f"Running faster-whisper on {dev_banner} (batch_size={batch_size}, beam_size={beam_size})..."
+    logger.info(active_log)
+    if on_progress:
+        on_progress(0, f"Running faster-whisper {rt.get('model_name', 'base')} on {dev_banner} (batch_size={batch_size})...")
+
     words_list: List[Dict[str, Any]] = []
+    probed_dur = _probe_wav_duration(audio_path)
+
+    def _consume_segments(segments_iter: Any, total_duration: float) -> None:
+        nonlocal words_list
+        next_milestone = 15
+        last_end = 0.0
+        for seg in segments_iter:
+            seg_end = float(getattr(seg, "end", 0.0) or 0.0)
+            last_end = max(last_end, seg_end)
+            if getattr(seg, "words", None):
+                for w in seg.words:
+                    cleaned = w.word.strip()
+                    if not cleaned:
+                        continue
+                    words_list.append({
+                        "word": cleaned,
+                        "start": round(float(w.start), 3),
+                        "end": round(float(w.end), 3),
+                        "is_filler": is_filler_word(cleaned),
+                        "deleted": False,
+                    })
+            if on_progress and total_duration > 0:
+                pct = min(100, int((seg_end / total_duration) * 100))
+                if pct >= next_milestone or pct >= 99:
+                    on_progress(
+                        pct,
+                        f"Transcribed {_fmt_duration(seg_end)} / {_fmt_duration(total_duration)} ({pct}%)...",
+                    )
+                    while next_milestone <= pct:
+                        next_milestone += 15
+        if on_progress and total_duration > 0 and last_end > 0 and next_milestone <= 100:
+            on_progress(100, f"Transcribed {_fmt_duration(total_duration)} / {_fmt_duration(total_duration)} (100%)...")
 
     try:
         try:
-            segments, info = model.transcribe(
+            segments, info = _run_batched_or_standard_transcribe(
+                model,
                 audio_path,
                 language=whisper_lang,
                 initial_prompt=initial_prompt,
                 word_timestamps=True,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400)
+                batch_size=batch_size,
+                beam_size=beam_size,
             )
-            total_duration = info.duration if hasattr(info, "duration") and info.duration else 0.0
-
-            for seg in segments:
-                if seg.words:
-                    for w in seg.words:
-                        cleaned = w.word.strip()
-                        if not cleaned:
-                            continue
-                        words_list.append({
-                            "word": cleaned,
-                            "start": round(w.start, 3),
-                            "end": round(w.end, 3),
-                            "is_filler": is_filler_word(cleaned),
-                            "deleted": False
-                        })
-                if on_progress and total_duration > 0:
-                    pct = min(100, int((seg.end / total_duration) * 100))
-                    on_progress(pct, f"Decoded up to {seg.end:.1f}s / {total_duration:.1f}s")
+            total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
+            _consume_segments(segments, total_duration)
         except Exception as cuda_err:
-            logger.warning(f"CUDA faster-whisper transcription error: {cuda_err}. Falling back to CPU model...")
+            logger.warning(f"CUDA/Batched faster-whisper transcription error: {cuda_err}. Falling back to CPU (int8, batch_size=4, beam_size=1)...")
             model = get_whisper_model(force_device="cpu")
-            segments, info = model.transcribe(
+            rt = get_whisper_runtime_info()
+            batch_size = int(rt.get("batch_size", 4))
+            words_list = []
+            segments, info = _run_batched_or_standard_transcribe(
+                model,
                 audio_path,
                 language=whisper_lang,
                 initial_prompt=initial_prompt,
                 word_timestamps=True,
                 vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=400)
+                batch_size=batch_size,
+                beam_size=1,
             )
-            total_duration = info.duration if hasattr(info, "duration") and info.duration else 0.0
-            for seg in segments:
-                if seg.words:
-                    for w in seg.words:
-                        cleaned = w.word.strip()
-                        if not cleaned:
-                            continue
-                        words_list.append({
-                            "word": cleaned,
-                            "start": round(w.start, 3),
-                            "end": round(w.end, 3),
-                            "is_filler": is_filler_word(cleaned),
-                            "deleted": False
-                        })
-                if on_progress and total_duration > 0:
-                    pct = min(100, int((seg.end / total_duration) * 100))
-                    on_progress(pct, f"Decoded up to {seg.end:.1f}s / {total_duration:.1f}s (CPU)")
+            total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
+            _consume_segments(segments, total_duration)
 
         # If VAD filtered everything, retry without VAD
         if not words_list:
             logger.info("VAD returned 0 words. Retrying full audio without VAD filter...")
-            segments, info = model.transcribe(
+            segments, info = _run_batched_or_standard_transcribe(
+                model,
                 audio_path,
                 language=whisper_lang,
                 initial_prompt=initial_prompt,
                 word_timestamps=True,
-                vad_filter=False
+                vad_filter=False,
+                batch_size=batch_size,
+                beam_size=beam_size,
             )
-            for seg in segments:
-                if seg.words:
-                    for w in seg.words:
-                        cleaned = w.word.strip()
-                        if not cleaned:
-                            continue
-                        words_list.append({
-                            "word": cleaned,
-                            "start": round(w.start, 3),
-                            "end": round(w.end, 3),
-                            "is_filler": is_filler_word(cleaned),
-                            "deleted": False
-                        })
+            total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
+            _consume_segments(segments, total_duration)
 
     except Exception as e:
         logger.error(f"Full audio transcription error: {e}\n{traceback.format_exc()}")

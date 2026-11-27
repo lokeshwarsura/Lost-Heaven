@@ -12,7 +12,10 @@ import {
   MachineSpecs,
   ModelsStatusReport,
   TestGeminiResponse,
-  GeminiModelInfo
+  GeminiModelInfo,
+  SourceWebcamRegion,
+  FramingOverride,
+  FramingMapResponse
 } from '../types';
 
 declare global {
@@ -245,7 +248,8 @@ export const api = {
     clipCount: number = 5,
     topicFocus?: string,
     captionLanguage: string = 'As spoken',
-    hardwareMode: string = 'gpu'
+    hardwareMode: string = 'gpu',
+    aiMode?: 'gemini' | 'offline'
   ): Promise<{ project_id: number; title: string }> {
     const formData = new FormData();
     formData.append('file', file);
@@ -254,6 +258,9 @@ export const api = {
     formData.append('clip_count', clipCount.toString());
     formData.append('caption_language', captionLanguage);
     formData.append('hardware_mode', hardwareMode);
+    if (aiMode) {
+      formData.append('ai_mode', aiMode);
+    }
     if (topicFocus) {
       formData.append('topic_focus', topicFocus);
     }
@@ -273,7 +280,8 @@ export const api = {
     clipCount: number = 5,
     topicFocus?: string,
     captionLanguage: string = 'As spoken',
-    hardwareMode: string = 'gpu'
+    hardwareMode: string = 'gpu',
+    aiMode?: 'gemini' | 'offline'
   ): Promise<{ project_id: number; title: string }> {
     const res = await fetch(`${API_BASE}/ingest/youtube`, {
       method: 'POST',
@@ -285,7 +293,8 @@ export const api = {
         clip_count: clipCount,
         topic_focus: topicFocus,
         caption_language: captionLanguage,
-        hardware_mode: hardwareMode
+        hardware_mode: hardwareMode,
+        ai_mode: aiMode
       }),
     });
     if (!res.ok) {
@@ -407,7 +416,7 @@ export const api = {
   async uploadFont(file: File): Promise<{ font_name: string }> {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch(`${API_BASE}/fonts/upload`, {
+    const res = await fetch(`${API_BASE}/system/fonts`, {
       method: 'POST',
       body: formData,
     });
@@ -418,6 +427,32 @@ export const api = {
     const formData = new FormData();
     formData.append('file', file);
     const res = await fetch(`${API_BASE}/assets/upload`, {
+      method: 'POST',
+      body: formData,
+    });
+    return res.json();
+  },
+
+  async listLuts(): Promise<Array<{ name: string; filename: string; path: string }>> {
+    const res = await fetch(`${API_BASE}/system/luts`);
+    if (!res.ok) return [];
+    return res.json();
+  },
+
+  async uploadLut(file: File): Promise<{ name: string; filename: string; path: string; url: string }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/system/luts`, {
+      method: 'POST',
+      body: formData,
+    });
+    return res.json();
+  },
+
+  async uploadBrandLogo(file: File): Promise<{ filename: string; url: string; path: string }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/system/brand-logo`, {
       method: 'POST',
       body: formData,
     });
@@ -437,6 +472,8 @@ export const api = {
     webcam_corner?: string;
     webcam_split_ratio?: number;
     pip_border_color?: string;
+    source_webcam_region?: any;
+    framing_override?: any;
     clip_size?: string;
     export_resolution?: string;
     watermark_path?: string;
@@ -447,10 +484,13 @@ export const api = {
     pan_x_offset?: number;
     pan_x?: number;
     color_preset?: string;
+    preset_intensity?: number;
     exposure?: number;
     brightness?: number;
     contrast?: number;
     lift_mids?: number;
+    highlights?: number;
+    shadows?: number;
     warmth?: number;
     saturation?: number;
     black_and_white?: number;
@@ -465,6 +505,19 @@ export const api = {
     film_grain?: number;
     vignette?: number;
     bottom_fade?: number;
+    color_temp?: number;
+    tint_shift?: number;
+    vibrance?: number;
+    matte_fade?: number;
+    halation_glow?: number;
+    lut_path?: string;
+    chroma_split?: number;
+    letterbox?: string;
+    speed_ramp?: number;
+    bypass_color?: boolean;
+    outro_cta_headline?: string;
+    outro_cta_handle?: string;
+    outro_logo_path?: string;
     burn_captions?: boolean;
     timing_offset?: number;
     caption_style?: string;
@@ -478,6 +531,9 @@ export const api = {
     active_color?: string;
     highlight_color?: string;
     outline_color?: string;
+    pill_color?: string;
+    pacing_density?: string;
+    text_case?: string;
     hold_back_alpha?: number;
     hold_back_opacity?: number;
     highlight_shape?: string;
@@ -486,6 +542,10 @@ export const api = {
     pos_x?: number;
     position_y?: number;
     pos_y?: number;
+    caption_x?: number;
+    caption_y?: number;
+    caption_rotation?: number;
+    caption_max_width?: number;
     outline_width?: number;
     outline?: number;
     shadow_depth?: number;
@@ -525,6 +585,9 @@ export const api = {
     backdrop_mode?: string;
     backdrop_blur_intensity?: number;
     backdrop_color?: string;
+    camera_motion?: string;
+    whip_pan_cuts?: boolean;
+    depth_pop?: number;
     privacy_blur_boxes?: any[];
     beat_sync_enabled?: boolean;
     spectrum_enabled?: boolean;
@@ -538,6 +601,13 @@ export const api = {
     handle_corner?: string;
     handle_opacity?: number;
     handle_display_mode?: string;
+    use_cold_open?: boolean;
+    cold_open_quote?: string;
+    auto_trim_dead_air?: boolean;
+    silence_threshold?: number;
+    dynamic_punch_zoom?: boolean;
+    punch_zoom_intensity?: number;
+    options?: Record<string, any>;
   }): Promise<PreviewFrameResponse> {
     const res = await fetch(`${API_BASE}/preview-frame`, {
       method: 'POST',
@@ -1023,6 +1093,136 @@ export const api = {
     const res = await fetch(`${API_BASE}/analytics/formula`);
     if (!res.ok) {
       throw new Error('Failed to fetch analytics formula');
+    }
+    return res.json();
+  },
+
+  async getWebcamRegion(
+    projectId: number,
+    clipId: number,
+    refresh = false
+  ): Promise<SourceWebcamRegion> {
+    const qs = refresh ? '?refresh=true' : '';
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/webcam-region${qs}`);
+    if (!res.ok) {
+      throw new Error('Failed to detect source webcam region');
+    }
+    return res.json();
+  },
+
+  async updateWebcamRegion(
+    projectId: number,
+    clipId: number,
+    payload: {
+      source_zone?: string;
+      x?: number;
+      y?: number;
+      w?: number;
+      h?: number;
+      refresh?: boolean;
+    }
+  ): Promise<SourceWebcamRegion> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/webcam-region`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      throw new Error('Failed to update source webcam region');
+    }
+    return res.json();
+  },
+
+  async getFramingMap(
+    projectId: number,
+    clipId: number,
+    refresh = false
+  ): Promise<FramingMapResponse> {
+    const qs = refresh ? '?refresh=true' : '';
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/framing-map${qs}`);
+    if (!res.ok) {
+      throw new Error('Failed to load clip framing map');
+    }
+    return res.json();
+  },
+
+  async updateFramingOverride(
+    projectId: number,
+    clipId: number,
+    payload: {
+      webcam_box?: { x: number; y: number; w: number; h: number } | null;
+      focus_anchor?: { x: number; y: number } | null;
+      lock_camera?: boolean;
+      reset?: boolean;
+    }
+  ): Promise<{
+    clip_id: number;
+    project_id: number;
+    framing_override: FramingOverride | null;
+    source_webcam_region: SourceWebcamRegion | null;
+    visual_map?: any;
+  }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/framing-override`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      throw new Error('Failed to save framing override');
+    }
+    return res.json();
+  },
+
+  async autoFrameAll(projectId: number): Promise<{
+    status: string;
+    project_id: number;
+    updated_count: number;
+    clips: ViralClip[];
+  }> {
+    const res = await fetch(`${API_BASE}/projects/${projectId}/auto-frame-all`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Smart Auto-Frame failed' }));
+      throw new Error(err.detail || 'Smart Auto-Frame failed');
+    }
+    return res.json();
+  },
+
+  async getBestFrames(projectId: number, clipId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/best-frames`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to load best frames & analysis' }));
+      throw new Error(err.detail || 'Failed to load best frames & analysis');
+    }
+    return res.json();
+  },
+
+  async getClipPresetPreviews(
+    projectId: number,
+    clipId: number,
+    lutPath?: string | null,
+    force = false
+  ): Promise<import('../types').PresetPreviewsResponse> {
+    const params = new URLSearchParams();
+    if (lutPath) params.set('lut_path', lutPath);
+    if (force) params.set('force', 'true');
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/preset-previews${qs}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to generate color preset previews' }));
+      throw new Error(err.detail || 'Failed to generate color preset previews');
+    }
+    return res.json();
+  },
+
+  async reanalyzeClip(projectId: number, clipId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/reanalyze`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Clip reanalysis failed' }));
+      throw new Error(err.detail || 'Clip reanalysis failed');
     }
     return res.json();
   },

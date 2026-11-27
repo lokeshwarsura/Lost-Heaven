@@ -17,8 +17,15 @@ from app.services.reframer import (
     build_multi_aspect_filter,
     canonicalize_framing_template,
     build_filter_complex_args,
+    prepare_clip_framing_data,
 )
-from app.services.face_tracker import track_faces_in_clip, detect_faces_offline
+from app.services.face_tracker import (
+    track_faces_in_clip,
+    detect_faces_offline,
+    detect_punch_zoom_peaks,
+    compute_punch_zoom_factor_at_t,
+    compute_punch_focus_anchor,
+)
 from app.services.filters import build_advanced_color_filter
 from app.services.caption_renderer import render_caption_frame
 from app.services.profanity_filter import mask_words_profanity
@@ -34,7 +41,11 @@ def render_exact_preview_frame(
     custom_height: int = 1920,
     frame_layout: str = "auto_track",
     webcam_corner: str = "top_left",
-    webcam_split_ratio: float = 0.38,
+    webcam_split_ratio: float = 0.40,
+    source_webcam_region: Optional[Dict[str, Any]] = None,
+    visual_map: Optional[Dict[str, Any]] = None,
+    framing_override: Optional[Dict[str, Any]] = None,
+    best_frames: Optional[List[Dict[str, Any]]] = None,
     pip_border_color: str = "#F59E0B",
     zoom: float = 1.0,
     pan_x_offset: float = 0.0,
@@ -58,6 +69,9 @@ def render_exact_preview_frame(
     backdrop_mode: str = "none",
     backdrop_blur_intensity: float = 18.0,
     backdrop_color: str = "#18181B",
+    depth_pop: float = 0.0,
+    camera_motion: str = "steady",
+    whip_pan_cuts: bool = False,
     privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None,
     beat_sync_enabled: bool = False,
     spectrum_enabled: bool = False,
@@ -71,6 +85,12 @@ def render_exact_preview_frame(
     handle_corner: str = "bottom_right",
     handle_opacity: float = 0.65,
     handle_display_mode: str = "always",
+    use_cold_open: bool = False,
+    cold_open_quote: str = "",
+    auto_trim_dead_air: bool = False,
+    silence_threshold: float = 0.45,
+    dynamic_punch_zoom: bool = False,
+    punch_zoom_intensity: float = 1.14,
 ) -> Dict[str, Any]:
     """
     Extract a single frame at `timestamp` using the exact FFmpeg reframing,
@@ -96,10 +116,12 @@ def render_exact_preview_frame(
 
         src_w = 1920
         src_h = 1080
+        src_fps = 30.0
         try:
             meta = probe_video(video_path)
             src_w = meta.get("width") or 1920
             src_h = meta.get("height") or 1080
+            src_fps = float(meta.get("fps") or 30.0)
         except Exception as e:
             logger.warning(f"Could not probe video {video_path} for preview frame, assuming 1920x1080: {e}")
 
@@ -118,50 +140,156 @@ def render_exact_preview_frame(
             if clip_start_time > 0 and seek_ts < clip_start_time:
                 seek_ts = clip_start_time + seek_ts
 
-        # Multi-segment timeline remap (blade cuts & merged clips)
-        preview_words = list(transcript_words or [])
+        # Multi-segment timeline remap (blade cuts, dead-air trimming, & merged clips)
+        preview_words = [dict(w) for w in (transcript_words or []) if not w.get("muted", False)]
         preview_cap_start = clip_start_time
         preview_cap_dur = clip_duration
-        if keep_segments:
+        co = caption_options or {}
+        eff_tighten = bool(co.get("tighten_pacing", False))
+        eff_trim_dead_air = bool(auto_trim_dead_air or co.get("auto_trim_dead_air", False))
+        eff_silence_thresh = float(co.get("silence_threshold", silence_threshold) or 0.45)
+
+        if keep_segments or eff_tighten or eff_trim_dead_air:
             from app.services.timeline_editor import (
                 compute_kept_segments_and_remapped_words,
                 map_output_time_to_source_time,
             )
-            abs_segs = [
-                (max(0.0, float(seg[0])), float(seg[1]))
-                for seg in keep_segments
-                if isinstance(seg, (list, tuple)) and len(seg) >= 2 and float(seg[1]) > float(seg[0]) + 0.05
-            ]
-            if abs_segs:
-                min_s = min(s for s, _ in abs_segs)
-                max_e = max(e for _, e in abs_segs)
-                tl = compute_kept_segments_and_remapped_words(
-                    words=preview_words,
-                    clip_start_time=min_s,
-                    clip_duration=max(clip_duration, max_e - min_s),
-                    explicit_keep_segments=abs_segs,
-                    crossfade_sec=float(merge_crossfade_sec or 0.03),
-                )
-                eff_segs = tl.get("kept_segments_abs") or abs_segs
-                if len(eff_segs) > 1 or clip_rel_ts_override is not None:
-                    seek_ts = map_output_time_to_source_time(
-                        clip_rel_ts,
-                        eff_segs,
-                        crossfade_sec=float(tl.get("crossfade_sec", merge_crossfade_sec)),
-                    )
-                preview_words = tl.get("remapped_words") or preview_words
-                preview_cap_start = 0.0
-                preview_cap_dur = float(tl.get("effective_duration") or clip_duration)
+            abs_segs: Optional[List[tuple[float, float]]] = None
+            if keep_segments:
+                parsed_abs = [
+                    (max(0.0, float(seg[0])), float(seg[1]))
+                    for seg in keep_segments
+                    if isinstance(seg, (list, tuple)) and len(seg) >= 2 and float(seg[1]) > float(seg[0]) + 0.05
+                ]
+                if parsed_abs:
+                    abs_segs = parsed_abs
 
-        # Fast face tracking around timestamp for auto_track / split_podcast
-        face_track_data = None
-        if layout in ("auto_track", "split_podcast"):
-            face_track_data = track_faces_in_clip(
-                video_path=video_path,
-                start_sec=max(0.0, seek_ts - 0.35),
-                end_sec=seek_ts + 0.35,
-                mode="dual" if layout == "split_podcast" else "single",
+            min_s = min(s for s, _ in abs_segs) if abs_segs else max(0.0, float(clip_start_time or 0.0))
+            max_e = (
+                max(e for _, e in abs_segs)
+                if abs_segs
+                else min_s + max(0.5, float(clip_duration or (float(meta.get("duration") or 0.0) if "meta" in locals() and isinstance(meta, dict) else 4.0) or 4.0))
             )
+            eff_cf_prev = (
+                max(0.03, float(merge_crossfade_sec or 0.03))
+                if (eff_tighten or eff_trim_dead_air)
+                else float(merge_crossfade_sec or 0.03)
+            )
+            tl = compute_kept_segments_and_remapped_words(
+                words=preview_words,
+                clip_start_time=min_s,
+                clip_duration=max(float(clip_duration or 0.0), max_e - min_s),
+                tighten_pacing=eff_tighten,
+                auto_trim_dead_air=eff_trim_dead_air,
+                silence_threshold=eff_silence_thresh,
+                clean_filler_words=bool(co.get("clean_filler_words", False)),
+                explicit_keep_segments=abs_segs,
+                crossfade_sec=eff_cf_prev,
+                video_path=video_path,
+            )
+            eff_segs = tl.get("kept_segments_abs") or abs_segs
+            if tl.get("has_cuts") and eff_segs:
+                seek_ts = map_output_time_to_source_time(
+                    clip_rel_ts,
+                    eff_segs,
+                    crossfade_sec=float(tl.get("crossfade_sec", eff_cf_prev)),
+                )
+            elif abs_segs and (len(abs_segs) > 1 or clip_rel_ts_override is not None):
+                seek_ts = map_output_time_to_source_time(
+                    clip_rel_ts,
+                    eff_segs,
+                    crossfade_sec=float(tl.get("crossfade_sec", eff_cf_prev)),
+                )
+            preview_words = tl.get("remapped_words") or preview_words
+            preview_cap_start = 0.0
+            preview_cap_dur = float(tl.get("effective_duration") or clip_duration)
+
+        # Single Source of Truth framing analysis (identical keyframes & crop math as renderer.py)
+        total_vid_dur = float(meta.get("duration") or 0.0) if "meta" in locals() and isinstance(meta, dict) else 0.0
+        if "eff_segs" in locals() and eff_segs:
+            framing_segs = [(float(s), float(e)) for s, e in eff_segs]
+        else:
+            s_anchor = max(0.0, float(clip_start_time or 0.0))
+            if clip_duration and clip_duration > 0.2:
+                e_anchor = s_anchor + float(clip_duration)
+            elif total_vid_dur > 0.2:
+                e_anchor = total_vid_dur
+            else:
+                e_anchor = max(seek_ts + 2.0, s_anchor + 4.0)
+            framing_segs = [(s_anchor, e_anchor)]
+            if clip_start_time <= 0.0 and not (clip_duration and clip_duration > 0.2):
+                clip_rel_ts = seek_ts
+
+        # Cold-Open Climax Teaser parity (`>= 8.0s` clips): map preview timestamp across teaser + main clip
+        main_framing_segs = list(framing_segs)
+        main_dur_eval = max(0.5, float(preview_cap_dur or (main_framing_segs[-1][1] - main_framing_segs[0][0]) or 8.0))
+        cold_open_active = False
+        cold_open_net_offset = 0.0
+        framing_rel_t = clip_rel_ts
+        if use_cold_open and main_dur_eval >= 8.0:
+            from app.services.timeline_editor import select_cold_open_climax_window, map_output_time_to_source_time
+            co_win = select_cold_open_climax_window(
+                video_path,
+                clip_start_time=main_framing_segs[0][0],
+                clip_duration=max(main_dur_eval, main_framing_segs[-1][1] - main_framing_segs[0][0]),
+                words=transcript_words,
+                cold_open_quote=cold_open_quote,
+                window_sec=2.50,
+            )
+            if co_win is not None:
+                co_s, co_e = co_win
+                co_len = max(0.8, round(co_e - co_s, 3))
+                co_xf = min(0.20, round(co_len * 0.25, 3))
+                cold_open_net_offset = round(co_len - co_xf, 3)
+                cold_open_active = True
+                if preview_cap_start > 0.0:
+                    for pw in preview_words:
+                        pw["start"] = round(float(pw.get("start", 0.0)) - preview_cap_start + cold_open_net_offset, 3)
+                        pw["end"] = round(float(pw.get("end", 0.0)) - preview_cap_start + cold_open_net_offset, 3)
+                    preview_cap_start = 0.0
+                else:
+                    for pw in preview_words:
+                        pw["start"] = round(float(pw.get("start", 0.0)) + cold_open_net_offset, 3)
+                        pw["end"] = round(float(pw.get("end", 0.0)) + cold_open_net_offset, 3)
+                preview_cap_dur = round(main_dur_eval + cold_open_net_offset, 3)
+                if clip_rel_ts < cold_open_net_offset:
+                    seek_ts = co_s + clip_rel_ts
+                    framing_segs = [(co_s, co_e)]
+                    framing_rel_t = clip_rel_ts
+                else:
+                    eff_main_t = max(0.0, clip_rel_ts - cold_open_net_offset)
+                    seek_ts = map_output_time_to_source_time(eff_main_t, main_framing_segs, crossfade_sec=float(merge_crossfade_sec or 0.03))
+                    framing_rel_t = eff_main_t
+
+        face_track_data, eff_webcam_corner, _ = prepare_clip_framing_data(
+            video_path=video_path,
+            kept_segments_abs=framing_segs,
+            frame_layout=layout,
+            webcam_corner=webcam_corner,
+            source_webcam_region=source_webcam_region,
+            visual_map=visual_map,
+            framing_override=framing_override,
+            best_frames=best_frames,
+            merge_crossfade_sec=float(merge_crossfade_sec or 0.03),
+        )
+
+        co = caption_options or {}
+        eff_cam_motion = str(camera_motion or co.get("camera_motion") or "steady")
+        eff_whip_pan = bool(whip_pan_cuts or co.get("whip_pan_cuts", False))
+        eff_dur_val = float(main_dur_eval if framing_rel_t != clip_rel_ts or not cold_open_active else (framing_segs[-1][1] - framing_segs[0][0]))
+        beat_ts_prev: Optional[List[float]] = None
+        if eff_cam_motion == "beat_punch":
+            try:
+                from app.services.beat_sync import detect_audio_beats
+                bd = detect_audio_beats(
+                    video_path,
+                    start_sec=framing_segs[0][0],
+                    duration_sec=max(1.0, eff_dur_val),
+                    spectrum_fps=8,
+                )
+                beat_ts_prev = bd.get("beats") or None
+            except Exception:
+                beat_ts_prev = None
 
         # 1. Multi-Aspect Framing Filter
         layout_vf = build_multi_aspect_filter(
@@ -171,7 +299,7 @@ def render_exact_preview_frame(
             source_h=src_h,
             custom_w=target_w,
             custom_h=target_h,
-            webcam_corner=webcam_corner,
+            webcam_corner=eff_webcam_corner,
             webcam_split_ratio=webcam_split_ratio,
             pip_border_color=pip_border_color,
             zoom=zoom,
@@ -179,33 +307,87 @@ def render_exact_preview_frame(
             pan_x=pan_x,
             face_track_data=face_track_data,
             is_video_render=False,
-            preview_rel_t=0.35,
+            preview_rel_t=framing_rel_t,
             target_size=(target_w, target_h),
+            camera_motion=eff_cam_motion,
+            whip_pan_cuts=eff_whip_pan,
+            clip_duration=eff_dur_val,
+            fps=src_fps,
+            beat_timestamps=beat_ts_prev,
         )
 
-        # 2. Footage Color Grading & FX BEFORE captions
+        # 2. Punch Zoom FX + Footage Color Grading & FX BEFORE captions
         filter_elements: List[str] = []
+        if dynamic_punch_zoom:
+            punch_data_prev = detect_punch_zoom_peaks(
+                video_path,
+                start_sec=main_framing_segs[0][0],
+                end_sec=main_framing_segs[0][0] + max(0.5, main_dur_eval),
+                base_zoom=1.0,
+                punch_intensity=punch_zoom_intensity,
+            )
+            p_intervals = list(punch_data_prev.get("punch_intervals") or [])
+            if cold_open_active and p_intervals:
+                p_intervals = [
+                    (
+                        round(float(t0) + cold_open_net_offset, 3),
+                        round(float(t1) + cold_open_net_offset, 3),
+                        pz,
+                    )
+                    for t0, t1, pz in p_intervals
+                ]
+            pz_now = compute_punch_zoom_factor_at_t(clip_rel_ts, p_intervals)
+            if pz_now > 1.005:
+                fx, fy = compute_punch_focus_anchor(face_track_data, t_rel=clip_rel_ts, framing_override=framing_override)
+                pw = max(target_w, int(round(target_w * pz_now / 2.0) * 2))
+                ph = max(target_h, int(round(target_h * pz_now / 2.0) * 2))
+                cx = int(round((pw - target_w) * fx))
+                cy = int(round((ph - target_h) * fy))
+                filter_elements.append(f"scale={pw}:{ph}:flags=lanczos,crop={target_w}:{target_h}:{cx}:{cy},setsar=1")
         cg = color_grading or {}
-        color_f = build_advanced_color_filter(
-            preset=cg.get("preset") or cg.get("color_preset") or "none",
-            exposure=cg.get("exposure", 0.0),
-            brightness=cg.get("brightness", 0.0),
-            contrast=cg.get("contrast", 1.0),
-            lift_mids=cg.get("lift_mids", 0.0),
-            warmth=cg.get("warmth", 0.0),
-            saturation=cg.get("saturation", 1.0),
-            black_and_white=cg.get("black_and_white", 0.0),
-            vintage=cg.get("vintage", 0.0),
-            tint_color=cg.get("tint_color", "none"),
-            tint_strength=cg.get("tint_strength", 0.0),
-            glow=cg.get("glow", 0.0),
-            smooth=cg.get("smooth", 0.0),
-            sharpness=cg.get("sharpness", 0.0),
-            blur=cg.get("blur", 0.0),
-            film_grain=cg.get("film_grain", 0.0),
-            vignette=cg.get("vignette", 0.0),
-            bottom_fade=cg.get("bottom_fade", 0.0),
-        )
+        if bool(cg.get("bypass_color", False)):
+            color_f = ""
+        else:
+            staged_lut_rel = None
+            if cg.get("lut_path"):
+                from app.services.audio_mastering import resolve_local_media_asset, stage_ascii_asset
+                lut_abs = resolve_local_media_asset(str(cg.get("lut_path")))
+                if lut_abs and os.path.exists(lut_abs):
+                    staged_lut_rel = stage_ascii_asset(lut_abs, Path(work_dir), target_stem="preview_lut")
+            color_f = build_advanced_color_filter(
+                preset=cg.get("preset") or cg.get("color_preset") or "none",
+                preset_intensity=cg.get("preset_intensity", 100.0) if cg.get("preset_intensity") is not None else 100.0,
+                exposure=cg.get("exposure", 0.0),
+                brightness=cg.get("brightness", 0.0),
+                contrast=cg.get("contrast", 1.0),
+                lift_mids=cg.get("lift_mids", 0.0),
+                highlights=cg.get("highlights", 0.0),
+                shadows=cg.get("shadows", 0.0),
+                warmth=cg.get("warmth", 0.0),
+                color_temp=cg.get("color_temp", 0.0),
+                tint_shift=cg.get("tint_shift", 0.0),
+                vibrance=cg.get("vibrance", 0.0),
+                matte_fade=cg.get("matte_fade", 0.0),
+                halation_glow=cg.get("halation_glow", 0.0),
+                lut_path=staged_lut_rel,
+                chroma_split=cg.get("chroma_split", 0.0),
+                letterbox=cg.get("letterbox", "none"),
+                saturation=cg.get("saturation", 1.0),
+                black_and_white=cg.get("black_and_white", 0.0),
+                vintage=cg.get("vintage", 0.0),
+                tint_color=cg.get("tint_color", "none"),
+                tint_strength=cg.get("tint_strength", 0.0),
+                glow=cg.get("glow", 0.0),
+                smooth=cg.get("smooth", 0.0),
+                sharpness=cg.get("sharpness", 0.0),
+                blur=cg.get("blur", 0.0),
+                film_grain=cg.get("film_grain", 0.0),
+                # Never apply dark radial vignette onto PiP webcam layouts
+                vignette=0.0 if layout == "gameplay_webcam_pip" else cg.get("vignette", 0.0),
+                bottom_fade=cg.get("bottom_fade", 0.0),
+                target_w=target_w,
+                target_h=target_h,
+            )
         if color_f:
             filter_elements.append(color_f)
 
@@ -219,6 +401,7 @@ def render_exact_preview_frame(
         from app.services.privacy_blur import build_privacy_blur_filtergraph, normalize_blur_boxes
 
         eff_backdrop = canonicalize_backdrop_mode(backdrop_mode)
+        eff_depth_pop = max(0.0, min(1.0, float(depth_pop or 0.0)))
         clean_blur_boxes = normalize_blur_boxes(privacy_blur_boxes)
 
         post_chain = ",".join(filter_elements) if filter_elements else "null"
@@ -231,8 +414,8 @@ def render_exact_preview_frame(
         ]
         next_in_idx = 1
 
-        # If virtual backdrop active, extract base graded frame first so alphamerge + overlay uses true alpha matte
-        if eff_backdrop != "none":
+        # If virtual backdrop or Subject Depth Pop (f/1.8) active, extract matte first
+        if eff_backdrop != "none" or eff_depth_pop > 0.01:
             pre_bg_name = "pre_bg.png"
             pre_fg = f"{layout_vf};[v]{post_chain}[vout]"
             (work_dir / "pre_bg_fg.txt").write_text(pre_fg, encoding="utf-8")
@@ -275,6 +458,7 @@ def render_exact_preview_frame(
                         target_h=target_h,
                         blur_intensity=backdrop_blur_intensity,
                         static_bg_input_idx=bg_in_idx,
+                        depth_pop=eff_depth_pop,
                         out_label="v_backdrop",
                     )
 
@@ -339,6 +523,7 @@ def render_exact_preview_frame(
         eff_handle_mode = str(co.get("handle_display_mode", handle_display_mode) or handle_display_mode or "always")
         render_overlay = bool(
             burn_captions
+            or cold_open_active
             or co.get("retention_bar_enabled")
             or co.get("outro_cta_enabled")
             or co.get("speaker_lower_thirds")
@@ -418,6 +603,10 @@ def render_exact_preview_frame(
                     position_grid=co.get("position_grid", "bottom_center"),
                     pos_x=co.get("pos_x", co.get("position_x", 50.0)),
                     pos_y=co.get("pos_y", co.get("position_y", 74.0)),
+                    caption_x=co.get("caption_x"),
+                    caption_y=co.get("caption_y"),
+                    caption_rotation=float(co.get("caption_rotation", 0.0) or 0.0),
+                    caption_max_width=float(co.get("caption_max_width", 0.82) or 0.82),
                     base_color=co.get("base_color", "#FFFFFF"),
                     highlight_color=co.get("highlight_color", co.get("active_color", "#C6F32F")),
                     outline_color=co.get("outline_color", "#000000"),
@@ -436,6 +625,9 @@ def render_exact_preview_frame(
                     retention_bar_color=co.get("retention_bar_color", "#C6F32F"),
                     outro_cta_enabled=bool(co.get("outro_cta_enabled", False)),
                     outro_cta_text=co.get("outro_cta_text", "Subscribe for More"),
+                    outro_cta_headline=str(co.get("outro_cta_headline", "") or ""),
+                    outro_cta_handle=str(co.get("outro_cta_handle", "") or ""),
+                    outro_logo_path=co.get("outro_logo_path"),
                     clip_start_time=preview_cap_start,
                     clip_duration=preview_cap_dur,
                     project_id=project_id,
@@ -461,6 +653,12 @@ def render_exact_preview_frame(
                     handle_corner=eff_handle_corner,
                     handle_opacity=eff_handle_op,
                     handle_display_mode=eff_handle_mode,
+                    cold_open_active=cold_open_active,
+                    cold_open_teaser_dur=cold_open_net_offset if cold_open_active else 2.3,
+                    caption_animation=co.get("caption_animation", co.get("animation", "Pop Bounce")),
+                    pill_color=co.get("pill_color"),
+                    pacing_density=co.get("pacing_density", "3-4 Words Viral"),
+                    text_case=co.get("text_case", "ALL CAPS" if co.get("uppercase", co.get("all_caps", True)) else "As Spoken"),
                 )
                 composited = Image.alpha_composite(base_rgba, cap_rgba).convert("RGB")
                 composited.save(out_path, format="PNG")

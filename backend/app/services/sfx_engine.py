@@ -88,10 +88,12 @@ def plan_sfx_events(
     hook_headline: str = "",
     punch_timestamps: Optional[List[float]] = None,
     callout_timestamps: Optional[List[float]] = None,
+    transition_times: Optional[List[float]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Compute deterministic micro-SFX trigger events:
     - Hook banner entrance -> `whoosh` at t=0.05s (-10 dB / gain 0.32)
+    - Cold-open transition times -> `whoosh` at transition points (gain 0.25)
     - Dynamic punch-in zoom & stat callouts -> `pop` at timestamps (-10 dB / gain 0.32)
     """
     dur = max(0.5, float(duration or 1.0))
@@ -99,6 +101,11 @@ def plan_sfx_events(
 
     if show_hook_banner and str(hook_headline or "").strip():
         events.append({"kind": "whoosh", "time": 0.05, "gain": 0.32})
+
+    for tt in (transition_times or []):
+        t_val = float(tt)
+        if 0.05 <= t_val <= dur - 0.15:
+            events.append({"kind": "whoosh", "time": round(t_val, 3), "gain": 0.25})
 
     last_t = -2.0
     combined_pops = sorted([float(x) for x in (punch_timestamps or [])] + [float(x) for x in (callout_timestamps or [])])

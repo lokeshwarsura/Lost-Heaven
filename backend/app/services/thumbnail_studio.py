@@ -195,6 +195,7 @@ def generate_depth_thumbnail(
     accent_color: str = "#C6F32F",
     rim_glow: bool = True,
     badge_text: str = "",
+    best_frames: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     Extract sharpest frame (or specified `timestamp`), apply framing crop via FFmpeg inside ASCII temp dir,
@@ -211,6 +212,21 @@ def generate_depth_thumbnail(
 
     if timestamp is not None:
         seek_ts = max(0.0, min(max(0.0, src_dur - 0.1), float(timestamp)))
+    elif best_frames:
+        # Automatically default to Peak Emotion / Peak Action Best Frame when user hasn't picked a manual timestamp
+        pref_order = ("peak_emotion", "peak_action", "clean_anchor", "clean_opener", "highlight_moment")
+        chosen_bf = None
+        for r_name in pref_order:
+            match = next((bf for bf in best_frames if isinstance(bf, dict) and bf.get("role") == r_name), None)
+            if match is not None:
+                chosen_bf = match
+                break
+        if chosen_bf is None and isinstance(best_frames[0], dict):
+            chosen_bf = best_frames[0]
+        if chosen_bf and chosen_bf.get("t") is not None:
+            seek_ts = max(0.0, min(max(0.0, src_dur - 0.1), float(chosen_bf["t"])))
+        else:
+            seek_ts = clip_start_time + min(1.5, max(0.2, clip_duration * 0.25))
     else:
         # Auto-pick sharpest frame inside opening third of clip
         best_ts = clip_start_time + min(1.5, max(0.2, clip_duration * 0.25))

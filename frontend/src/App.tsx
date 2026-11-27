@@ -12,13 +12,16 @@ import { HomeView } from './components/HomeView';
 import { ProgressView } from './components/ProgressView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { FirstTimeSetupWizard } from './components/FirstTimeSetupWizard';
+import { AnalysisInspectorModal } from './components/AnalysisInspectorModal';
+import { AIEngineModal } from './components/AIEngineModal';
 import {
   Project,
   ViralClip,
   CaptionStylePreset,
   StudioProfile,
   SystemInfo,
-  StudioSettings
+  StudioSettings,
+  BestFrameItem
 } from './types';
 import { api } from './api/client';
 import { applyTheme, getActiveTheme } from './themes/themes';
@@ -61,6 +64,8 @@ export const App: React.FC = () => {
 
   // Transcript Search & Manual Clip Creator Modal
   const [isTranscriptModalOpen, setIsTranscriptModalOpen] = useState(false);
+  const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
+  const [thumbRequest, setThumbRequest] = useState<{ timestamp: number; seq: number } | null>(null);
   const [transcriptQuery, setTranscriptQuery] = useState('');
   const [transcriptMatches, setTranscriptMatches] = useState<Array<{ start: number; end: number; text: string }>>([]);
   const [manualStart, setManualStart] = useState('0');
@@ -68,6 +73,7 @@ export const App: React.FC = () => {
   const [manualTitle, setManualTitle] = useState('');
   const [isCreatingManual, setIsCreatingManual] = useState(false);
   const [isShortcutsModalOpen, setIsShortcutsModalOpen] = useState(false);
+  const [isEngineModalOpen, setIsEngineModalOpen] = useState(false);
 
   const {
     canUndo,
@@ -77,8 +83,20 @@ export const App: React.FC = () => {
     redo: popRedoSnapshot
   } = useEditorHistory(selectedClip?.id ?? null);
 
-  // Platform Safe-Zone Guide
+  // Platform Safe-Zone Guide & Color Grade Compare Hold
   const [safeZoneGuide, setSafeZoneGuide] = useState<string>('TikTok');
+  const [compareOriginal, setCompareOriginal] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!compareOriginal) return;
+    const release = () => setCompareOriginal(false);
+    window.addEventListener('pointerup', release);
+    window.addEventListener('blur', release);
+    return () => {
+      window.removeEventListener('pointerup', release);
+      window.removeEventListener('blur', release);
+    };
+  }, [compareOriginal]);
 
   // Modals, Wizard, Toast & Loading states
   const [isWizardOpen, setIsWizardOpen] = useState(false);
@@ -87,6 +105,7 @@ export const App: React.FC = () => {
   const [isRendering, setIsRendering] = useState(false);
   const [isMerging, setIsMerging] = useState(false);
   const [isCompilingTrailer, setIsCompilingTrailer] = useState(false);
+  const [isAutoFramingAll, setIsAutoFramingAll] = useState(false);
   const pendingClipPatchRef = useRef<Promise<any> | null>(null);
 
   const showToast = (message: string, type: 'error' | 'success' | 'info' = 'info') => {
@@ -445,6 +464,97 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleSeekMasterTime = (masterTime: number) => {
+    if (!selectedClip) return;
+    const segs =
+      Array.isArray(selectedClip.keep_segments) && selectedClip.keep_segments.length > 0
+        ? selectedClip.keep_segments
+        : [[Number(selectedClip.start_time || 0), Number(selectedClip.end_time || 30)]];
+    const xfade = Number(selectedClip.merge_crossfade_sec ?? 0.03);
+    let outStart = 0;
+    let prevDur = 0;
+    let relT = Math.max(0, masterTime - Number(selectedClip.start_time || 0));
+    for (let i = 0; i < segs.length; i++) {
+      const [s, e] = segs[i];
+      const segDur = Math.max(0.05, Number(e) - Number(s));
+      const effX = i > 0 ? Math.max(0, Math.min(xfade, prevDur * 0.35, segDur * 0.35)) : 0;
+      const segOutStart = i === 0 ? 0 : Math.max(0, outStart - effX);
+      if (masterTime >= Number(s) && masterTime <= Number(e)) {
+        relT = segOutStart + (masterTime - Number(s));
+        break;
+      }
+      outStart = segOutStart + segDur;
+      prevDur = segDur;
+    }
+    setPreviewSeekTime(Math.max(0, relT) + (Date.now() % 1000) * 1e-6);
+  };
+
+  const handleSnapClipStartFrame = async (frame: BestFrameItem) => {
+    if (!selectedClip) return;
+    const nextStart = Number(frame.t.toFixed(2));
+    const safeEnd = Math.max(nextStart + 0.8, Number(selectedClip.end_time || nextStart + 5));
+    await handleTrimClip(selectedClip.id, nextStart, safeEnd);
+    setPreviewSeekTime(0.0001);
+  };
+
+  const handleCalibrateCameraFrame = async (frame: BestFrameItem) => {
+    if (!selectedClip) return;
+    const pId = currentProject?.id || selectedClip.project_id;
+    try {
+      const fmap = await api.getFramingMap(pId, selectedClip.id, false);
+      const kfs = fmap?.visual_map?.keyframes || [];
+      const shots = fmap?.visual_map?.shots || [];
+      const nearestKf = kfs.length
+        ? kfs.reduce((best, cur) =>
+            Math.abs(Number(cur.t || 0) - Number(frame.rel_t || 0)) <
+            Math.abs(Number(best.t || 0) - Number(frame.rel_t || 0))
+              ? cur
+              : best
+          )
+        : shots.length
+          ? shots.reduce((best, cur) => {
+              const bMid = 0.5 * (Number(best.start_t || 0) + Number(best.end_t || 0));
+              const cMid = 0.5 * (Number(cur.start_t || 0) + Number(cur.end_t || 0));
+              return Math.abs(cMid - Number(frame.rel_t || 0)) < Math.abs(bMid - Number(frame.rel_t || 0))
+                ? cur
+                : best;
+            })
+          : null;
+      const anchor = {
+        x: Math.max(0.08, Math.min(0.92, Number(nearestKf?.cx ?? 0.5))),
+        y: Math.max(0.08, Math.min(0.92, Number(nearestKf?.cy ?? 0.4))),
+      };
+      const cam = fmap?.source_webcam_region || fmap?.visual_map?.webcam;
+      const webcamBox =
+        cam && Number(cam.w) > 0.04 && Number(cam.h) > 0.04
+          ? { x: Number(cam.x), y: Number(cam.y), w: Number(cam.w), h: Number(cam.h) }
+          : undefined;
+
+      const ovRes = await api.updateFramingOverride(pId, selectedClip.id, {
+        focus_anchor: anchor,
+        ...(webcamBox ? { webcam_box: webcamBox } : {}),
+        lock_camera: true,
+      });
+      await handleUpdateClip({
+        framing_override: ovRes.framing_override,
+        source_webcam_region: ovRes.source_webcam_region,
+      });
+      handleSeekMasterTime(frame.t);
+      showToast(
+        `Calibrated framing anchor (${Math.round(anchor.x * 100)}%, ${Math.round(anchor.y * 100)}%) from ${frame.role.replace(/_/g, ' ')}`,
+        'success'
+      );
+    } catch (err: any) {
+      showToast(err?.message || 'Camera calibration failed', 'error');
+    }
+  };
+
+  const handleSetThumbnailCoverFrame = (frame: BestFrameItem) => {
+    setThumbRequest({ timestamp: frame.t, seq: Date.now() });
+    setIsAnalysisModalOpen(false);
+    handleSeekMasterTime(frame.t);
+  };
+
   const handleMergeClips = async (clipIds: number[], smoothTransition: boolean, title?: string) => {
     const pId = currentProject?.id || selectedClip?.project_id;
     if (!pId || clipIds.length < 2) return;
@@ -489,6 +599,28 @@ export const App: React.FC = () => {
       showToast(err?.message || 'Failed to compile trailer', 'error');
     } finally {
       setIsCompilingTrailer(false);
+    }
+  };
+
+  const handleAutoFrameAll = async () => {
+    const pId = currentProject?.id || selectedClip?.project_id;
+    if (!pId || isAutoFramingAll) return;
+    try {
+      setIsAutoFramingAll(true);
+      const res = await api.autoFrameAll(pId);
+      if (Array.isArray(res?.clips)) {
+        setClips(res.clips);
+        if (selectedClip) {
+          const updatedSelected = res.clips.find((c) => c.id === selectedClip.id);
+          if (updatedSelected) setSelectedClip(updatedSelected);
+        }
+        showToast(`Smart Auto-Frame applied across ${res.updated_count} clips`, 'success');
+      }
+    } catch (err: any) {
+      console.error('Smart Auto-Frame failed:', err);
+      showToast(err?.message || 'Failed to auto-frame clips', 'error');
+    } finally {
+      setIsAutoFramingAll(false);
     }
   };
 
@@ -712,6 +844,13 @@ export const App: React.FC = () => {
     { id: 'settings', label: 'Settings & Diagnostics', icon: SettingsIcon }
   ];
 
+  const isOfflineMultimodal = Boolean(
+    studioSettings &&
+      (studioSettings.ai_provider === 'offline' ||
+        studioSettings.gemini_boost_enabled === false ||
+        studioSettings.gemini_configured === false)
+  );
+
   return (
     <div className="h-screen w-screen overflow-hidden flex bg-[var(--bg-canvas)] text-[var(--text-primary)] select-none transition-colors">
       {/* ============================================================== */}
@@ -805,6 +944,8 @@ export const App: React.FC = () => {
               setActiveView('progress');
             }}
             onViewLibrary={() => setActiveView('projects')}
+            isOfflineMultimodal={isOfflineMultimodal}
+            studioSettings={studioSettings}
           />
         )}
 
@@ -835,11 +976,15 @@ export const App: React.FC = () => {
               onApplyProfile={handleApplyProfile}
               onSaveProfile={handleSaveProfile}
               onOpenTranscriptSearch={currentProject ? handleOpenTranscriptSearch : undefined}
+              onOpenAnalysisWorkstation={selectedClip ? () => setIsAnalysisModalOpen(true) : undefined}
               canUndo={canUndo}
               canRedo={canRedo}
               onUndo={handleUndo}
               onRedo={handleRedo}
               onOpenShortcuts={() => setIsShortcutsModalOpen(true)}
+              isOfflineMultimodal={isOfflineMultimodal}
+              geminiConfigured={Boolean(studioSettings?.gemini_configured)}
+              onOpenEngineModal={() => setIsEngineModalOpen(true)}
             />
 
             {/* Pipeline Error Banner */}
@@ -888,6 +1033,8 @@ export const App: React.FC = () => {
                 isMerging={isMerging}
                 onCompileTrailer={handleCompileTrailer}
                 isCompilingTrailer={isCompilingTrailer}
+                onAutoFrameAll={handleAutoFrameAll}
+                isAutoFramingAll={isAutoFramingAll}
               />
 
               {/* Column 2: Full-Width Center Inspector */}
@@ -898,6 +1045,10 @@ export const App: React.FC = () => {
                     project={currentProject}
                     onUpdateClip={handleUpdateClip}
                     onUpdateProject={handleUpdateProject}
+                    onOpenAnalysisWorkstation={() => setIsAnalysisModalOpen(true)}
+                    onSeekToMasterTime={handleSeekMasterTime}
+                    onCalibrateFrame={handleCalibrateCameraFrame}
+                    onOpenThumbnailFrame={handleSetThumbnailCoverFrame}
                   />
                 )}
 
@@ -921,6 +1072,8 @@ export const App: React.FC = () => {
                     clip={selectedClip}
                     onUpdateClip={handleUpdateClip}
                     onUploadAsset={api.uploadAsset}
+                    compareOriginal={compareOriginal}
+                    onCompareOriginalChange={setCompareOriginal}
                   />
                 )}
               </main>
@@ -928,9 +1081,12 @@ export const App: React.FC = () => {
               {/* Column 3: Auto-Scaled Smartphone Preview & Export Dock */}
               <SmartphonePreview
                 clip={selectedClip}
+                activeStep={activeStep}
                 videoUrl={selectedClip?.video_url || selectedClip?.preview_url || undefined}
                 safeZoneGuide={safeZoneGuide}
                 onSafeZoneChange={setSafeZoneGuide}
+                compareOriginal={compareOriginal}
+                onCompareOriginalChange={setCompareOriginal}
                 seekTime={previewSeekTime}
                 onPlaybackTimeChange={setCurrentPlaybackTime}
                 onGenerateClips={handleGenerateClips}
@@ -939,6 +1095,9 @@ export const App: React.FC = () => {
                 onTrimClip={handleTrimClip}
                 onUpdateSegments={handleUpdateSegments}
                 onApplyFixClip={handleApplyFixClip}
+                onUpdateClip={handleUpdateClip}
+                onOpenAnalysisWorkstation={() => setIsAnalysisModalOpen(true)}
+                externalThumbRequest={thumbRequest}
                 isRendering={isRendering || selectedClip?.render_status === 'rendering'}
                 renderProgress={selectedClip?.render_progress || 0}
               />
@@ -980,6 +1139,19 @@ export const App: React.FC = () => {
         isOpen={isWizardOpen}
         onClose={() => setIsWizardOpen(false)}
         systemInfo={systemInfo}
+      />
+
+      {/* Multimodal AI Video & Audio Analysis + Best-Frame Workstation */}
+      <AnalysisInspectorModal
+        isOpen={isAnalysisModalOpen}
+        onClose={() => setIsAnalysisModalOpen(false)}
+        clip={selectedClip}
+        projectId={currentProject?.id}
+        currentPlaybackTime={currentPlaybackTime}
+        onSeekToMasterTime={handleSeekMasterTime}
+        onSetThumbnailCover={handleSetThumbnailCoverFrame}
+        onSnapClipStart={handleSnapClipStartFrame}
+        onCalibrateCamera={handleCalibrateCameraFrame}
       />
 
       {/* Full Transcript Search & Manual Clip Creator Modal */}
@@ -1133,6 +1305,13 @@ export const App: React.FC = () => {
           </div>
         </div>
       )}
+
+      <AIEngineModal
+        isOpen={isEngineModalOpen}
+        onClose={() => setIsEngineModalOpen(false)}
+        currentMode={isOfflineMultimodal ? 'offline' : 'gemini'}
+        geminiConfigured={Boolean(studioSettings?.gemini_configured)}
+      />
 
       {/* Global Toast Notification */}
       {toast && (

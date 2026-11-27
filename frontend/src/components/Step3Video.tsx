@@ -1,20 +1,25 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  Sun, Droplets, Sparkles, Shield, Upload, Music, Volume2, Copy, Check, RotateCcw, Save, Film, Flag
+  Sun, Droplets, Sparkles, Shield, Upload, Music, Volume2, Copy, Check, RotateCcw, Save, Film, Flag, Eye, Sliders
 } from 'lucide-react';
-import { ViralClip, BrollSegment } from '../types';
+import { ViralClip, BrollSegment, PresetPreviewsResponse } from '../types';
 import { api } from '../api/client';
+import { GradeSlider } from './GradeSlider';
 
 interface Step3VideoProps {
   clip: ViralClip | null;
   onUpdateClip: (updates: Partial<ViralClip>) => void;
   onUploadAsset?: (file: File) => Promise<{ url: string; filename: string; path: string }>;
+  compareOriginal?: boolean;
+  onCompareOriginalChange?: (held: boolean) => void;
 }
 
 export const Step3Video: React.FC<Step3VideoProps> = ({
   clip,
   onUpdateClip,
-  onUploadAsset
+  onUploadAsset,
+  compareOriginal = false,
+  onCompareOriginalChange,
 }) => {
   const [subTab, setSubTab] = useState<'grade' | 'fx' | 'metadata'>('grade');
   const [copiedTitleIndex, setCopiedTitleIndex] = useState<number | null>(null);
@@ -27,6 +32,33 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   const [dubVoice, setDubVoice] = useState<string>('default');
   const [isDubbing, setIsDubbing] = useState(false);
   const [dubNotice, setDubNotice] = useState<string | null>(null);
+  const [lutNotice, setLutNotice] = useState<string | null>(null);
+  const [logoNotice, setLogoNotice] = useState<string | null>(null);
+  const [presetPreviews, setPresetPreviews] = useState<PresetPreviewsResponse | null>(null);
+  const [loadingPresetPreviews, setLoadingPresetPreviews] = useState(false);
+
+  useEffect(() => {
+    if (!clip) {
+      setPresetPreviews(null);
+      return;
+    }
+    let cancelled = false;
+    setLoadingPresetPreviews(true);
+    api
+      .getClipPresetPreviews(clip.project_id, clip.id, clip.lut_path || undefined)
+      .then((res) => {
+        if (!cancelled) setPresetPreviews(res);
+      })
+      .catch(() => {
+        if (!cancelled) setPresetPreviews(null);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingPresetPreviews(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [clip?.project_id, clip?.id, clip?.lut_path]);
 
   const handleExtractCallouts = async () => {
     if (!clip) return;
@@ -54,7 +86,11 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
       setLoadingBroll(true);
       setBrollNotice(null);
       const res = await api.getBrollSuggestions(clip.project_id, clip.id);
-      const suggs: BrollSegment[] = res?.suggestions || [];
+      const activeLayout = clip.broll_layout === 'reaction_pip' ? 'reaction_pip' : 'fullscreen';
+      const suggs: BrollSegment[] = (res?.suggestions || []).map((seg: BrollSegment) => ({
+        ...seg,
+        layout: seg.layout || activeLayout
+      }));
       onUpdateClip({ broll_segments: suggs });
       setBrollNotice(
         suggs.length > 0
@@ -95,79 +131,119 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
     );
   }
 
-  const clipSizes: ViralClip['clip_size'][] = ['Auto', '1080p', '720p', '540p', '480p'];
+  const exportResolutions: { id: ViralClip['clip_size']; label: string }[] = [
+    { id: 'Auto', label: 'Auto' },
+    { id: '1080p', label: '1080p' },
+    { id: '720p', label: '720p' },
+    { id: '480p', label: '480p' },
+  ];
 
   const colorPresets: {
     id: string;
     label: string;
+    swatch: string;
     values: Partial<ViralClip>;
   }[] = [
     {
       id: 'none',
       label: 'Original',
+      swatch: 'from-zinc-700/60 to-zinc-900/90',
       values: {
-        exposure: 0, brightness: 0, contrast: 1.0, lift_mids: 1.0,
-        warmth: 0, saturation: 1.0, black_and_white: 0, vintage: 0,
-        tint_color: 'none', tint_strength: 0, sharpness: 0, vignette: 0
-      }
+        exposure: 0, brightness: 0, contrast: 1.0, lift_mids: 1.0, highlights: 0, shadows: 0,
+        sharpness: 0, vignette: 0, color_temp: 0, tint_shift: 0, vibrance: 0, saturation: 1.0,
+        matte_fade: 0, halation_glow: 0, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0, lut_path: '',
+      },
     },
     {
-      id: 'cinematic',
-      label: 'Cinematic',
+      id: 'kodak_portra_400',
+      label: 'Kodak Portra 400',
+      swatch: 'from-amber-700/50 via-orange-900/40 to-stone-900/90',
       values: {
-        exposure: 0.02, brightness: -0.02, contrast: 1.18, lift_mids: 0.95,
-        warmth: 0.14, saturation: 1.12, black_and_white: 0, vintage: 0.10,
-        tint_color: 'none', tint_strength: 0, sharpness: 0.2, vignette: 0.35
-      }
+        exposure: 0.03, brightness: 0, contrast: 1.04, lift_mids: 1.0, highlights: -8, shadows: 14,
+        sharpness: 0.12, vignette: 0.16, color_temp: 14, tint_shift: 4, vibrance: 12, saturation: 1.04,
+        matte_fade: 14, halation_glow: 20, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
     },
     {
-      id: 'vibrant_gaming',
-      label: 'Vibrant Gaming',
+      id: 'teal_orange',
+      label: 'Teal & Orange',
+      swatch: 'from-cyan-700/60 via-teal-900/40 to-amber-700/70',
       values: {
-        exposure: 0.06, brightness: 0.02, contrast: 1.22, lift_mids: 1.05,
-        warmth: 0.04, saturation: 1.45, black_and_white: 0, vintage: 0,
-        tint_color: 'none', tint_strength: 0, sharpness: 0.45, vignette: 0
-      }
+        exposure: 0, brightness: 0, contrast: 1.08, lift_mids: 1.0, highlights: 8, shadows: -10,
+        sharpness: 0.20, vignette: 0.26, color_temp: 8, tint_shift: -6, vibrance: 16, saturation: 1.08,
+        matte_fade: 6, halation_glow: 12, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
     },
     {
-      id: 'warm_vintage',
-      label: 'Warm Vintage',
+      id: 'cyberpunk_neon',
+      label: 'Cyberpunk Neon',
+      swatch: 'from-fuchsia-700/60 via-violet-900/50 to-cyan-700/70',
       values: {
-        exposure: 0.04, brightness: 0.02, contrast: 1.06, lift_mids: 1.05,
-        warmth: 0.34, saturation: 1.10, black_and_white: 0, vintage: 0.45,
-        tint_color: 'Yellow', tint_strength: 0.20, sharpness: 0, vignette: 0.25
-      }
+        exposure: 0.02, brightness: 0, contrast: 1.10, lift_mids: 1.0, highlights: 14, shadows: -10,
+        sharpness: 0.24, vignette: 0.24, color_temp: -18, tint_shift: 26, vibrance: 28, saturation: 1.14,
+        matte_fade: 4, halation_glow: 32, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
     },
     {
-      id: 'cool_tech',
-      label: 'Cool Tech',
+      id: 'moody_noir',
+      label: 'Moody Noir',
+      swatch: 'from-slate-800/80 via-zinc-900/70 to-black',
       values: {
-        exposure: 0.02, brightness: 0, contrast: 1.14, lift_mids: 1.0,
-        warmth: -0.32, saturation: 1.16, black_and_white: 0, vintage: 0,
-        tint_color: 'Blue', tint_strength: 0.25, sharpness: 0.30, vignette: 0.15
-      }
+        exposure: -0.06, brightness: 0, contrast: 1.12, lift_mids: 1.0, highlights: -10, shadows: -18,
+        sharpness: 0.18, vignette: 0.38, color_temp: -12, tint_shift: -2, vibrance: -12, saturation: 0.88,
+        matte_fade: 18, halation_glow: 8, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
     },
     {
-      id: 'bw_noir',
-      label: 'B&W Noir',
+      id: 'golden_hour',
+      label: 'Golden Hour',
+      swatch: 'from-yellow-600/60 via-amber-800/50 to-orange-950/90',
       values: {
-        exposure: -0.02, brightness: -0.04, contrast: 1.38, lift_mids: 0.92,
-        warmth: 0, saturation: 0.0, black_and_white: 1.0, vintage: 0,
-        tint_color: 'none', tint_strength: 0, sharpness: 0.25, vignette: 0.45
-      }
+        exposure: 0.06, brightness: 0, contrast: 1.04, lift_mids: 1.0, highlights: 12, shadows: 14,
+        sharpness: 0.10, vignette: 0.18, color_temp: 30, tint_shift: 6, vibrance: 18, saturation: 1.08,
+        matte_fade: 10, halation_glow: 28, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
     },
     {
-      id: 'hdr_pop',
-      label: 'HDR Pop',
+      id: 'bw_16mm',
+      label: '16mm B&W',
+      swatch: 'from-neutral-500/70 via-neutral-800/80 to-black',
       values: {
-        exposure: 0.08, brightness: 0.02, contrast: 1.25, lift_mids: 1.10,
-        warmth: 0.06, saturation: 1.50, black_and_white: 0, vintage: 0,
-        tint_color: 'none', tint_strength: 0, sharpness: 0.55, vignette: 0.10
-      }
-    }
+        exposure: -0.02, brightness: 0, contrast: 1.16, lift_mids: 1.0, highlights: 10, shadows: -14,
+        sharpness: 0.22, vignette: 0.36, color_temp: 0, tint_shift: 0, vibrance: 0, saturation: 0.88,
+        matte_fade: 16, halation_glow: 16, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'gaming_pop',
+      label: 'Gaming Pop',
+      swatch: 'from-emerald-600/60 via-sky-800/50 to-indigo-950/90',
+      values: {
+        exposure: 0.04, brightness: 0, contrast: 1.12, lift_mids: 1.0, highlights: 12, shadows: -8,
+        sharpness: 0.34, vignette: 0.0, color_temp: 4, tint_shift: 0, vibrance: 26, saturation: 1.18,
+        matte_fade: 0, halation_glow: 0, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'clean_rec709',
+      label: 'Clean Rec.709',
+      swatch: 'from-sky-700/40 via-zinc-800/60 to-zinc-950/90',
+      values: {
+        exposure: 0.02, brightness: 0, contrast: 1.04, lift_mids: 1.0, highlights: 4, shadows: 4,
+        sharpness: 0.14, vignette: 0.0, color_temp: 2, tint_shift: 0, vibrance: 10, saturation: 1.04,
+        matte_fade: 0, halation_glow: 0, warmth: 0, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
   ];
-
-  const tintOptions = ['None', 'Red', 'Blue', 'Green', 'Yellow'];
 
   const corners: { id: ViralClip['watermark_corner']; label: string }[] = [
     { id: 'top_left', label: 'Top Left' },
@@ -199,17 +275,29 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   const resetLightAndColor = () => {
     onUpdateClip({
       color_preset: 'none',
+      preset_intensity: 100,
       exposure: 0,
       brightness: 0,
       contrast: 1.0,
       lift_mids: 1.0,
+      highlights: 0,
+      shadows: 0,
+      sharpness: 0,
+      vignette: 0,
       warmth: 0,
       saturation: 1.0,
       black_and_white: 0,
       vintage: 0,
       tint_color: 'none',
-      tint_strength: 0
+      tint_strength: 0,
+      color_temp: 0,
+      tint_shift: 0,
+      vibrance: 0,
+      matte_fade: 0,
+      halation_glow: 0,
+      lut_path: ''
     });
+    setLutNotice(null);
   };
 
   const handleSaveMetadata = async () => {
@@ -231,59 +319,253 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   const vignetteVal =
     typeof clip.vignette === 'number' ? clip.vignette : clip.vignette ? 1.0 : 0;
 
+  const activePresetStrength = Math.round(clip.preset_intensity ?? 100);
+  const exposureUi = Math.round((clip.exposure || 0) * 100);
+  const contrastUi = Math.round(((clip.contrast ?? 1.0) - 1.0) * 100);
+  const highlightsUi = Math.round(clip.highlights ?? 0);
+  const shadowsUi = Math.round(clip.shadows ?? 0);
+  const clarityUi = Math.round((clip.sharpness || 0) * 100);
+  const vignetteUi = Math.round(vignetteVal * 100);
+
+  const colorTempUi = Math.round(clip.color_temp ?? 0);
+  const tintShiftUi = Math.round(clip.tint_shift ?? 0);
+  const vibranceUi = Math.round(clip.vibrance ?? 0);
+  const saturationUi = Math.round(((clip.saturation ?? 1.0) - 1.0) * 100);
+  const matteFadeUi = Math.round(clip.matte_fade ?? 0);
+  const halationUi = Math.round(clip.halation_glow ?? 0);
+
+  const thumbUrlByPreset: Record<string, string> = {};
+  presetPreviews?.presets?.forEach((item) => {
+    if (item.thumbnail_url) thumbUrlByPreset[item.id] = item.thumbnail_url;
+  });
+
+  const activeExportFps = String(clip.export_fps || 'source') === '60' ? '60' : 'source';
+
   return (
     <div className="space-y-4 text-xs animate-fadeIn w-full text-[var(--text-primary)]">
-      {/* Top Row: Clip Resolution + Preset Quick Looks */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="font-bold text-xs uppercase tracking-wide">Export Resolution</span>
-            <span className="text-[10px] text-[var(--text-secondary)]">Target MP4 height</span>
+      {/* Top Row: Compact Export Output + 3x3 Live-Thumbnail Look Presets */}
+      <div className="grid grid-cols-1 lg:grid-cols-[270px_minmax(0,1fr)] gap-4 items-stretch">
+        {/* Left: Compact Export Output */}
+        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 flex flex-col justify-between gap-3">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-bold text-xs uppercase tracking-wide flex items-center gap-1.5">
+                <Film className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                Export Output
+              </span>
+              <span className="text-[10px] font-mono text-[var(--text-muted)]">MP4 H.264</span>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1.5">
+                <span>Resolution</span>
+                <span className="font-mono text-[var(--accent-primary)] font-semibold">
+                  {clip.clip_size || 'Auto'}
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-1.5 tabular-nums">
+                {exportResolutions.map((sz) => (
+                  <button
+                    key={sz.id}
+                    type="button"
+                    onClick={() => onUpdateClip({ clip_size: sz.id })}
+                    className={`py-1.5 rounded-lg border text-center text-[11px] font-medium transition ${
+                      clip.clip_size === sz.id
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {sz.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1.5">
+                <span>Frame Rate</span>
+                <span className="font-mono text-[var(--accent-primary)] font-semibold">
+                  {activeExportFps === '60' ? '60 fps' : 'Source'}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 tabular-nums">
+                {[
+                  { id: 'source', label: 'Source FPS' },
+                  { id: '60', label: '60 fps' },
+                ].map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => onUpdateClip({ export_fps: opt.id })}
+                    className={`py-1.5 rounded-lg border text-center text-[11px] font-medium transition ${
+                      activeExportFps === opt.id
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
-          <div className="grid grid-cols-5 gap-1.5 tabular-nums">
-            {clipSizes.map((sz) => (
-              <button
-                key={sz}
-                type="button"
-                onClick={() => onUpdateClip({ clip_size: sz })}
-                className={`py-1.5 rounded-lg border text-center font-medium transition ${
-                  clip.clip_size === sz
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              >
-                {sz}
-              </button>
-            ))}
+
+          <div className="pt-2.5 border-t border-[var(--border-subtle)]/70 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
+            <span>Active Look</span>
+            <span className="font-mono font-semibold text-[var(--text-primary)] truncate max-w-[140px]">
+              {clip.lut_path
+                ? '3D .cube LUT'
+                : colorPresets.find((p) => p.id === (clip.color_preset || 'none'))?.label ||
+                  (clip.color_preset || 'Original')}
+            </span>
           </div>
         </div>
 
-        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="font-bold text-xs uppercase tracking-wide">Preset Quick Looks</span>
-            <button
-              type="button"
-              onClick={resetLightAndColor}
-              className="text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] flex items-center gap-1 transition"
-            >
-              <RotateCcw className="w-3 h-3" /> Reset Grade
-            </button>
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {colorPresets.map((p) => (
+        {/* Right: 3x3 Live-Thumbnail Visual Look Presets & .cube 3D LUT Studio */}
+        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-bold text-xs uppercase tracking-wide flex items-center gap-1.5">
+              <Sliders className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+              Visual Look Presets
+            </span>
+            <div className="flex items-center gap-2 shrink-0">
+              {onCompareOriginalChange && (
+                <button
+                  type="button"
+                  onPointerDown={() => onCompareOriginalChange(true)}
+                  onPointerUp={() => onCompareOriginalChange(false)}
+                  onPointerLeave={() => onCompareOriginalChange(false)}
+                  onPointerCancel={() => onCompareOriginalChange(false)}
+                  className={`px-2 py-1 rounded-lg border text-[10px] font-semibold flex items-center gap-1 transition select-none ${
+                    compareOriginal
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                  title="Hold to view raw ungraded frame for comparison"
+                >
+                  <Eye className="w-3 h-3" />
+                  <span>Compare Original (Hold)</span>
+                </button>
+              )}
               <button
-                key={p.id}
                 type="button"
-                onClick={() => onUpdateClip({ color_preset: p.id, ...p.values })}
-                className={`py-1 px-2.5 rounded-lg border text-[11px] transition ${
-                  clip.color_preset === p.id
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
+                onClick={resetLightAndColor}
+                className="text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] flex items-center gap-1 transition"
               >
-                {p.label}
+                <RotateCcw className="w-3 h-3" /> Reset Grade
               </button>
-            ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-2">
+            {colorPresets.map((p) => {
+              const active = (clip.color_preset || 'none') === p.id;
+              const thumbUrl = thumbUrlByPreset[p.id];
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() =>
+                    onUpdateClip({
+                      color_preset: p.id,
+                      preset_intensity: (clip.preset_intensity ?? 100) <= 0 ? 100 : clip.preset_intensity ?? 100,
+                      ...p.values,
+                    })
+                  }
+                  className={`group relative aspect-video w-full rounded-lg overflow-hidden border text-left transition ${
+                    active
+                      ? 'border-[var(--accent-primary)] ring-2 ring-[var(--accent-primary)]/70'
+                      : 'border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50'
+                  }`}
+                >
+                  {thumbUrl ? (
+                    <img
+                      src={thumbUrl}
+                      alt={p.label}
+                      loading="lazy"
+                      className="w-full h-full object-cover transition-transform duration-200 group-hover:scale-105"
+                    />
+                  ) : (
+                    <div
+                      className={`w-full h-full bg-gradient-to-br ${p.swatch} ${
+                        loadingPresetPreviews ? 'animate-pulse' : ''
+                      }`}
+                    />
+                  )}
+                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/90 via-black/55 to-transparent px-1.5 py-1 flex items-center justify-between gap-1">
+                    <span
+                      className={`text-[10px] leading-tight truncate ${
+                        active ? 'text-[var(--accent-primary)] font-bold' : 'text-zinc-100 font-semibold'
+                      }`}
+                    >
+                      {p.label}
+                    </span>
+                    {active && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-primary)] shrink-0" />
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Preset Strength + Upload .cube 3D LUT */}
+          <div className="pt-2 border-t border-[var(--border-subtle)]/70 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_auto] gap-3 items-center">
+            <GradeSlider
+              label="Preset Strength"
+              value={activePresetStrength}
+              min={0}
+              max={100}
+              step={1}
+              defaultValue={100}
+              unit="%"
+              onChange={(val) => onUpdateClip({ preset_intensity: val })}
+            />
+
+            <div className="flex flex-wrap items-center gap-2 justify-end">
+              {presetPreviews?.lut_preview?.thumbnail_url && clip.lut_path && (
+                <img
+                  src={presetPreviews.lut_preview.thumbnail_url}
+                  alt="Custom LUT Preview"
+                  className="w-12 h-7 object-cover rounded border border-[var(--accent-primary)]/70 shrink-0"
+                />
+              )}
+              <label className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[var(--bg-input)] hover:border-[var(--accent-primary)]/50 border border-[var(--border-subtle)] rounded-lg cursor-pointer text-[11px] font-semibold whitespace-nowrap">
+                <Upload className="w-3 h-3 text-[var(--accent-primary)]" />
+                <span>{clip.lut_path ? 'Replace .cube 3D LUT' : 'Upload .cube 3D LUT'}</span>
+                <input
+                  type="file"
+                  accept=".cube"
+                  className="hidden"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    try {
+                      const res = await api.uploadLut(file);
+                      onUpdateClip({ lut_path: res.path });
+                      setLutNotice(`Loaded LUT: ${res.name}`);
+                    } catch {
+                      setLutNotice('Failed to upload .cube LUT');
+                    }
+                  }}
+                />
+              </label>
+              {clip.lut_path && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onUpdateClip({ lut_path: '' });
+                    setLutNotice(null);
+                  }}
+                  className="text-[10px] text-red-400 hover:underline whitespace-nowrap"
+                >
+                  Clear LUT
+                </button>
+              )}
+              {lutNotice && (
+                <span className="text-[10px] font-mono text-[var(--accent-primary)]">{lutNotice}</span>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -315,105 +597,156 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
         })}
       </div>
 
-      {/* TAB 1: LIGHT & COLOR */}
+      {/* TAB 1: BALANCED 6 vs 6 LIGHT & COLOR STUDIO */}
       {subTab === 'grade' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fadeIn tabular-nums">
-          {/* Light Card */}
+          {/* Tone & Optics (6 sliders) */}
           <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
-            <div className="flex items-center gap-2 font-bold text-xs text-[var(--text-primary)]">
-              <Sun className="w-4 h-4 text-[var(--accent-primary)]" />
-              <span>Light & Exposure</span>
+            <div className="flex items-center justify-between font-bold text-xs text-[var(--text-primary)]">
+              <span className="flex items-center gap-2">
+                <Sun className="w-4 h-4 text-[var(--accent-primary)]" />
+                <span>Tone & Optics</span>
+              </span>
+              <span className="text-[10px] font-normal text-[var(--text-muted)]">Double-click to reset</span>
             </div>
 
-            {[
-              { label: 'Exposure', key: 'exposure', min: -0.5, max: 0.5, step: 0.02, val: clip.exposure || 0, display: Math.round((clip.exposure || 0) * 100) },
-              { label: 'Brightness', key: 'brightness', min: -0.5, max: 0.5, step: 0.02, val: clip.brightness || 0, display: Math.round((clip.brightness || 0) * 100) },
-              { label: 'Contrast', key: 'contrast', min: 0.5, max: 1.8, step: 0.05, val: clip.contrast || 1.0, display: Math.round(((clip.contrast || 1.0) - 1.0) * 100) },
-              { label: 'Lift Mids (Gamma)', key: 'lift_mids', min: 0.6, max: 1.6, step: 0.05, val: clip.lift_mids || 1.0, display: Math.round(((clip.lift_mids || 1.0) - 1.0) * 100) }
-            ].map((s) => (
-              <div key={s.key}>
-                <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
-                  <span>{s.label}</span>
-                  <span className="font-mono text-[var(--accent-primary)] font-bold">{s.display}%</span>
-                </div>
-                <input
-                  type="range"
-                  min={s.min}
-                  max={s.max}
-                  step={s.step}
-                  value={s.val}
-                  onChange={(e) => onUpdateClip({ [s.key]: parseFloat(e.target.value) } as any)}
-                  className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
-                />
-              </div>
-            ))}
+            <GradeSlider
+              label="Exposure"
+              value={exposureUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ exposure: Number((val / 100).toFixed(2)), brightness: 0 })}
+            />
+            <GradeSlider
+              label="Contrast"
+              value={contrastUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ contrast: Number((1.0 + val / 100).toFixed(2)) })}
+            />
+            <GradeSlider
+              label="Highlights"
+              value={highlightsUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ highlights: val })}
+            />
+            <GradeSlider
+              label="Shadows (Lift)"
+              value={shadowsUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ shadows: val })}
+            />
+            <GradeSlider
+              label="Clarity & Crispness"
+              value={clarityUi}
+              min={0}
+              max={100}
+              step={1}
+              defaultValue={0}
+              unit="%"
+              onChange={(val) => onUpdateClip({ sharpness: Number((val / 100).toFixed(2)) })}
+            />
+            <GradeSlider
+              label="Cinema Vignette"
+              value={vignetteUi}
+              min={0}
+              max={100}
+              step={1}
+              defaultValue={0}
+              unit="%"
+              onChange={(val) => onUpdateClip({ vignette: Number((val / 100).toFixed(2)) })}
+            />
           </div>
 
-          {/* Color Card */}
+          {/* Color & Film Character (6 sliders) */}
           <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
-            <div className="flex items-center gap-2 font-bold text-xs text-[var(--text-primary)]">
-              <Droplets className="w-4 h-4 text-[var(--accent-primary)]" />
-              <span>Color & Tint</span>
+            <div className="flex items-center justify-between font-bold text-xs text-[var(--text-primary)]">
+              <span className="flex items-center gap-2">
+                <Droplets className="w-4 h-4 text-[var(--accent-primary)]" />
+                <span>Color & Film Character</span>
+              </span>
+              <span className="text-[10px] font-normal text-[var(--text-muted)]">0 = neutral center</span>
             </div>
 
-            {[
-              { label: 'Warmth (Cool ↔ Warm)', key: 'warmth', min: -0.5, max: 0.5, step: 0.02, val: clip.warmth || 0, display: Math.round((clip.warmth || 0) * 100) },
-              { label: 'Saturation', key: 'saturation', min: 0.0, max: 2.5, step: 0.05, val: clip.saturation || 1.0, display: Math.round(((clip.saturation || 1.0) - 1.0) * 100) },
-              { label: 'Black & White', key: 'black_and_white', min: 0, max: 1.0, step: 0.05, val: clip.black_and_white || 0, display: Math.round((clip.black_and_white || 0) * 100) },
-              { label: 'Vintage Look', key: 'vintage', min: 0, max: 1.0, step: 0.05, val: clip.vintage || 0, display: Math.round((clip.vintage || 0) * 100) }
-            ].map((s) => (
-              <div key={s.key}>
-                <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
-                  <span>{s.label}</span>
-                  <span className="font-mono text-[var(--accent-primary)] font-bold">{s.display}%</span>
-                </div>
-                <input
-                  type="range"
-                  min={s.min}
-                  max={s.max}
-                  step={s.step}
-                  value={s.val}
-                  onChange={(e) => onUpdateClip({ [s.key]: parseFloat(e.target.value) } as any)}
-                  className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
-                />
-              </div>
-            ))}
-
-            <div className="pt-1 flex items-center justify-between gap-2">
-              <span className="text-[11px] text-[var(--text-secondary)]">Color Tint</span>
-              <div className="flex gap-1 flex-wrap">
-                {tintOptions.map((t) => {
-                  const tintHexMap: Record<string, string> = {
-                    Red: '#EF4444',
-                    Blue: '#3B82F6',
-                    Green: '#10B981',
-                    Yellow: '#FACC15'
-                  };
-                  const activeTint =
-                    t === 'None'
-                      ? (clip.tint_strength || 0) <= 0.01 || !clip.tint_color || clip.tint_color === 'none'
-                      : (clip.tint_strength || 0) > 0.01 &&
-                        (clip.tint_color === t || clip.tint_color === tintHexMap[t]);
-                  return (
-                    <button
-                      key={t}
-                      type="button"
-                      onClick={() => {
-                        if (t === 'None') onUpdateClip({ tint_color: 'none', tint_strength: 0 });
-                        else onUpdateClip({ tint_color: t, tint_strength: 0.25 });
-                      }}
-                      className={`px-2 py-0.5 rounded border text-[10px] transition ${
-                        activeTint
-                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)] font-bold'
-                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {t}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            <GradeSlider
+              label="Temperature (Cool ↔ Warm)"
+              value={colorTempUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ color_temp: val, warmth: 0 })}
+            />
+            <GradeSlider
+              label="Tint (Green ↔ Magenta)"
+              value={tintShiftUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ tint_shift: val })}
+            />
+            <GradeSlider
+              label="Vibrance (Skin-Safe)"
+              value={vibranceUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) => onUpdateClip({ vibrance: val })}
+            />
+            <GradeSlider
+              label="Saturation"
+              value={saturationUi}
+              min={-100}
+              max={100}
+              step={1}
+              defaultValue={0}
+              bipolar
+              onChange={(val) =>
+                onUpdateClip({
+                  saturation: Number((1.0 + val / 100).toFixed(2)),
+                  black_and_white: val <= -99 ? 1.0 : 0,
+                })
+              }
+            />
+            <GradeSlider
+              label="Matte Fade (Film Blacks)"
+              value={matteFadeUi}
+              min={0}
+              max={100}
+              step={1}
+              defaultValue={0}
+              unit="%"
+              onChange={(val) => onUpdateClip({ matte_fade: val, vintage: 0 })}
+            />
+            <GradeSlider
+              label="Film Halation Glow"
+              value={halationUi}
+              min={0}
+              max={100}
+              step={1}
+              defaultValue={0}
+              unit="%"
+              onChange={(val) => onUpdateClip({ halation_glow: val })}
+            />
           </div>
         </div>
       )}
@@ -438,7 +771,11 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                     blur: 0,
                     film_grain: 0,
                     vignette: 0,
-                    bottom_fade: 0
+                    bottom_fade: 0,
+                    depth_pop: 0,
+                    chroma_split: 0,
+                    letterbox: 'none',
+                    speed_ramp: 1.0
                   })
                 }
                 className="text-[10px] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] flex items-center gap-1"
@@ -449,13 +786,13 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
 
             <div className="grid grid-cols-2 gap-3">
               {[
-                { label: 'Dreamy Glow', key: 'glow', val: clip.glow || 0 },
-                { label: 'Skin Smooth', key: 'smooth', val: clip.smooth || 0 },
-                { label: 'Sharpness', key: 'sharpness', val: clip.sharpness || 0 },
-                { label: 'Soft Blur', key: 'blur', val: clip.blur || 0 },
-                { label: 'Film Grain', key: 'film_grain', val: clip.film_grain || 0 },
-                { label: 'Vignette', key: 'vignette', val: vignetteVal },
-                { label: 'Bottom Fade', key: 'bottom_fade', val: clip.bottom_fade || 0 }
+                { label: 'Dreamy Glow', key: 'glow', val: clip.glow || 0, max: 1.0, step: 0.05 },
+                { label: 'Skin Smooth', key: 'smooth', val: clip.smooth || 0, max: 1.0, step: 0.05 },
+                { label: 'Soft Blur', key: 'blur', val: clip.blur || 0, max: 1.0, step: 0.05 },
+                { label: 'Film Grain', key: 'film_grain', val: clip.film_grain || 0, max: 1.0, step: 0.05 },
+                { label: 'Bottom Fade', key: 'bottom_fade', val: clip.bottom_fade || 0, max: 1.0, step: 0.05 },
+                { label: 'Subject Depth Pop (f/1.8)', key: 'depth_pop', val: clip.depth_pop || 0, max: 1.0, step: 0.05 },
+                { label: 'RGB Chromatic Split', key: 'chroma_split', val: (clip.chroma_split ?? 0) > 1 ? (clip.chroma_split ?? 0) / 100 : (clip.chroma_split ?? 0), max: 1.0, step: 0.05 }
               ].map((s) => (
                 <div key={s.key}>
                   <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
@@ -467,14 +804,66 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                   <input
                     type="range"
                     min={0}
-                    max={1.0}
-                    step={0.05}
+                    max={s.max}
+                    step={s.step}
                     value={s.val}
                     onChange={(e) => onUpdateClip({ [s.key]: parseFloat(e.target.value) } as any)}
                     className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
                   />
                 </div>
               ))}
+            </div>
+
+            <div className="pt-2.5 border-t border-[var(--border-subtle)]/70 grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <span className="text-[11px] text-[var(--text-secondary)] block mb-1">Playback Speed Ramp</span>
+                <div className="grid grid-cols-4 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+                  {[0.95, 1.0, 1.06, 1.12].map((spd) => {
+                    const active = Math.abs((clip.speed_ramp ?? 1.0) - spd) < 0.015;
+                    return (
+                      <button
+                        key={spd}
+                        type="button"
+                        onClick={() => onUpdateClip({ speed_ramp: spd })}
+                        className={`py-1 rounded-md text-[10px] font-mono font-bold transition ${
+                          active
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                            : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {spd.toFixed(2).replace(/\.00$/, '.0')}x
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <span className="text-[11px] text-[var(--text-secondary)] block mb-1">Cinema Letterbox</span>
+                <div className="grid grid-cols-3 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+                  {[
+                    { id: 'none', label: 'None' },
+                    { id: '1.85:1', label: '1.85:1' },
+                    { id: '2.39:1', label: '2.39:1' },
+                  ].map((lb) => {
+                    const active = (clip.letterbox || 'none').toLowerCase() === lb.id;
+                    return (
+                      <button
+                        key={lb.id}
+                        type="button"
+                        onClick={() => onUpdateClip({ letterbox: lb.id })}
+                        className={`py-1 rounded-md text-[10px] font-mono font-bold transition ${
+                          active
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                            : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {lb.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           </div>
 
@@ -636,7 +1025,7 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                       : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
                   }`}
                 >
-                  {(clip.normalize_audio ?? true) ? '✓ ' : ''}Loudness -14 LUFS
+                  {(clip.normalize_audio ?? true) ? '✓ ' : ''}Loudness Normalize
                 </button>
                 <button
                   type="button"
@@ -662,6 +1051,18 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                 </button>
                 <button
                   type="button"
+                  onClick={() => onUpdateClip({ de_esser: !(clip.de_esser ?? false) })}
+                  className={`py-1.5 px-2.5 rounded-lg border text-[11px] font-medium text-left transition ${
+                    clip.de_esser
+                      ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
+                  title="Attenuates harsh 6.5 kHz sibilance on 'S' and 'T' sounds"
+                >
+                  {clip.de_esser ? '✓ ' : ''}De-Esser (6.5 kHz)
+                </button>
+                <button
+                  type="button"
                   onClick={() => onUpdateClip({ auto_sfx: !(clip.auto_sfx ?? false) })}
                   className={`py-1.5 px-2.5 rounded-lg border text-[11px] font-medium text-left transition ${
                     clip.auto_sfx
@@ -682,6 +1083,58 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                 >
                   {clip.beat_sync_enabled ? '✓ ' : ''}Snap Zooms &amp; Cuts to Beat
                 </button>
+              </div>
+
+              {/* Voice EQ Presets & Broadcast LUFS Target */}
+              <div className="pt-2 space-y-2 border-t border-[var(--border-subtle)]/70">
+                <div>
+                  <span className="text-[10px] font-bold uppercase text-[var(--text-secondary)] block mb-1">
+                    Voice EQ Preset
+                  </span>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+                    {['Raw', 'Podcast Warmth', 'Crisp Broadcast', 'Gaming Clarity'].map((eq) => {
+                      const active = (clip.voice_eq_preset || 'Raw') === eq;
+                      return (
+                        <button
+                          key={eq}
+                          type="button"
+                          onClick={() => onUpdateClip({ voice_eq_preset: eq })}
+                          className={`py-1 px-1 rounded-md text-[10px] font-semibold transition truncate ${
+                            active
+                              ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold'
+                              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                          }`}
+                        >
+                          {eq}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-[10px] font-bold uppercase text-[var(--text-secondary)] block mb-1">
+                    Broadcast Loudness Target
+                  </span>
+                  <div className="grid grid-cols-3 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+                    {['-16 LUFS', '-14 LUFS', '-11 LUFS'].map((lt) => {
+                      const active = (clip.loudness_target || '-14 LUFS') === lt;
+                      return (
+                        <button
+                          key={lt}
+                          type="button"
+                          onClick={() => onUpdateClip({ loudness_target: lt, normalize_audio: true })}
+                          className={`py-1 rounded-md text-[10px] font-mono font-bold transition ${
+                            active
+                              ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                              : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                          }`}
+                        >
+                          {lt}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
 
               {/* Live Audio Spectrum Visualizer */}
@@ -869,13 +1322,66 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
               </div>
 
               {clip.outro_cta_enabled && (
-                <input
-                  type="text"
-                  value={clip.outro_cta_text ?? 'Subscribe for More'}
-                  onChange={(e) => onUpdateClip({ outro_cta_text: e.target.value })}
-                  placeholder="Subscribe for More"
-                  className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
-                />
+                <div className="space-y-2 p-2.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)]">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      value={clip.outro_cta_headline ?? ''}
+                      onChange={(e) => onUpdateClip({ outro_cta_headline: e.target.value })}
+                      placeholder="End-Card Headline (e.g. WATCH NEXT)"
+                      className="w-full bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                    />
+                    <input
+                      type="text"
+                      value={clip.outro_cta_handle ?? ''}
+                      onChange={(e) => onUpdateClip({ outro_cta_handle: e.target.value })}
+                      placeholder="@Handle (e.g. @LostHeaven)"
+                      className="w-full bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                    />
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <input
+                      type="text"
+                      value={clip.outro_cta_text ?? 'Subscribe for More'}
+                      onChange={(e) => onUpdateClip({ outro_cta_text: e.target.value })}
+                      placeholder="Button Badge Text (Subscribe for More)"
+                      className="flex-1 min-w-[160px] bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
+                    />
+                    <label className="flex items-center gap-1.5 px-2.5 py-1.5 bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/40 border border-[var(--border-subtle)] rounded-lg cursor-pointer text-[11px] font-semibold shrink-0">
+                      <Upload className="w-3 h-3 text-[var(--accent-primary)]" />
+                      <span>{clip.outro_logo_path ? 'Change Brand Logo' : 'Brand Logo PNG'}</span>
+                      <input
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          try {
+                            const res = await api.uploadBrandLogo(file);
+                            onUpdateClip({ outro_logo_path: res.path });
+                            setLogoNotice('Logo attached');
+                          } catch {
+                            setLogoNotice('Upload failed');
+                          }
+                        }}
+                      />
+                    </label>
+                    {clip.outro_logo_path && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onUpdateClip({ outro_logo_path: '' });
+                          setLogoNotice(null);
+                        }}
+                        className="text-[10px] text-red-400 hover:underline"
+                      >
+                        Remove Logo
+                      </button>
+                    )}
+                    {logoNotice && <span className="text-[10px] font-mono text-emerald-400">{logoNotice}</span>}
+                  </div>
+                </div>
               )}
             </div>
 
@@ -1005,6 +1511,39 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                 >
                   {loadingBroll ? 'Scanning...' : 'Suggest Cutaways'}
                 </button>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                {(
+                  [
+                    { id: 'fullscreen', label: 'Full-Screen Cutaway' },
+                    { id: 'reaction_pip', label: 'B-Roll + Speaker Reaction PiP' }
+                  ] as const
+                ).map((mode) => {
+                  const selected = (clip.broll_layout || 'fullscreen') === mode.id;
+                  return (
+                    <button
+                      key={mode.id}
+                      type="button"
+                      onClick={() => {
+                        const updatedSegs = (clip.broll_segments || []).map((seg) => ({
+                          ...seg,
+                          layout: mode.id
+                        }));
+                        onUpdateClip({
+                          broll_layout: mode.id,
+                          ...(updatedSegs.length > 0 ? { broll_segments: updatedSegs } : {})
+                        });
+                      }}
+                      className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold border transition text-center ${
+                        selected
+                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                      }`}
+                    >
+                      {mode.label}
+                    </button>
+                  );
+                })}
               </div>
               {brollNotice && (
                 <div className="text-[10px] font-mono text-[var(--accent-primary)]">{brollNotice}</div>

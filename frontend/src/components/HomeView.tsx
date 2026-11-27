@@ -4,8 +4,9 @@ import {
   Trash2, ArrowRight, CheckCircle2, Layers, Globe, FileVideo,
   AlertCircle, RefreshCw, Cpu, Zap
 } from 'lucide-react';
-import { Project, AnalyticsFormulaReport } from '../types';
+import { Project, AnalyticsFormulaReport, StudioSettings } from '../types';
 import { api } from '../api/client';
+import { AIEngineModal } from './AIEngineModal';
 
 const YouTubeIcon: React.FC<{ className?: string }> = ({ className = "w-4 h-4" }) => (
   <svg className={className} viewBox="0 0 24 24" fill="currentColor">
@@ -18,13 +19,17 @@ interface HomeViewProps {
   onOpenProject: (projectId: number) => void;
   onViewProgress: (projectId: number) => void;
   onViewLibrary?: () => void;
+  isOfflineMultimodal?: boolean;
+  studioSettings?: Partial<StudioSettings> | null;
 }
 
 export const HomeView: React.FC<HomeViewProps> = ({
   onStartJob,
   onOpenProject,
   onViewProgress,
-  onViewLibrary
+  onViewLibrary,
+  isOfflineMultimodal = false,
+  studioSettings = null,
 }) => {
   // Ingestion Source State
   const [activeTab, setActiveTab] = useState<'upload' | 'youtube'>('upload');
@@ -48,12 +53,21 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const [recentProjects, setRecentProjects] = useState<Project[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState(true);
   const [formulaReport, setFormulaReport] = useState<AnalyticsFormulaReport | null>(null);
+  const [localSettings, setLocalSettings] = useState<Partial<StudioSettings> | null>(studioSettings);
+  const [isEnginePromptOpen, setIsEnginePromptOpen] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
+    setLocalSettings(studioSettings);
+  }, [studioSettings]);
+
+  useEffect(() => {
     loadRecentProjects();
     api.getAnalyticsFormula().then(setFormulaReport).catch(() => null);
+    if (!studioSettings) {
+      api.getSystemSettings().then(setLocalSettings).catch(() => null);
+    }
   }, []);
 
   const loadRecentProjects = async () => {
@@ -121,17 +135,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
-  const handleStartAnalysis = async () => {
-    setErrorMessage(null);
-    if (activeTab === 'upload' && !selectedFile) {
-      setErrorMessage('Please select or drop a video file before starting analysis.');
-      return;
-    }
-    if (activeTab === 'youtube' && !youtubeUrl.trim()) {
-      setErrorMessage('Please enter a YouTube video URL.');
-      return;
-    }
-
+  const executeIngestionJob = async (chosenAiMode?: 'gemini' | 'offline') => {
     try {
       setIsSubmitting(true);
       let res: { project_id: number; title: string };
@@ -144,7 +148,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
           clipCount,
           topicFocus.trim() || undefined,
           captionLanguage,
-          hardwareMode
+          hardwareMode,
+          chosenAiMode
         );
       } else {
         res = await api.importYouTube(
@@ -154,7 +159,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
           clipCount,
           topicFocus.trim() || undefined,
           captionLanguage,
-          hardwareMode
+          hardwareMode,
+          chosenAiMode
         );
       }
 
@@ -168,6 +174,37 @@ export const HomeView: React.FC<HomeViewProps> = ({
       setErrorMessage(err.message || 'Failed to submit video for analysis');
       setIsSubmitting(false);
     }
+  };
+
+  const handleStartAnalysis = async () => {
+    setErrorMessage(null);
+    if (activeTab === 'upload' && !selectedFile) {
+      setErrorMessage('Please select or drop a video file before starting analysis.');
+      return;
+    }
+    if (activeTab === 'youtube' && !youtubeUrl.trim()) {
+      setErrorMessage('Please enter a YouTube video URL.');
+      return;
+    }
+
+    const activeCfg = localSettings || (await api.getSystemSettings().catch(() => null));
+    if (activeCfg) setLocalSettings(activeCfg);
+
+    const hasKey = Boolean(activeCfg?.gemini_configured);
+    const explicitOffline =
+      activeCfg?.ai_mode === 'offline' ||
+      activeCfg?.ai_provider === 'offline' ||
+      activeCfg?.gemini_enabled === false ||
+      activeCfg?.gemini_boost_enabled === false ||
+      isOfflineMultimodal;
+
+    // Prompt explicitly before launching if no Gemini key is saved AND offline wasn't explicitly chosen
+    if (!hasKey && !explicitOffline) {
+      setIsEnginePromptOpen(true);
+      return;
+    }
+
+    await executeIngestionJob(explicitOffline ? 'offline' : 'gemini');
   };
 
   const handleDeleteProject = async (e: React.MouseEvent, id: number) => {
@@ -187,9 +224,17 @@ export const HomeView: React.FC<HomeViewProps> = ({
         
         {/* Header Hero */}
         <div className="text-center space-y-2 pt-2">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--accent-primary)] text-xs font-semibold shadow-sm">
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Local-First AI Video Clipper & Multi-Format Studio</span>
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--accent-primary)] text-xs font-semibold shadow-sm">
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Local-First AI Video Clipper &amp; Multi-Format Studio</span>
+            </div>
+            {isOfflineMultimodal && (
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/35 text-emerald-400 text-xs font-bold shadow-sm">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>Offline Multimodal AI · Active</span>
+              </div>
+            )}
           </div>
           <h1 className="text-3xl md:text-4xl font-black tracking-tight text-[var(--text-primary)]">
             Turn Long Videos into <span className="text-[var(--accent-primary)]">Viral Shorts</span>
@@ -680,6 +725,19 @@ export const HomeView: React.FC<HomeViewProps> = ({
         </div>
 
       </div>
+
+      <AIEngineModal
+        isOpen={isEnginePromptOpen}
+        onClose={() => setIsEnginePromptOpen(false)}
+        title="Choose AI Analysis Engine"
+        subtitle="No Gemini API key is configured yet. Enter a key or run 100% locally in Offline Multimodal AI Mode."
+        currentMode={isOfflineMultimodal ? 'offline' : localSettings?.ai_mode || null}
+        geminiConfigured={Boolean(localSettings?.gemini_configured)}
+        onChosen={async (mode) => {
+          setIsEnginePromptOpen(false);
+          await executeIngestionJob(mode);
+        }}
+      />
     </div>
   );
 };

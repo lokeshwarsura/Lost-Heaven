@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import shutil
@@ -132,37 +133,54 @@ def resolve_pillow_font(
         else "regular"
     )
 
-    candidates: List[str] = []
-    if norm_base in FONT_CANDIDATES:
-        candidates.extend(FONT_CANDIDATES[norm_base][style_key])
-    # Also try direct custom font filename matching (e.g. uploaded fonts)
+    req_candidates: List[str] = []
     stem = raw.replace(" ", "")
-    candidates.extend([
+    # Prioritize direct custom font filenames first so uploaded fonts are never shadowed
+    req_candidates.extend([
         f"{raw}.ttf", f"{raw}.otf",
         f"{stem}.ttf", f"{stem}.otf",
         f"{stem}-Bold.ttf", f"{stem}-Regular.ttf",
     ])
-    candidates.extend(FONT_CANDIDATES["montserrat"][style_key])
+    if norm_base in FONT_CANDIDATES:
+        req_candidates.extend(FONT_CANDIDATES[norm_base][style_key])
 
     search_dirs = _font_search_dirs()
+    # First pass: exact/fuzzy match for the requested font across storage/fonts & system dirs
     for d in search_dirs:
         if not d.exists():
             continue
-        for fname in candidates:
+        if str(d).lower().endswith("fonts") and d != Path(r"C:\Windows\Fonts"):
+            try:
+                norm_flat = norm_base.replace(" ", "")
+                for p in sorted(d.iterdir()):
+                    if p.suffix.lower() in (".ttf", ".otf"):
+                        p_flat = p.stem.lower().replace(" ", "")
+                        if p_flat == norm_flat or (norm_flat and norm_flat in p_flat):
+                            try:
+                                return ImageFont.truetype(str(p), size=size_px)
+                            except Exception:
+                                continue
+            except Exception:
+                pass
+        for fname in req_candidates:
             candidate_path = d / fname
             if candidate_path.is_file():
                 try:
                     return ImageFont.truetype(str(candidate_path), size=size_px)
                 except Exception:
                     continue
-        # Substring match inside custom font folders (non-Windows system)
-        if str(d).lower().endswith("fonts") and d != Path(r"C:\Windows\Fonts"):
-            try:
-                for p in d.iterdir():
-                    if p.suffix.lower() in (".ttf", ".otf") and norm_base.replace(" ", "") in p.stem.lower().replace(" ", ""):
-                        return ImageFont.truetype(str(p), size=size_px)
-            except Exception:
-                pass
+
+    # Second pass: bundled Montserrat fallback
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        for fname in FONT_CANDIDATES["montserrat"][style_key]:
+            candidate_path = d / fname
+            if candidate_path.is_file():
+                try:
+                    return ImageFont.truetype(str(candidate_path), size=size_px)
+                except Exception:
+                    continue
 
     # Guaranteed Pillow fallback (never crashes)
     try:
@@ -182,12 +200,21 @@ def normalize_and_chunk_words(
     max_words_per_chunk: int = 4,
     max_chars_per_line: int = 18,
     bridge_gap_sec: float = 0.15,
+    pacing_density: str = "3-4 Words Viral",
 ) -> List[Dict[str, Any]]:
     """
     Normalize transcript words to clip-relative [0.0, clip_duration] timestamps,
-    group into punchy 2-4 word chunks (~14-18 chars max), and bridge micro-silences (< 0.15s).
+    group into punchy chunks controlled by `pacing_density`, and bridge micro-silences (< 0.15s).
     Returns list of chunks: [{"start": float, "end": float, "words": [word_dict, ...]}].
     """
+    dens = str(pacing_density or "3-4 Words Viral").strip().lower()
+    if not word_by_word:
+        if "1" in dens or "rapid" in dens:
+            max_words_per_chunk = 2
+            max_chars_per_line = 12
+        elif "full" in dens or "phrase" in dens:
+            max_words_per_chunk = 8
+            max_chars_per_line = 34
     raw_words = list(words or [])
     if not raw_words and project_id is not None:
         t_path = Path(settings.STORAGE_DIR) / "projects" / str(project_id) / "transcript.json"
@@ -331,6 +358,30 @@ def normalize_and_chunk_words(
     return chunks
 
 
+def _canonicalize_caption_animation(anim: Optional[str]) -> str:
+    raw = str(anim or "Instant Cut").strip().lower().replace("-", " ").replace("_", " ")
+    if raw in ("pop bounce", "pop", "soft bounce", "hard bounce", "elastic"):
+        return "pop_bounce"
+    if raw in ("slide up", "slide across"):
+        return "slide_up"
+    if raw in ("scale slam", "zoom", "pulse"):
+        return "scale_slam"
+    if raw in ("blur fade", "fade in", "blur scroll"):
+        return "blur_fade"
+    if raw in ("typewriter reveal", "typewriter"):
+        return "typewriter_reveal"
+    return "instant_cut"
+
+
+def _apply_text_case(tok: str, text_case_mode: str) -> str:
+    if text_case_mode == "all_caps":
+        return tok.upper()
+    if text_case_mode == "title_case":
+        # Preserve apostrophes inside contractions (e.g. Don't -> Don't)
+        return re.sub(r"[A-Za-z]+('[A-Za-z]+)?", lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(), tok)
+    return tok
+
+
 def _resolve_style_settings(
     style_preset: str = "Karaoke pop",
     font_family: Optional[str] = None,
@@ -341,6 +392,7 @@ def _resolve_style_settings(
     base_color: Optional[str] = None,
     highlight_color: Optional[str] = None,
     outline_color: Optional[str] = None,
+    pill_color: Optional[str] = None,
     highlight_shape: Optional[str] = None,
     hold_back_opacity: float = 1.0,
     outline: Optional[float] = None,
@@ -351,24 +403,56 @@ def _resolve_style_settings(
     pos_x: Optional[float] = None,
     pos_y: Optional[float] = None,
     position_grid: str = "bottom_center",
+    caption_x: Optional[float] = None,
+    caption_y: Optional[float] = None,
+    caption_rotation: float = 0.0,
+    caption_max_width: float = 0.82,
+    caption_animation: Optional[str] = None,
+    text_case: Optional[str] = None,
 ) -> Dict[str, Any]:
     preset_def = CAPTION_STYLES_DEF.get(style_preset, CAPTION_STYLES_DEF["Karaoke pop"])
-    norm_shape = (highlight_shape or "").strip().lower().replace(" ", "_")
+    norm_shape = (highlight_shape or "").strip().lower().replace(" ", "_").replace(".", "_")
     if not norm_shape:
         if preset_def.get("border_style") == 3 or style_preset in ("Punch Box", "Brand Block"):
             norm_shape = "filled_box"
         elif style_preset == "Underline Pop":
             norm_shape = "underline"
+        elif style_preset == "Neon Glow":
+            norm_shape = "neon_glow"
         else:
             norm_shape = "colour_only"
-    elif norm_shape in ("pill_box", "filled_box"):
+    elif norm_shape in ("pill_box", "filled_box", "rounded_pill_box"):
         norm_shape = "filled_box"
-    elif norm_shape in ("colour_only", "color_only"):
+    elif norm_shape in ("colour_only", "color_only", "color_pop"):
         norm_shape = "colour_only"
+    elif norm_shape in ("underline", "marker_underline"):
+        norm_shape = "underline"
+    elif norm_shape in ("neon_glow", "neon_outer_glow"):
+        norm_shape = "neon_glow"
+    elif norm_shape in ("kinetic_pop", "1_18x_kinetic_pop", "118x_kinetic_pop", "scale_118"):
+        norm_shape = "kinetic_pop"
 
     eff_glow = float(glow or 0.0)
-    if eff_glow == 0.0 and style_preset == "Neon Glow":
-        eff_glow = 3.0
+    if eff_glow == 0.0 and (style_preset == "Neon Glow" or norm_shape == "neon_glow"):
+        eff_glow = 3.5
+
+    raw_tc = str(text_case or "").strip().lower()
+    if "title" in raw_tc:
+        tc_mode = "title_case"
+        eff_upper = False
+    elif "as" in raw_tc or "spoke" in raw_tc or "orig" in raw_tc:
+        tc_mode = "as_spoken"
+        eff_upper = False
+    elif "all" in raw_tc or "upper" in raw_tc:
+        tc_mode = "all_caps"
+        eff_upper = True
+    else:
+        eff_upper = bool(uppercase) if uppercase is not None else bool(preset_def.get("all_caps", True))
+        tc_mode = "all_caps" if eff_upper else "as_spoken"
+
+    eff_shadow = float(shadow if shadow is not None else preset_def.get("shadow_depth", 3.0))
+    if eff_shadow > 10.5:
+        eff_shadow = eff_shadow / 10.0
 
     # Grid fallback if pos_x/pos_y not passed explicitly
     grid_coords = {
@@ -378,26 +462,53 @@ def _resolve_style_settings(
     }
     gx, gy = grid_coords.get(position_grid, (50.0, 74.0))
 
+    resolved_hl = highlight_color or preset_def.get("active_color", "#C6F32F")
+    resolved_pill = (pill_color or "").strip() or resolved_hl
+
+    eff_pos_x = max(
+        5.0,
+        min(
+            95.0,
+            float(caption_x) * 100.0 if caption_x is not None else float(pos_x if pos_x is not None else gx),
+        ),
+    )
+    eff_pos_y = max(
+        8.0,
+        min(
+            92.0,
+            float(caption_y) * 100.0 if caption_y is not None else float(pos_y if pos_y is not None else gy),
+        ),
+    )
+    eff_rot = max(-15.0, min(15.0, float(caption_rotation or 0.0)))
+    eff_mw = max(0.45, min(0.90, float(caption_max_width or 0.82)))
+
     return {
         "style_preset": style_preset,
         "font_family": font_family or preset_def.get("font", "Montserrat"),
         "base_font_size": int(preset_def.get("font_size", 64)),
-        "font_size_pct": int(font_size_pct or 100),
+        "font_size_pct": max(65, min(155, int(font_size_pct or 100))),
         "bold": bool(bold) if bold is not None else (style_preset not in ("Cinematic", "Documentary")),
         "italic": bool(italic) if italic is not None else (style_preset == "Cinematic"),
-        "uppercase": bool(uppercase) if uppercase is not None else bool(preset_def.get("all_caps", True)),
+        "uppercase": eff_upper,
+        "text_case": tc_mode,
         "base_color": base_color or preset_def.get("base_color", "#FFFFFF"),
-        "highlight_color": highlight_color or preset_def.get("active_color", "#C6F32F"),
+        "highlight_color": resolved_hl,
+        "pill_color": resolved_pill,
         "outline_color": outline_color or preset_def.get("outline_color", "#000000"),
         "highlight_shape": norm_shape,
         "hold_back_opacity": max(0.05, min(1.0, float(hold_back_opacity if hold_back_opacity is not None else 1.0))),
-        "outline": float(outline if outline is not None else preset_def.get("outline_width", 4.0)),
-        "shadow": float(shadow if shadow is not None else preset_def.get("shadow_depth", 3.0)),
+        "outline": max(0.0, min(12.0, float(outline if outline is not None else preset_def.get("outline_width", 4.0)))),
+        "shadow": max(0.0, min(10.0, eff_shadow)),
         "glow": eff_glow,
         "letter_spacing": float(letter_spacing or 0.0),
         "alignment": (alignment or "Centre").strip().lower(),
-        "pos_x": float(pos_x if pos_x is not None else gx),
-        "pos_y": float(pos_y if pos_y is not None else gy),
+        "pos_x": eff_pos_x,
+        "pos_y": eff_pos_y,
+        "caption_x": eff_pos_x / 100.0,
+        "caption_y": eff_pos_y / 100.0,
+        "caption_rotation": eff_rot,
+        "caption_max_width": eff_mw,
+        "caption_animation": _canonicalize_caption_animation(caption_animation),
         "is_full_line_block": style_preset == "Brand Block",
     }
 
@@ -539,6 +650,62 @@ def _draw_hook_banner(
         curr_y += line_h + gap_y
 
 
+def _draw_cold_open_climax_badge(
+    canvas: Image.Image,
+    width: int,
+    height: int,
+    has_hook_banner: bool = False,
+):
+    """Draw a high-contrast pill badge (`🔥 CLIMAX PREVIEW`) during the prepended Cold-Open teaser."""
+    scale = max(0.45, width / 1080.0)
+    font = resolve_pillow_font("Montserrat", int(round(24 * scale)), bold=True, italic=False)
+    draw = ImageDraw.Draw(canvas)
+    label = "CLIMAX PREVIEW"
+    tw, th = _measure_text(draw, label, font)
+    pad_x = int(round(22 * scale))
+    pad_y = int(round(10 * scale))
+    flame_w = int(round(22 * scale))
+    gap = int(round(10 * scale))
+    pill_w = int(round(tw)) + pad_x * 2 + flame_w + gap
+    pill_h = int(round(th)) + pad_y * 2
+    x0 = (width - pill_w) // 2
+    y0 = max(14, int(round(height * (0.025 if has_hook_banner else 0.065))))
+    x1 = x0 + pill_w
+    y1 = y0 + pill_h
+
+    draw.rounded_rectangle(
+        [x0, y0, x1, y1],
+        radius=pill_h // 2,
+        fill=(220, 38, 38, 235),
+        outline=(251, 191, 36, 255),
+        width=max(2, int(round(2 * scale))),
+    )
+    # Crisp vector flame icon on the left side of the pill (avoids missing emoji glyph squares)
+    fx = x0 + pad_x + flame_w * 0.45
+    fy_bot = y1 - pad_y * 0.85
+    fy_top = y0 + pad_y * 0.7
+    fy_mid = 0.5 * (fy_bot + fy_top)
+    r = max(4, int(round(flame_w * 0.42)))
+    draw.polygon(
+        [
+            (fx, fy_top),
+            (fx + r * 0.9, fy_mid + r * 0.1),
+            (fx + r * 0.6, fy_bot),
+            (fx - r * 0.6, fy_bot),
+            (fx - r * 0.9, fy_mid + r * 0.1),
+        ],
+        fill=(254, 240, 138, 255),
+    )
+    draw.text(
+        (x0 + pad_x + flame_w + gap, y0 + pad_y),
+        label,
+        font=font,
+        fill=(255, 255, 255, 255),
+        stroke_width=max(1, int(round(1.5 * scale))),
+        stroke_fill=(0, 0, 0, 200),
+    )
+
+
 def _draw_retention_bar(
     canvas: Image.Image,
     progress_ratio: float,
@@ -578,46 +745,131 @@ def _draw_outro_cta_card(
     height: int,
     cta_text: str = "Subscribe for More",
     accent_hex: str = "#C6F32F",
+    cta_headline: str = "",
+    cta_handle: str = "",
+    logo_path: Optional[str] = None,
 ) -> None:
-    """Render an animated 2-second end-card CTA badge in the final 2.0s of the clip."""
+    """Render an animated 2-second Branded End-Card Outro overlay in the final 2.0s of the clip."""
     if clip_duration <= 2.2 or t < (clip_duration - 2.0):
         return
     elapsed_in_card = max(0.0, t - (clip_duration - 2.0))
     fade = min(1.0, elapsed_in_card / 0.35)
-    alpha_bg = int(round(220 * fade))
+    alpha_bg = int(round(228 * fade))
     alpha_fg = int(round(255 * fade))
     if alpha_fg < 10:
         return
 
     scale = max(0.45, width / 1080.0)
-    font_px = max(20, int(round(36 * scale)))
-    font = resolve_pillow_font("Montserrat", font_px, bold=True)
-    text = (cta_text or "Subscribe for More").strip() or "Subscribe for More"
-    label = f"{text}  →"
-
-    draw = ImageDraw.Draw(canvas)
-    tw, th = _measure_text(draw, label, font)
-    pad_x = int(round(28 * scale))
-    pad_y = int(round(14 * scale))
-    box_w = min(width - 40, int(round(tw)) + pad_x * 2)
-    box_h = int(round(th)) + pad_y * 2
-    x0 = (width - box_w) // 2
-    y0 = max(40, int(round(height * 0.82)) - box_h // 2)
-
     r, g, b, _ = _parse_rgba(accent_hex or "#C6F32F", 1.0)
+    draw = ImageDraw.Draw(canvas)
+
+    logo_img: Optional[Image.Image] = None
+    logo_sz = int(round(78 * scale))
+    if logo_path:
+        try:
+            from app.services.audio_mastering import resolve_local_media_asset
+            resolved_l = resolve_local_media_asset(logo_path)
+            if resolved_l and os.path.exists(resolved_l):
+                with Image.open(resolved_l) as raw_l:
+                    l_rgba = raw_l.convert("RGBA")
+                    l_rgba.thumbnail((logo_sz, logo_sz), Image.Resampling.LANCZOS)
+                    if fade < 0.99:
+                        la = l_rgba.getchannel("A").point(lambda v: int(round(v * fade)))
+                        l_rgba.putalpha(la)
+                    logo_img = l_rgba
+        except Exception:
+            logo_img = None
+
+    headline_clean = str(cta_headline or "").strip()
+    handle_clean = str(cta_handle or "").strip()
+    btn_text = (cta_text or "Subscribe for More").strip() or "Subscribe for More"
+    btn_label = f"{btn_text}  →"
+
+    has_rich_brand = bool(headline_clean or handle_clean or logo_img is not None)
+    if not has_rich_brand:
+        font_px = max(20, int(round(36 * scale)))
+        font = resolve_pillow_font("Montserrat", font_px, bold=True)
+        tw, th = _measure_text(draw, btn_label, font)
+        pad_x = int(round(28 * scale))
+        pad_y = int(round(14 * scale))
+        box_w = min(width - 40, int(round(tw)) + pad_x * 2)
+        box_h = int(round(th)) + pad_y * 2
+        x0 = (width - box_w) // 2
+        y0 = max(40, int(round(height * 0.82)) - box_h // 2)
+        draw.rounded_rectangle(
+            [x0, y0, x0 + box_w, y0 + box_h],
+            radius=max(12, box_h // 2),
+            fill=(14, 15, 20, alpha_bg),
+            outline=(r, g, b, alpha_fg),
+            width=max(2, int(round(3 * scale))),
+        )
+        draw.text(
+            ((width - tw) / 2.0, y0 + pad_y - int(round(2 * scale))),
+            btn_label,
+            font=font,
+            fill=(r, g, b, alpha_fg),
+        )
+        return
+
+    # Full glassmorphic Branded End-Card stack (Logo + Headline + @Handle + Button Badge)
+    f_head = resolve_pillow_font("Montserrat", max(22, int(round(38 * scale))), bold=True)
+    f_handle = resolve_pillow_font("Montserrat", max(18, int(round(26 * scale))), bold=False)
+    f_btn = resolve_pillow_font("Montserrat", max(18, int(round(30 * scale))), bold=True)
+
+    card_w = min(width - int(round(80 * scale)), int(round(width * 0.78)))
+    pad_card = int(round(26 * scale))
+    inner_h = 0
+    gap = int(round(12 * scale))
+    if logo_img is not None:
+        inner_h += logo_img.height + gap
+    if headline_clean:
+        _, hh = _measure_text(draw, headline_clean.upper(), f_head)
+        inner_h += int(round(hh)) + gap
+    if handle_clean:
+        _, hnh = _measure_text(draw, handle_clean, f_handle)
+        inner_h += int(round(hnh)) + gap
+    btw, bth = _measure_text(draw, btn_label, f_btn)
+    btn_h = int(round(bth)) + int(round(18 * scale))
+    inner_h += btn_h
+    card_h = inner_h + pad_card * 2
+
+    cx0 = (width - card_w) // 2
+    cy0 = max(36, min(height - card_h - 36, int(round(height * 0.70)) - card_h // 2))
     draw.rounded_rectangle(
-        [x0, y0, x0 + box_w, y0 + box_h],
-        radius=max(12, box_h // 2),
-        fill=(14, 15, 20, alpha_bg),
+        [cx0, cy0, cx0 + card_w, cy0 + card_h],
+        radius=max(16, int(round(24 * scale))),
+        fill=(14, 15, 22, alpha_bg),
         outline=(r, g, b, alpha_fg),
         width=max(2, int(round(3 * scale))),
     )
-    draw.text(
-        ((width - tw) / 2.0, y0 + pad_y - int(round(2 * scale))),
-        label,
-        font=font,
+
+    cur_y = cy0 + pad_card
+    if logo_img is not None:
+        lx = (width - logo_img.width) // 2
+        canvas.paste(logo_img, (lx, int(cur_y)), logo_img)
+        cur_y += logo_img.height + gap
+
+    if headline_clean:
+        ht = headline_clean.upper()
+        hw, hh = _measure_text(draw, ht, f_head)
+        draw.text(((width - hw) / 2.0, cur_y), ht, font=f_head, fill=(255, 255, 255, alpha_fg))
+        cur_y += int(round(hh)) + gap
+
+    if handle_clean:
+        hn_w, hn_h = _measure_text(draw, handle_clean, f_handle)
+        draw.text(((width - hn_w) / 2.0, cur_y), handle_clean, font=f_handle, fill=(203, 213, 225, alpha_fg))
+        cur_y += int(round(hn_h)) + gap
+
+    bw = min(card_w - pad_card, int(round(btw)) + int(round(44 * scale)))
+    bx0 = (width - bw) // 2
+    draw.rounded_rectangle(
+        [bx0, cur_y, bx0 + bw, cur_y + btn_h],
+        radius=btn_h // 2,
         fill=(r, g, b, alpha_fg),
     )
+    lum = 0.299 * r + 0.587 * g + 0.114 * b
+    ink = (12, 12, 18, alpha_fg) if lum > 140 else (255, 255, 255, alpha_fg)
+    draw.text(((width - btw) / 2.0, cur_y + int(round(8 * scale))), btn_label, font=f_btn, fill=ink)
 
 
 def _resolve_bilingual_font(px_size: int, text: str = "") -> Any:
@@ -654,6 +906,8 @@ def _compute_face_safe_anchor_y(
     if not face_keyframes:
         return default_anchor_y
     closest = min(face_keyframes, key=lambda kf: abs(float(kf.get("t", 0.0)) - t))
+    if "face_count" in closest and int(closest.get("face_count", 0) or 0) <= 0:
+        return default_anchor_y
     fcy = float(closest.get("cy", 0.4))
     fh_norm = float(closest.get("face_h", 0.26) or 0.26)
     cy_px = fcy * height
@@ -817,6 +1071,10 @@ def render_caption_frame(
     position_grid: str = "bottom_center",
     pos_x: Optional[float] = 50.0,
     pos_y: Optional[float] = 74.0,
+    caption_x: Optional[float] = None,
+    caption_y: Optional[float] = None,
+    caption_rotation: float = 0.0,
+    caption_max_width: float = 0.82,
     base_color: Optional[str] = None,
     highlight_color: Optional[str] = None,
     outline_color: Optional[str] = None,
@@ -834,6 +1092,9 @@ def render_caption_frame(
     retention_bar_color: str = "#C6F32F",
     outro_cta_enabled: bool = False,
     outro_cta_text: str = "Subscribe for More",
+    outro_cta_headline: str = "",
+    outro_cta_handle: str = "",
+    outro_logo_path: Optional[str] = None,
     clip_start_time: float = 0.0,
     clip_duration: float = 0.0,
     project_id: Optional[int] = None,
@@ -862,6 +1123,12 @@ def render_caption_frame(
     handle_corner: str = "bottom_right",
     handle_opacity: float = 0.65,
     handle_display_mode: str = "always",
+    cold_open_active: bool = False,
+    cold_open_teaser_dur: float = 2.3,
+    caption_animation: Optional[str] = None,
+    pill_color: Optional[str] = None,
+    pacing_density: str = "3-4 Words Viral",
+    text_case: Optional[str] = None,
 ) -> Image.Image:
     """
     Render a full-resolution transparent RGBA caption + retention/CTA overlay frame at clip-relative time `t`.
@@ -891,9 +1158,15 @@ def render_caption_frame(
             canvas, t, clip_duration, width, height,
             cta_text=outro_cta_text,
             accent_hex=highlight_color or retention_bar_color or "#C6F32F",
+            cta_headline=outro_cta_headline,
+            cta_handle=outro_cta_handle,
+            logo_path=outro_logo_path,
         )
 
     hook_visible_now = bool(burn_captions and hook_banner_enabled and hook_headline and 0.0 <= t <= 3.5)
+    cold_open_visible_now = bool(cold_open_active and 0.0 <= t <= max(0.5, float(cold_open_teaser_dur or 2.3)))
+    if cold_open_visible_now:
+        _draw_cold_open_climax_badge(canvas, width, height, has_hook_banner=hook_visible_now)
 
     if chapters_enabled and chapters:
         from app.services.chapter_engine import draw_chapter_pill
@@ -919,6 +1192,7 @@ def render_caption_frame(
             timing_offset=timing_offset,
             clean_filler_words=clean_filler_words,
             word_by_word=word_by_word,
+            pacing_density=pacing_density,
         )
     )
 
@@ -966,6 +1240,8 @@ def render_caption_frame(
         )
 
     if not burn_captions:
+        if hook_visible_now:
+            _draw_hook_banner(canvas, hook_headline, width, height)
         return canvas
 
     if hook_visible_now:
@@ -1001,6 +1277,7 @@ def render_caption_frame(
         base_color=base_color,
         highlight_color=highlight_color,
         outline_color=outline_color,
+        pill_color=pill_color,
         highlight_shape=highlight_shape,
         hold_back_opacity=hold_back_opacity,
         outline=outline,
@@ -1011,16 +1288,16 @@ def render_caption_frame(
         pos_x=pos_x,
         pos_y=pos_y,
         position_grid=position_grid,
+        caption_x=caption_x,
+        caption_y=caption_y,
+        caption_rotation=caption_rotation,
+        caption_max_width=caption_max_width,
+        caption_animation=caption_animation,
+        text_case=text_case,
     )
 
     scale = max(0.45, width / 1080.0)
-    font_px = max(18, int(round(cfg["base_font_size"] * (cfg["font_size_pct"] / 100.0) * scale)))
-    font = resolve_pillow_font(cfg["font_family"], font_px, bold=cfg["bold"], italic=cfg["italic"])
-
     dummy_draw = ImageDraw.Draw(canvas)
-    space_w, _ = _measure_text(dummy_draw, " ", font, letter_spacing=0.0)
-    if space_w < 4.0:
-        space_w = font_px * 0.28
 
     power_words = getattr(render_caption_frame, "_power_words", None)
     if power_words is None:
@@ -1043,32 +1320,44 @@ def render_caption_frame(
         emoji_font_cache = {}
         render_caption_frame._emoji_fonts = emoji_font_cache
 
-    base_font_px = max(12, int(getattr(font, "size", 48)))
-    font_path = getattr(font, "path", None)
+    def _get_emoji_font(epx: int):
+        if epx not in emoji_font_cache:
+            loaded_efont = None
+            for cand_epath in (
+                r"C:\Windows\Fonts\seguiemj.ttf",
+                "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+                "/System/Library/Fonts/Apple Color Emoji.ttc",
+            ):
+                if os.path.exists(cand_epath):
+                    try:
+                        loaded_efont = ImageFont.truetype(cand_epath, epx)
+                        break
+                    except Exception:
+                        continue
+            emoji_font_cache[epx] = loaded_efont
+        return emoji_font_cache[epx]
+
+    stroke_px = max(0, int(round(cfg["outline"] * scale)))
+    spacing_px = cfg["letter_spacing"] * scale
+    box_pad_px = (
+        int(round(36 * scale))
+        if (cfg["is_full_line_block"] or cfg["highlight_shape"] == "filled_box")
+        else int(round(8 * scale))
+    )
+    edge_margin = max(24.0, float(int(round(24.0 * max(1.0, scale))))) if (width >= 320 and height >= 320) else max(8.0, width * 0.05)
+    max_safe_width = min(max(120, int(round(width - edge_margin * 2.0))), max(120, int(round(width * cfg["caption_max_width"]))))
+    inner_max_w = max(80.0, float(max_safe_width - box_pad_px - stroke_px * 2))
+    side_margin = edge_margin
+
+    req_font_px = max(18, int(round(cfg["base_font_size"] * (cfg["font_size_pct"] / 100.0) * scale)))
+
+    # Measure & shrink proportionally until every wrapped line + pill box fits cleanly inside 0.82 * width
+    font_px = req_font_px
+    font = resolve_pillow_font(cfg["font_family"], font_px, bold=cfg["bold"], italic=cfg["italic"])
     power_font = font
-    if highlight_power_words and font_path:
-        try:
-            power_font = ImageFont.truetype(font_path, max(12, int(round(base_font_px * 1.08))))
-        except Exception:
-            power_font = font
-
-    emoji_px = max(14, int(round(base_font_px * 0.88)))
-    if emoji_px not in emoji_font_cache:
-        loaded_efont = None
-        for cand_epath in (
-            r"C:\Windows\Fonts\seguiemj.ttf",
-            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-            "/System/Library/Fonts/Apple Color Emoji.ttc",
-        ):
-            if os.path.exists(cand_epath):
-                try:
-                    loaded_efont = ImageFont.truetype(cand_epath, emoji_px)
-                    break
-                except Exception:
-                    continue
-        emoji_font_cache[emoji_px] = loaded_efont
-    emoji_font = emoji_font_cache[emoji_px]
-
+    emoji_font = None
+    emoji_px = max(14, int(round(req_font_px * 0.88)))
+    space_w = 10.0
     display_tokens: List[str] = []
     token_widths: List[float] = []
     token_heights: List[float] = []
@@ -1076,66 +1365,114 @@ def render_caption_frame(
     token_emoji_offsets: List[float] = []
     token_is_power: List[bool] = []
     token_fonts: List[Any] = []
+    lines_idx: List[List[int]] = []
+    line_widths: List[float] = []
+    line_heights: List[float] = []
+    max_block_w = 0.0
 
-    for w in cwords:
-        raw_tok = str(w.get("word", "")).strip()
-        clean_key = raw_tok.lower().strip(".,!?:;\"'()[]")
-        tok = raw_tok.upper() if cfg["uppercase"] else raw_tok
-        is_power = bool(highlight_power_words and clean_key in power_words)
-        tok_font = power_font if is_power else font
+    for shrink_step in range(12):
+        cand_px = max(14, int(round(req_font_px * (0.90 ** shrink_step))))
+        font_px = cand_px
+        font = resolve_pillow_font(cfg["font_family"], font_px, bold=cfg["bold"], italic=cfg["italic"])
+        space_w, _ = _measure_text(dummy_draw, " ", font, letter_spacing=0.0)
+        if space_w < 4.0:
+            space_w = font_px * 0.28
 
-        matched_emoji: Optional[str] = None
-        emoji_prefix_w = 0.0
-        emoji_h = 0.0
-        if auto_emoji:
-            matched_emoji = EMOJI_KEYWORDS.get(clean_key)
-            if matched_emoji:
-                emoji_gap = max(6.0, base_font_px * 0.16)
-                if emoji_font is not None:
-                    try:
-                        ebb = dummy_draw.textbbox((0, 0), matched_emoji, font=emoji_font, embedded_color=True)
-                        emoji_prefix_w = max(float(emoji_px), float(ebb[2] - ebb[0])) + emoji_gap
-                        emoji_h = float(ebb[3] - ebb[1])
-                    except Exception:
+        base_font_px = max(12, int(getattr(font, "size", font_px)))
+        font_path = getattr(font, "path", None)
+        power_font = font
+        if highlight_power_words and font_path:
+            try:
+                power_font = ImageFont.truetype(font_path, max(12, int(round(base_font_px * 1.08))))
+            except Exception:
+                power_font = font
+
+        kinetic_pop_font = font
+        if cfg["highlight_shape"] == "kinetic_pop":
+            kinetic_pop_font = resolve_pillow_font(
+                cfg["font_family"],
+                max(14, int(round(base_font_px * 1.18))),
+                bold=cfg["bold"],
+                italic=cfg["italic"],
+            )
+
+        emoji_px = max(12, int(round(base_font_px * 0.88)))
+        emoji_font = _get_emoji_font(emoji_px)
+
+        display_tokens = []
+        token_widths = []
+        token_heights = []
+        token_emojis = []
+        token_emoji_offsets = []
+        token_is_power = []
+        token_fonts = []
+
+        for tok_i, w in enumerate(cwords):
+            raw_tok = str(w.get("word", "")).strip()
+            clean_key = raw_tok.lower().strip(".,!?:;\"'()[]")
+            tok = _apply_text_case(raw_tok, cfg["text_case"])
+            is_power = bool(highlight_power_words and clean_key in power_words)
+            is_kin_active = bool(cfg["highlight_shape"] == "kinetic_pop" and tok_i == active_word_idx)
+            tok_font = kinetic_pop_font if is_kin_active else (power_font if is_power else font)
+
+            matched_emoji: Optional[str] = None
+            emoji_prefix_w = 0.0
+            emoji_h = 0.0
+            if auto_emoji:
+                matched_emoji = EMOJI_KEYWORDS.get(clean_key)
+                if matched_emoji:
+                    emoji_gap = max(6.0, base_font_px * 0.16)
+                    if emoji_font is not None:
+                        try:
+                            ebb = dummy_draw.textbbox((0, 0), matched_emoji, font=emoji_font, embedded_color=True)
+                            emoji_prefix_w = max(float(emoji_px), float(ebb[2] - ebb[0])) + emoji_gap
+                            emoji_h = float(ebb[3] - ebb[1])
+                        except Exception:
+                            emoji_prefix_w = float(emoji_px) + emoji_gap
+                            emoji_h = float(emoji_px)
+                    else:
                         emoji_prefix_w = float(emoji_px) + emoji_gap
                         emoji_h = float(emoji_px)
-                else:
-                    emoji_prefix_w = float(emoji_px) + emoji_gap
-                    emoji_h = float(emoji_px)
 
-        tw, th = _measure_text(dummy_draw, tok, tok_font, letter_spacing=cfg["letter_spacing"] * scale)
-        display_tokens.append(tok)
-        token_widths.append(tw + emoji_prefix_w)
-        token_heights.append(max(th, emoji_h))
-        token_emojis.append(matched_emoji)
-        token_emoji_offsets.append(emoji_prefix_w)
-        token_is_power.append(is_power)
-        token_fonts.append(tok_font)
+            tw, th = _measure_text(dummy_draw, tok, tok_font, letter_spacing=spacing_px)
+            display_tokens.append(tok)
+            token_widths.append(tw + emoji_prefix_w)
+            token_heights.append(max(th, emoji_h))
+            token_emojis.append(matched_emoji)
+            token_emoji_offsets.append(emoji_prefix_w)
+            token_is_power.append(is_power)
+            token_fonts.append(tok_font)
 
-    max_line_w = max(120.0, width * 0.86)
-    lines_idx: List[List[int]] = []
-    curr_line: List[int] = []
-    curr_w = 0.0
-    for idx in range(len(display_tokens)):
-        add_w = token_widths[idx] + (space_w if curr_line else 0.0)
-        if curr_line and curr_w + add_w > max_line_w:
+        lines_idx = []
+        curr_line: List[int] = []
+        curr_w = 0.0
+        for idx in range(len(display_tokens)):
+            add_w = token_widths[idx] + (space_w if curr_line else 0.0)
+            if curr_line and curr_w + add_w > inner_max_w:
+                lines_idx.append(curr_line)
+                curr_line = [idx]
+                curr_w = token_widths[idx]
+            else:
+                curr_line.append(idx)
+                curr_w += add_w
+        if curr_line:
             lines_idx.append(curr_line)
-            curr_line = [idx]
-            curr_w = token_widths[idx]
-        else:
-            curr_line.append(idx)
-            curr_w += add_w
-    if curr_line:
-        lines_idx.append(curr_line)
 
+        line_heights = [max(token_heights[i] for i in ln) for ln in lines_idx]
+        line_widths = [
+            sum(token_widths[i] for i in ln) + max(0, len(ln) - 1) * space_w
+            for ln in lines_idx
+        ]
+        max_block_w = max(line_widths) if line_widths else 0.0
+        max_single_tok = max(token_widths) if token_widths else 0.0
+
+        # Fits horizontally within 0.82 * width (accounting for box padding) and reasonable vertical line count
+        if max_single_tok <= inner_max_w and max_block_w <= inner_max_w and (len(lines_idx) <= 3 or cand_px <= 20):
+            break
+
+    base_font_px = max(12, int(getattr(font, "size", font_px)))
     line_gap = max(8.0, font_px * 0.22)
-    line_heights = [max(token_heights[i] for i in ln) for ln in lines_idx]
     total_h = sum(line_heights) + max(0, len(lines_idx) - 1) * line_gap
-    line_widths = [
-        sum(token_widths[i] for i in ln) + max(0, len(ln) - 1) * space_w
-        for ln in lines_idx
-    ]
-    max_block_w = max(line_widths) if line_widths else 0.0
 
     sec_line_txt = ""
     sec_font = None
@@ -1159,25 +1496,25 @@ def render_caption_frame(
             sec_h = float(sbb[3] - sbb[1])
             total_h += sec_gap + sec_h + 10.0 * scale
 
-    anchor_x = (cfg["pos_x"] / 100.0) * width
-    anchor_y = (cfg["pos_y"] / 100.0) * height
+    anchor_x = int(round(cfg["caption_x"] * width))
+    anchor_y = int(round(cfg["caption_y"] * height))
 
-    # Keep block cleanly inside frame margins & optionally avoid detected faces
-    margin_pad = max(16.0, 24.0 * scale)
+    # Clamp cleanly inside edge margins (>= 24px from left/right/top/bottom on real frames)
+    margin_pad = side_margin
+    top_safe_pad = max(edge_margin, height * 0.16) if hook_visible_now else edge_margin
+    bot_safe_pad = edge_margin
     if face_safe_captions and face_keyframes:
         anchor_y = _compute_face_safe_anchor_y(
             t=t,
-            default_anchor_y=anchor_y,
+            default_anchor_y=float(anchor_y),
             total_h=total_h,
-            margin_pad=margin_pad,
+            margin_pad=top_safe_pad,
             height=height,
             face_keyframes=face_keyframes,
         )
-    start_y = max(margin_pad, min(height - total_h - margin_pad, anchor_y - total_h / 2.0))
+    start_y = max(top_safe_pad, min(height - total_h - bot_safe_pad, float(anchor_y) - total_h / 2.0))
 
-    stroke_px = max(0, int(round(cfg["outline"] * scale)))
     shadow_px = max(0, int(round(cfg["shadow"] * scale)))
-    spacing_px = cfg["letter_spacing"] * scale
 
     inactive_rgba = _parse_rgba(cfg["base_color"], alpha_float=cfg["hold_back_opacity"])
     active_hex = cfg["highlight_color"]
@@ -1186,21 +1523,24 @@ def render_caption_frame(
         if w_sid and w_sid in speakers and speakers[w_sid].get("color"):
             active_hex = str(speakers[w_sid]["color"])
     active_rgba = _parse_rgba(active_hex, alpha_float=1.0)
+    pill_rgba = _parse_rgba(cfg["pill_color"], alpha_float=1.0)
     outline_rgba = _parse_rgba(cfg["outline_color"], alpha_float=1.0)
     shadow_rgba = (0, 0, 0, 185)
+    anim_mode = cfg["caption_animation"]
+    max_visible_tok = active_word_idx if anim_mode == "typewriter_reveal" else len(cwords) - 1
 
-    # Compute exact token coordinates first
+    # Compute exact token coordinates clamped inside [side_margin, width - side_margin]
     token_positions: List[Tuple[int, float, float, float, float]] = []
     cy = start_y
     for ln_i, ln in enumerate(lines_idx):
         lw = line_widths[ln_i]
         lh = line_heights[ln_i]
         if cfg["alignment"] == "left":
-            lx = max(margin_pad, min(width - lw - margin_pad, anchor_x - max_block_w / 2.0))
+            lx = max(side_margin, min(width - lw - side_margin, anchor_x - max_block_w / 2.0))
         elif cfg["alignment"] == "right":
-            lx = max(margin_pad, min(width - lw - margin_pad, anchor_x + max_block_w / 2.0 - lw))
+            lx = max(side_margin, min(width - lw - side_margin, anchor_x + max_block_w / 2.0 - lw))
         else:
-            lx = max(margin_pad, min(width - lw - margin_pad, anchor_x - lw / 2.0))
+            lx = max(side_margin, min(width - lw - side_margin, anchor_x - lw / 2.0))
 
         cx = lx
         for tok_i in ln:
@@ -1208,7 +1548,10 @@ def render_caption_frame(
             cx += token_widths[tok_i] + space_w
         cy += lh + line_gap
 
-    # 1. Backdrop pill boxes / Brand Block / Underlines layer
+    # Build isolated caption block layer so kinetic entry physics transform cleanly inside safe bounds
+    caption_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
+
+    # 1. Backdrop pill boxes / Brand Block / Underlines / Neon Halo layer
     bg_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
     bg_draw = ImageDraw.Draw(bg_layer)
 
@@ -1216,12 +1559,12 @@ def render_caption_frame(
         pad_x = max(14, int(round(18 * scale)))
         pad_y = max(8, int(round(10 * scale)))
         for ln_i, ln in enumerate(lines_idx):
-            matching = [tp for tp in token_positions if tp[0] in ln]
+            matching = [tp for tp in token_positions if tp[0] in ln and tp[0] <= max_visible_tok]
             if not matching:
                 continue
-            x0 = min(tp[1] for tp in matching) - pad_x
+            x0 = max(4.0, min(tp[1] for tp in matching) - pad_x)
             y0 = min(tp[2] for tp in matching) - pad_y
-            x1 = max(tp[1] + tp[3] for tp in matching) + pad_x
+            x1 = min(width - 4.0, max(tp[1] + tp[3] for tp in matching) + pad_x)
             y1 = max(tp[2] + tp[4] for tp in matching) + pad_y
             bg_draw.rounded_rectangle(
                 [x0, y0, x1, y1],
@@ -1232,45 +1575,53 @@ def render_caption_frame(
         pad_x = max(10, int(round(14 * scale)))
         pad_y = max(5, int(round(7 * scale)))
         for tok_i, tx, ty, tw, th in token_positions:
-            if tok_i == active_word_idx:
-                pill_fill = (active_rgba[0], active_rgba[1], active_rgba[2], 242)
+            if tok_i == active_word_idx and tok_i <= max_visible_tok:
+                pill_fill = (pill_rgba[0], pill_rgba[1], pill_rgba[2], 242)
+                x0 = max(4.0, tx - pad_x)
+                x1 = min(width - 4.0, tx + tw + pad_x)
                 bg_draw.rounded_rectangle(
-                    [tx - pad_x, ty - pad_y, tx + tw + pad_x, ty + th + pad_y],
+                    [x0, ty - pad_y, x1, ty + th + pad_y],
                     radius=max(8, int(round(12 * scale))),
                     fill=pill_fill,
                 )
     elif cfg["highlight_shape"] == "underline":
         bar_h = max(4, int(round(6 * scale)))
         for tok_i, tx, ty, tw, th in token_positions:
-            if tok_i == active_word_idx:
+            if tok_i == active_word_idx and tok_i <= max_visible_tok:
                 bg_draw.rounded_rectangle(
                     [tx, ty + th + max(3, int(round(4 * scale))), tx + tw, ty + th + max(3, int(round(4 * scale))) + bar_h],
                     radius=bar_h // 2,
                     fill=active_rgba,
                 )
 
-    canvas = Image.alpha_composite(canvas, bg_layer)
+    caption_layer = Image.alpha_composite(caption_layer, bg_layer)
 
-    # 2. Glow layer (Gaussian blurred duplicate)
-    if cfg["glow"] > 0.0:
+    # 2. Glow layer (Gaussian blurred duplicate — enhanced for Neon Outer Glow)
+    if cfg["glow"] > 0.0 or cfg["highlight_shape"] == "neon_glow":
         glow_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
         glow_draw = ImageDraw.Draw(glow_layer)
+        glow_str = max(cfg["glow"], 3.5 if cfg["highlight_shape"] == "neon_glow" else 0.0)
         for tok_i, tx, ty, _, _ in token_positions:
+            if tok_i > max_visible_tok:
+                continue
             tok = display_tokens[tok_i]
             is_active = tok_i == active_word_idx
+            tok_font = token_fonts[tok_i] if tok_i < len(token_fonts) else font
+            if cfg["highlight_shape"] == "neon_glow" and not is_active:
+                continue
             glow_col = active_rgba if is_active else _parse_rgba(cfg["base_color"], alpha_float=0.45)
             _draw_spaced_text(
                 glow_draw,
                 (tx, ty),
                 tok,
-                font,
+                tok_font,
                 fill=glow_col,
                 letter_spacing=spacing_px,
-                stroke_width=max(1, stroke_px // 2),
+                stroke_width=max(2, stroke_px // 2 + 2),
                 stroke_fill=glow_col,
             )
-        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=max(1.5, cfg["glow"] * 2.2 * scale)))
-        canvas = Image.alpha_composite(canvas, glow_layer)
+        glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(radius=max(2.0, glow_str * 2.4 * scale)))
+        caption_layer = Image.alpha_composite(caption_layer, glow_layer)
 
     # 3. Shadow + Crisp Foreground Text Layer
     fg_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
@@ -1278,11 +1629,14 @@ def render_caption_frame(
 
     if shadow_px > 0 and not cfg["is_full_line_block"]:
         for tok_i, tx, ty, _, _ in token_positions:
+            if tok_i > max_visible_tok:
+                continue
+            tok_font = token_fonts[tok_i] if tok_i < len(token_fonts) else font
             _draw_spaced_text(
                 fg_draw,
                 (tx + shadow_px, ty + shadow_px),
                 display_tokens[tok_i],
-                font,
+                tok_font,
                 fill=shadow_rgba,
                 letter_spacing=spacing_px,
                 stroke_width=stroke_px,
@@ -1290,6 +1644,8 @@ def render_caption_frame(
             )
 
     for tok_i, tx, ty, _, tok_h in token_positions:
+        if tok_i > max_visible_tok:
+            continue
         is_active = tok_i == active_word_idx
         is_power = token_is_power[tok_i] if tok_i < len(token_is_power) else False
         tok_font = token_fonts[tok_i] if tok_i < len(token_fonts) else font
@@ -1297,8 +1653,8 @@ def render_caption_frame(
         emoji_x_off = token_emoji_offsets[tok_i] if tok_i < len(token_emoji_offsets) else 0.0
 
         if cfg["highlight_shape"] == "filled_box" and is_active:
-            # High-contrast dark ink when pill box background matches highlight_color
-            r, g, b, _ = active_rgba
+            # High-contrast dark or white ink paired cleanly against custom pill_color
+            r, g, b, _ = pill_rgba
             luminance = (0.299 * r + 0.587 * g + 0.114 * b)
             text_fill = (12, 12, 16, 255) if luminance > 145 else (255, 255, 255, 255)
             tok_stroke = 0
@@ -1358,7 +1714,85 @@ def render_caption_frame(
         )
         fg_draw.text((sx, sec_y), sec_line_txt, font=sec_font, fill=(248, 250, 252, 250))
 
-    canvas = Image.alpha_composite(canvas, fg_layer)
+    caption_layer = Image.alpha_composite(caption_layer, fg_layer)
+
+    # Apply kinetic entry physics (scale, Y-offset, blur, alpha) while keeping within horizontal safe bounds
+    dt_entry = max(0.0, float(t) - float(active_chunk["start"]))
+    k_scale = 1.0
+    k_dy = 0
+    k_alpha = 1.0
+    k_blur = 0.0
+    if anim_mode == "pop_bounce" and dt_entry < 0.22:
+        u = dt_entry / 0.22
+        k_scale = 0.80 + 0.30 * math.sin(u * math.pi * 0.84)
+        k_alpha = min(1.0, 0.35 + u * 0.65)
+    elif anim_mode == "slide_up" and dt_entry < 0.22:
+        u = dt_entry / 0.22
+        ease = 1.0 - (1.0 - u) ** 3
+        k_dy = int(round(32.0 * scale * (1.0 - ease)))
+        k_alpha = max(0.20, ease)
+    elif anim_mode == "scale_slam" and dt_entry < 0.18:
+        u = dt_entry / 0.18
+        k_scale = 1.32 - 0.32 * (u * u)
+        k_alpha = min(1.0, 0.35 + u * 0.65)
+    elif anim_mode == "blur_fade" and dt_entry < 0.22:
+        u = dt_entry / 0.22
+        k_blur = max(0.0, (1.0 - u) * 5.0 * scale)
+        k_alpha = max(0.18, u)
+
+    rot_deg = float(cfg.get("caption_rotation", 0.0) or 0.0)
+    bb = caption_layer.getbbox()
+    if bb is not None and (abs(k_scale - 1.0) > 0.01 or k_dy != 0 or k_alpha < 0.99 or k_blur > 0.2 or abs(rot_deg) > 0.05):
+        # Transform & rotate around caption center, clamping strictly inside >= edge_margin on all 4 sides
+        bw = max(1, bb[2] - bb[0])
+        max_k = min(k_scale, max(1.0, (max_safe_width / float(bw))))
+        crop_patch = caption_layer.crop(bb)
+        if abs(max_k - 1.0) > 0.01:
+            nw = max(2, int(round(crop_patch.width * max_k)))
+            nh = max(2, int(round(crop_patch.height * max_k)))
+            crop_patch = crop_patch.resize((nw, nh), Image.Resampling.BICUBIC)
+        if k_blur > 0.2:
+            crop_patch = crop_patch.filter(ImageFilter.GaussianBlur(radius=k_blur))
+        if abs(rot_deg) > 0.05:
+            crop_patch = crop_patch.rotate(-rot_deg, resample=Image.Resampling.BICUBIC, expand=True)
+            # Shrink proportionally only if rotated bounding box exceeds available safe canvas span
+            avail_w = max(32, int(width - edge_margin * 2.0))
+            avail_h = max(32, int(height - top_safe_pad - bot_safe_pad))
+            if crop_patch.width > avail_w or crop_patch.height > avail_h:
+                fit_ratio = min(avail_w / max(1, crop_patch.width), avail_h / max(1, crop_patch.height))
+                crop_patch = crop_patch.resize(
+                    (max(2, int(round(crop_patch.width * fit_ratio))), max(2, int(round(crop_patch.height * fit_ratio)))),
+                    Image.Resampling.BICUBIC,
+                )
+        if k_alpha < 0.99:
+            a_ch = crop_patch.getchannel("A").point(lambda v: int(round(v * k_alpha)))
+            crop_patch.putalpha(a_ch)
+        cx_mid = 0.5 * (bb[0] + bb[2])
+        cy_mid = 0.5 * (bb[1] + bb[3]) + k_dy
+        min_x = int(edge_margin)
+        max_x = max(min_x, int(width - edge_margin - crop_patch.width))
+        min_y = int(top_safe_pad)
+        max_y = max(min_y, int(height - bot_safe_pad - crop_patch.height))
+        px = int(max(min_x, min(max_x, round(cx_mid - crop_patch.width / 2.0))))
+        py = int(max(min_y, min(max_y, round(cy_mid - crop_patch.height / 2.0))))
+        anim_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
+        anim_layer.paste(crop_patch, (px, py), crop_patch)
+        caption_layer = anim_layer
+    elif bb is not None:
+        # Enforce strict >= edge_margin safety clamp even on unrotated/static pills & shadows
+        min_x = int(edge_margin)
+        max_x = max(min_x, int(width - edge_margin - (bb[2] - bb[0])))
+        min_y = int(top_safe_pad)
+        max_y = max(min_y, int(height - bot_safe_pad - (bb[3] - bb[1])))
+        shift_x = max(min_x - bb[0], min(max_x - bb[0], 0))
+        shift_y = max(min_y - bb[1], min(max_y - bb[1], 0))
+        if shift_x != 0 or shift_y != 0:
+            crop_patch = caption_layer.crop(bb)
+            shifted_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
+            shifted_layer.paste(crop_patch, (bb[0] + shift_x, bb[1] + shift_y), crop_patch)
+            caption_layer = shifted_layer
+
+    canvas = Image.alpha_composite(canvas, caption_layer)
     return canvas
 
 
@@ -1380,6 +1814,9 @@ def build_caption_ffconcat(
     retention_bar_color: str = "#C6F32F",
     outro_cta_enabled: bool = False,
     outro_cta_text: str = "Subscribe for More",
+    outro_cta_headline: str = "",
+    outro_cta_handle: str = "",
+    outro_logo_path: Optional[str] = None,
     speakers: Optional[Dict[str, Any]] = None,
     speaker_lower_thirds: bool = False,
     face_safe_captions: bool = False,
@@ -1400,6 +1837,12 @@ def build_caption_ffconcat(
     handle_corner: str = "bottom_right",
     handle_opacity: float = 0.65,
     handle_display_mode: str = "always",
+    cold_open_active: bool = False,
+    cold_open_teaser_dur: float = 2.3,
+    caption_animation: Optional[str] = None,
+    pill_color: Optional[str] = None,
+    pacing_density: str = "3-4 Words Viral",
+    text_case: Optional[str] = None,
     **style_kwargs: Any,
 ) -> Tuple[Path, Path, int]:
     """
@@ -1423,10 +1866,12 @@ def build_caption_ffconcat(
             timing_offset=timing_offset,
             clean_filler_words=clean_filler_words,
             word_by_word=word_by_word,
+            pacing_density=pacing_density,
         )
         if (burn_captions or speaker_lower_thirds)
         else []
     )
+    anim_mode = _canonicalize_caption_animation(caption_animation)
 
     turns = (
         detect_speaker_lower_third_turns([w for ch in chunks for w in (ch.get("words") or [])], speakers)
@@ -1436,6 +1881,9 @@ def build_caption_ffconcat(
     active_cards = [c for c in (callout_cards or []) if isinstance(c, dict) and c.get("enabled", True)] if auto_callouts else []
 
     breakpoints = {0.0, round(dur_total, 3)}
+    co_teaser_end = max(0.5, float(cold_open_teaser_dur or 2.3))
+    if cold_open_active and co_teaser_end < dur_total:
+        breakpoints.add(round(co_teaser_end, 3))
     if burn_captions and hook_banner_enabled and hook_headline.strip():
         if 3.5 < dur_total:
             breakpoints.add(3.5)
@@ -1498,6 +1946,11 @@ def build_caption_ffconcat(
     if burn_captions:
         for ch in chunks:
             breakpoints.add(max(0.0, min(dur_total, round(ch["start"], 3))))
+            if anim_mode != "instant_cut" and anim_mode != "typewriter_reveal":
+                for k_off in (0.04, 0.09, 0.14, 0.22):
+                    pt = round(ch["start"] + k_off, 3)
+                    if pt < ch["end"] and pt < dur_total:
+                        breakpoints.add(pt)
             breakpoints.add(max(0.0, min(dur_total, round(ch["end"], 3))))
             for w in ch["words"]:
                 breakpoints.add(max(0.0, min(dur_total, round(w["start"], 3))))
@@ -1528,6 +1981,7 @@ def build_caption_ffconcat(
         mid_t = (t0 + t1) / 2.0
 
         hook_vis = bool(burn_captions and hook_banner_enabled and hook_headline.strip() and mid_t <= 3.5)
+        cold_open_vis = bool(cold_open_active and mid_t <= co_teaser_end)
         bar_bucket = int(round((mid_t / dur_total) * 100)) if retention_bar_enabled else -1
         cta_bucket = -1
         if outro_cta_enabled and dur_total > 2.2 and mid_t >= (dur_total - 2.0):
@@ -1548,7 +2002,8 @@ def build_caption_ffconcat(
         face_bucket = -1
         if burn_captions and face_safe_captions and face_keyframes:
             closest_kf = min(face_keyframes, key=lambda kf: abs(float(kf.get("t", 0.0)) - mid_t))
-            face_bucket = int(round(float(closest_kf.get("cy", 0.4)) * 20))
+            if not ("face_count" in closest_kf and int(closest_kf.get("face_count", 0) or 0) <= 0):
+                face_bucket = int(round(float(closest_kf.get("cy", 0.4)) * 20))
 
         chap_idx = -1
         chap_ease = 0
@@ -1571,10 +2026,14 @@ def build_caption_ffconcat(
 
         ch_idx = -1
         word_idx = -1
+        anim_bucket = 4
         if burn_captions:
             for ci, ch in enumerate(chunks):
                 if ch["start"] <= mid_t <= ch["end"]:
                     ch_idx = ci
+                    if anim_mode != "instant_cut" and anim_mode != "typewriter_reveal":
+                        dt_a = mid_t - ch["start"]
+                        anim_bucket = 4 if dt_a >= 0.22 else min(3, int(dt_a / 0.055))
                     for wi, w in enumerate(ch["words"]):
                         if w["start"] <= mid_t <= w["end"]:
                             word_idx = wi
@@ -1586,6 +2045,7 @@ def build_caption_ffconcat(
         if (
             ch_idx == -1
             and not hook_vis
+            and not cold_open_vis
             and bar_bucket == -1
             and cta_bucket == -1
             and turn_idx == -1
@@ -1597,7 +2057,7 @@ def build_caption_ffconcat(
             fname = "blank.png"
         else:
             state_key = (
-                ch_idx, word_idx, hook_vis, bar_bucket, cta_bucket,
+                ch_idx, word_idx, anim_bucket, hook_vis, cold_open_vis, bar_bucket, cta_bucket,
                 turn_idx, callout_state, face_bucket, chap_idx, chap_ease, spec_bucket, handle_bucket
             )
             fname = state_to_filename.get(state_key, "")
@@ -1617,6 +2077,9 @@ def build_caption_ffconcat(
                     retention_bar_color=retention_bar_color,
                     outro_cta_enabled=outro_cta_enabled,
                     outro_cta_text=outro_cta_text,
+                    outro_cta_headline=outro_cta_headline,
+                    outro_cta_handle=outro_cta_handle,
+                    outro_logo_path=outro_logo_path,
                     clip_start_time=clip_start_time,
                     clip_duration=dur_total,
                     project_id=project_id,
@@ -1645,6 +2108,12 @@ def build_caption_ffconcat(
                     handle_corner=handle_corner,
                     handle_opacity=handle_opacity,
                     handle_display_mode=handle_display_mode,
+                    cold_open_active=cold_open_active,
+                    cold_open_teaser_dur=co_teaser_end,
+                    caption_animation=caption_animation,
+                    pill_color=pill_color,
+                    pacing_density=pacing_density,
+                    text_case=text_case,
                     **style_kwargs,
                 )
                 img.save(temp_dir / fname, format="PNG")

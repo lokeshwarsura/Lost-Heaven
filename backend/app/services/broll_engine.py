@@ -170,24 +170,46 @@ def suggest_broll_cutaways(
 
 def build_broll_overlay_filter(
     base_video_label: str,
-    broll_specs: List[Tuple[int, float, float, bool]],
+    broll_specs: List[Tuple[Any, ...]],
     target_w: int,
     target_h: int,
     fps: float = 30.0,
     out_label: str = "v_broll",
+    default_layout: str = "fullscreen",
+    reaction_corner: str = "top_right",
 ) -> Tuple[str, str]:
     """
     Overlay B-Roll video/image assets onto `base_video_label` using center-fill crop
     and gentle Ken Burns zoom for still images cleanly inside `[start, end]`.
-    `broll_specs`: list of `(input_idx, start_sec, end_sec, is_image)`.
+    Supports both:
+      - `"fullscreen"`: Full-Screen Cutaway
+      - `"reaction_pip"`: Full-Screen B-Roll + Speaker Reaction rounded PiP card
+    `broll_specs`: list of `(input_idx, start_sec, end_sec, is_image)` or
+      `(input_idx, start_sec, end_sec, is_image, layout)`.
     """
     if not broll_specs:
         return "", base_video_label
 
+    from app.services.reframer import _rounded_pip_alpha_filter, _pip_safe_xy
+
     parts: List[str] = []
     curr_v = base_video_label
 
-    for idx, (in_idx, s_t, e_t, is_image) in enumerate(broll_specs):
+    pip_w = max(96, int(round(target_w * 0.30)) // 2 * 2)
+    pip_h = max(96, int(round(pip_w * 1.15)) // 2 * 2)
+    border_px = 2
+    card_w = pip_w + border_px * 2
+    card_h = pip_h + border_px * 2
+    px, py = _pip_safe_xy(reaction_corner, target_w, target_h, card_w, card_h)
+    round_mask_f = _rounded_pip_alpha_filter(radius=16)
+
+    for idx, spec in enumerate(broll_specs):
+        in_idx = int(spec[0])
+        s_t = float(spec[1])
+        e_t = float(spec[2])
+        is_image = bool(spec[3])
+        seg_layout = str(spec[4] if len(spec) > 4 and spec[4] else default_layout).strip().lower()
+
         seg_dur = max(0.3, e_t - s_t)
         br_lbl = f"broll_in_{idx}"
         out_step = out_label if idx == len(broll_specs) - 1 else f"v_br_{idx}"
@@ -204,9 +226,30 @@ def build_broll_overlay_filter(
                 f"[{in_idx}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
                 f"crop={target_w}:{target_h},trim=0:{seg_dur:.3f},setpts=PTS-STARTPTS+{s_t:.3f}/TB[{br_lbl}]"
             )
-        parts.append(
-            f"[{curr_v}][{br_lbl}]overlay=0:0:enable='between(t,{s_t:.3f},{e_t:.3f})':eof_action=pass[{out_step}]"
-        )
+
+        if seg_layout == "reaction_pip":
+            base_s = f"v_br_main_{idx}"
+            pip_src = f"v_br_pip_{idx}"
+            pip_card = f"v_br_card_{idx}"
+            mid_s = f"v_br_mid_{idx}"
+            parts.append(f"[{curr_v}]split=2[{base_s}][{pip_src}]")
+            parts.append(
+                f"[{base_s}][{br_lbl}]overlay=0:0:enable='between(t,{s_t:.3f},{e_t:.3f})':eof_action=pass[{mid_s}]"
+            )
+            parts.append(
+                f"[{pip_src}]crop=iw*0.72:ih*0.62:iw*0.14:ih*0.10,"
+                f"scale={pip_w}:{pip_h}:force_original_aspect_ratio=increase,"
+                f"crop={pip_w}:{pip_h},format=rgba,"
+                f"pad={card_w}:{card_h}:{border_px}:{border_px}:0xFFFFFFD8,"
+                f"{round_mask_f}[{pip_card}]"
+            )
+            parts.append(
+                f"[{mid_s}][{pip_card}]overlay={px}:{py}:enable='between(t,{s_t:.3f},{e_t:.3f})':eof_action=pass[{out_step}]"
+            )
+        else:
+            parts.append(
+                f"[{curr_v}][{br_lbl}]overlay=0:0:enable='between(t,{s_t:.3f},{e_t:.3f})':eof_action=pass[{out_step}]"
+            )
         curr_v = out_step
 
     return ";".join(parts), curr_v

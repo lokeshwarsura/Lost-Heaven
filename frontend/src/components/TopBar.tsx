@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Upload, Link2, Sliders, Type, Film, X, Loader2, Layers, Search, Undo2, Redo2, Keyboard } from 'lucide-react';
+import { Upload, Link2, Sliders, Type, Film, X, Loader2, Layers, Search, Undo2, Redo2, Keyboard, Sparkles } from 'lucide-react';
 import { StudioProfile } from '../types';
 
 interface TopBarProps {
@@ -13,11 +13,15 @@ interface TopBarProps {
   onApplyProfile?: (profile: StudioProfile) => void;
   onSaveProfile?: (name: string) => void;
   onOpenTranscriptSearch?: () => void;
+  onOpenAnalysisWorkstation?: () => void;
   canUndo?: boolean;
   canRedo?: boolean;
   onUndo?: () => void;
   onRedo?: () => void;
   onOpenShortcuts?: () => void;
+  isOfflineMultimodal?: boolean;
+  geminiConfigured?: boolean;
+  onOpenEngineModal?: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -31,11 +35,15 @@ export const TopBar: React.FC<TopBarProps> = ({
   onApplyProfile,
   onSaveProfile,
   onOpenTranscriptSearch,
+  onOpenAnalysisWorkstation,
   canUndo = false,
   canRedo = false,
   onUndo,
   onRedo,
-  onOpenShortcuts
+  onOpenShortcuts,
+  isOfflineMultimodal = false,
+  geminiConfigured = false,
+  onOpenEngineModal,
 }) => {
   const [ytUrl, setYtUrl] = useState('');
   const [showYtPopover, setShowYtPopover] = useState(false);
@@ -70,6 +78,48 @@ export const TopBar: React.FC<TopBarProps> = ({
             Studio
           </span>
         </div>
+
+        {onOpenEngineModal ? (
+          <button
+            type="button"
+            onClick={onOpenEngineModal}
+            className={`hidden lg:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold border transition shrink-0 cursor-pointer hover:brightness-110 ${
+              isOfflineMultimodal
+                ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-400'
+                : geminiConfigured
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)]/40 text-[var(--accent-primary)]'
+                : 'bg-amber-500/15 border-amber-500/40 text-amber-400'
+            }`}
+            title="Click to switch between Gemini Cloud AI and 100% Offline Multimodal AI Mode"
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isOfflineMultimodal
+                  ? 'bg-emerald-400 animate-pulse'
+                  : geminiConfigured
+                  ? 'bg-[var(--accent-primary)]'
+                  : 'bg-amber-400 animate-pulse'
+              }`}
+            />
+            <span>
+              {isOfflineMultimodal
+                ? 'Offline Multimodal AI · Local'
+                : geminiConfigured
+                ? 'Gemini AI · Connected'
+                : 'Gemini AI · Setup Needed'}
+            </span>
+          </button>
+        ) : (
+          isOfflineMultimodal && (
+            <span
+              className="hidden lg:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/35 text-emerald-400 text-[10px] font-bold shrink-0"
+              title="Cloud Gemini offline/disabled — running 100% local facial, vocal & acoustic multimodal clipping"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+              Offline Multimodal AI · Local
+            </span>
+          )
+        )}
 
         {projectTitle && (
           <>
@@ -186,6 +236,18 @@ export const TopBar: React.FC<TopBarProps> = ({
               </button>
             )}
           </div>
+        )}
+
+        {onOpenAnalysisWorkstation && (
+          <button
+            type="button"
+            onClick={onOpenAnalysisWorkstation}
+            className="flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-xs font-semibold text-[var(--text-primary)] bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/50 border border-[var(--border-subtle)] transition shrink-0"
+            title="Open AI Video & Audio Analysis + Best-Frame Workstation"
+          >
+            <Sparkles className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+            <span className="hidden xl:inline">AI Analysis &amp; Best Frames</span>
+          </button>
         )}
 
         {onOpenTranscriptSearch && (

@@ -10,6 +10,7 @@ import numpy as np
 
 from app.config import settings
 from app.services.face_tracker import detect_faces_offline
+from app.services.filters import build_depth_pop_foreground_filter
 from app.services.proxy import get_ffmpeg_cmd
 from app.services.reframer import hex_to_ffmpeg_color
 
@@ -300,6 +301,7 @@ def generate_clip_matte_video_and_backdrop(
     backdrop_mode: str,
     blur_intensity: float = 18.0,
     backdrop_color: str = "#18181B",
+    depth_pop: float = 0.0,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Sample framed `[v]` video frames via FFmpeg pipe at low cost, compute temporal-smoothed
@@ -308,7 +310,8 @@ def generate_clip_matte_video_and_backdrop(
     Returns `(matte_filename, static_backdrop_filename_or_None)`.
     """
     mode = canonicalize_backdrop_mode(backdrop_mode)
-    if mode == "none":
+    d_pop = max(0.0, min(1.0, float(depth_pop or 0.0)))
+    if mode == "none" and d_pop <= 0.01:
         return None, None
 
     ffmpeg = get_ffmpeg_cmd()
@@ -403,37 +406,48 @@ def append_backdrop_filter_stage(
     target_h: int,
     blur_intensity: float = 18.0,
     static_bg_input_idx: Optional[int] = None,
+    depth_pop: float = 0.0,
     out_label: str = "v_backdrop",
 ) -> str:
     """
-    Append true FFmpeg `alphamerge` + `overlay` filtergraph nodes into `fg_segments`.
+    Append true FFmpeg `alphamerge` + `overlay` filtergraph nodes into `fg_segments`,
+    supporting Virtual Backdrops as well as f/1.8 Subject Depth Pop (`depth_pop`).
     Returns new video stream label.
     """
     mode = canonicalize_backdrop_mode(backdrop_mode)
+    d_pop = max(0.0, min(1.0, float(depth_pop or 0.0)))
     sigma = max(4.0, min(50.0, float(blur_intensity or 18.0)))
+    if mode == "none" and d_pop > 0.01:
+        sigma = 4.0 + d_pop * 18.0
+    elif d_pop > 0.01:
+        sigma = min(50.0, sigma + d_pop * 8.0)
+
     fg_lbl = f"fg_src_{matte_input_idx}"
     fg_rgba = f"fg_rgba_{matte_input_idx}"
     matte_fmt = f"matte_g_{matte_input_idx}"
     bg_lbl = f"bg_layer_{matte_input_idx}"
+    pop_f = build_depth_pop_foreground_filter(d_pop)
+    fg_post = f"{pop_f},format=rgba" if pop_f else "format=rgba"
 
     fg_segments.append(f"[{matte_input_idx}:v]scale={target_w}:{target_h},format=gray[{matte_fmt}]")
 
     if static_bg_input_idx is not None:
         fg_segments.append(f"[{static_bg_input_idx}:v]scale={target_w}:{target_h},format=yuv420p[{bg_lbl}]")
-        fg_segments.append(f"[{curr_v_lbl}]format=rgba[{fg_lbl}]")
+        fg_segments.append(f"[{curr_v_lbl}]{fg_post}[{fg_lbl}]")
     elif mode == "gameplay_blur":
         fg_segments.append(f"[{curr_v_lbl}]split=2[{fg_lbl}_raw][{bg_lbl}_src]")
         fg_segments.append(
             f"[{bg_lbl}_src]crop=iw/1.12:ih/1.12:(iw-iw/1.12)/2:(ih-ih/1.12)/2,"
             f"scale={target_w}:{target_h},gblur=sigma={sigma * 1.25:.1f},eq=brightness=-0.06[{bg_lbl}]"
         )
-        fg_segments.append(f"[{fg_lbl}_raw]format=rgba[{fg_lbl}]")
+        fg_segments.append(f"[{fg_lbl}_raw]{fg_post}[{fg_lbl}]")
     else:
+        bg_darken = -0.05 - 0.03 * d_pop
         fg_segments.append(f"[{curr_v_lbl}]split=2[{fg_lbl}_raw][{bg_lbl}_src]")
         fg_segments.append(
-            f"[{bg_lbl}_src]gblur=sigma={sigma:.1f},eq=brightness=-0.05[{bg_lbl}]"
+            f"[{bg_lbl}_src]gblur=sigma={sigma:.1f},eq=brightness={bg_darken:.3f}[{bg_lbl}]"
         )
-        fg_segments.append(f"[{fg_lbl}_raw]format=rgba[{fg_lbl}]")
+        fg_segments.append(f"[{fg_lbl}_raw]{fg_post}[{fg_lbl}]")
 
     fg_segments.append(f"[{fg_lbl}][{matte_fmt}]alphamerge[{fg_rgba}]")
     fg_segments.append(f"[{bg_lbl}][{fg_rgba}]overlay=0:0:shortest=1[{out_label}]")

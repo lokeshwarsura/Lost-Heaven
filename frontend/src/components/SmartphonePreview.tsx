@@ -2,12 +2,10 @@ import React, { useRef, useState, useEffect } from 'react';
 import {
   Play, Pause, RefreshCw, Eye, Smartphone, Heart, MessageCircle,
   Share2, Music, Volume2, VolumeX, Download, Zap, CheckCircle2, Loader2, X, Scissors,
-  Sparkles, Package, Copy, Check, Activity, Trash2, Image as ImageIcon, Shield
+  Sparkles, Package, Copy, Check, Activity, Trash2, Image as ImageIcon, Shield,
+  Crop, Crosshair, Lock, Unlock, Move, RotateCcw
 } from 'lucide-react';
-import {
-  ViralClip, PlatformCopyMap, RetentionAuditReport, RetentionWarning,
-  PrivacyBlurBox, PreflightReport
-} from '../types';
+import { ViralClip, PlatformCopyMap, RetentionAuditReport, RetentionWarning, PrivacyBlurBox, PreflightReport, PreflightCheck, FramingOverride, BestFrameItem } from '../types';
 import { api } from '../api/client';
 
 const YouTubeIcon = ({ className = 'w-4 h-4' }: { className?: string }) => (
@@ -82,6 +80,7 @@ function mapMasterToRel(masterT: number, segs: SegPair[], crossfadeSec = 0.03): 
 
 interface SmartphonePreviewProps {
   clip: ViralClip | null;
+  activeStep?: 1 | 2 | 3;
   videoUrl?: string;
   safeZoneGuide: string;
   onSafeZoneChange: (guide: string) => void;
@@ -102,12 +101,18 @@ interface SmartphonePreviewProps {
   onTrimClip?: (clipId: number, startTime: number, endTime: number) => void | Promise<void>;
   onUpdateSegments?: (clipId: number, keepSegments: [number, number][]) => void | Promise<void>;
   onApplyFixClip?: (clipId: number, updates: Partial<ViralClip>) => void | Promise<void>;
+  onUpdateClip?: (updates: Partial<ViralClip>) => void;
+  onOpenAnalysisWorkstation?: () => void;
+  externalThumbRequest?: { timestamp: number; seq: number } | null;
+  compareOriginal?: boolean;
+  onCompareOriginalChange?: (held: boolean) => void;
   isRendering: boolean;
   renderProgress: number;
 }
 
 export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   clip,
+  activeStep = 1,
   videoUrl,
   safeZoneGuide,
   onSafeZoneChange,
@@ -119,6 +124,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   onTrimClip,
   onUpdateSegments,
   onApplyFixClip,
+  onUpdateClip,
+  onOpenAnalysisWorkstation,
+  externalThumbRequest,
+  compareOriginal = false,
+  onCompareOriginalChange,
   isRendering,
   renderProgress
 }) => {
@@ -167,17 +177,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const [duration, setDuration] = useState(30);
   const [showExactFrame, setShowExactFrame] = useState(false);
   const [exactFrameUrl, setExactFrameUrl] = useState<string | null>(null);
+  const [rawFrameUrl, setRawFrameUrl] = useState<string | null>(null);
+  const rawFrameCacheRef = useRef<Record<string, string>>({});
   const [frameLatencyMs, setFrameLatencyMs] = useState<number | null>(null);
   const [isRenderingFrame, setIsRenderingFrame] = useState(false);
 
   // YouTube Publish Modal state
   const [isPublishModalOpen, setIsPublishModalOpen] = useState(false);
-
-  // Platform Safe-Zone & Demonetization Pre-Flight Scanner state
-  const [preflightReport, setPreflightReport] = useState<PreflightReport | null>(null);
-  const [isPreflightOpen, setIsPreflightOpen] = useState(false);
-  const [isPreflightLoading, setIsPreflightLoading] = useState(false);
-  const [fixingPreflightId, setFixingPreflightId] = useState<string | null>(null);
 
   // Depth-Layered AI Thumbnail Studio state
   const [isThumbModalOpen, setIsThumbModalOpen] = useState(false);
@@ -188,6 +194,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const [thumbRimGlow, setThumbRimGlow] = useState(true);
   const [thumbAccentColor, setThumbAccentColor] = useState('#C6F32F');
   const [thumbUsePlayhead, setThumbUsePlayhead] = useState(false);
+  const [thumbCustomTimestamp, setThumbCustomTimestamp] = useState<number | null>(null);
+  const [thumbBestFrames, setThumbBestFrames] = useState<BestFrameItem[]>([]);
   const [isGeneratingThumb, setIsGeneratingThumb] = useState(false);
   const [thumbError, setThumbError] = useState<string | null>(null);
   const [thumbResult, setThumbResult] = useState<{
@@ -201,6 +209,31 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   // Interactive Privacy / HUD Blur Box Drag & Resize state
   const previewStageBoxRef = useRef<HTMLDivElement>(null);
   const [blurDraftBoxes, setBlurDraftBoxes] = useState<PrivacyBlurBox[] | null>(null);
+  const [isEditFrameOpen, setIsEditFrameOpen] = useState(false);
+  const [sourceFrameUrl, setSourceFrameUrl] = useState<string | null>(null);
+  const [frameBoxDraft, setFrameBoxDraft] = useState<{
+    webcam_box: { x: number; y: number; w: number; h: number };
+    focus_anchor: { x: number; y: number };
+    lock_camera: boolean;
+  }>({
+    webcam_box: { x: 0.02, y: 0.02, w: 0.28, h: 0.30 },
+    focus_anchor: { x: 0.5, y: 0.42 },
+    lock_camera: false,
+  });
+  const frameBoxCanvasRef = useRef<HTMLDivElement>(null);
+  const frameDragRef = useRef<{
+    target: 'box_move' | 'box_nw' | 'box_ne' | 'box_sw' | 'box_se' | 'anchor';
+    startX: number;
+    startY: number;
+    origBox: { x: number; y: number; w: number; h: number };
+    origAnchor: { x: number; y: number };
+    latest: {
+      webcam_box: { x: number; y: number; w: number; h: number };
+      focus_anchor: { x: number; y: number };
+      lock_camera: boolean;
+    };
+  } | null>(null);
+  const [draggingFrameMode, setDraggingFrameMode] = useState<string | null>(null);
   const blurDragRef = useRef<{
     idx: number;
     kind: 'move' | 'resize';
@@ -210,42 +243,218 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     latest: PrivacyBlurBox[];
   } | null>(null);
   const [draggingBlurIdx, setDraggingBlurIdx] = useState<number | null>(null);
+  const [freeformCaptionMode, setFreeformCaptionMode] = useState<boolean>(activeStep === 2);
+  const [captionDragDraft, setCaptionDragDraft] = useState<{ x: number; y: number } | null>(null);
+  const [isDraggingCaption, setIsDraggingCaption] = useState<boolean>(false);
+  const captionDragRef = useRef<{
+    startX: number;
+    startY: number;
+    origX: number;
+    origY: number;
+    latestX: number;
+    latestY: number;
+  } | null>(null);
+
+  useEffect(() => {
+    setFreeformCaptionMode(activeStep === 2);
+  }, [activeStep]);
+
+  useEffect(() => {
+    setCaptionDragDraft(null);
+  }, [clip?.id, clip?.caption_x, clip?.caption_y, clip?.position_x, clip?.position_y]);
+
+  useEffect(() => {
+    if (!isDraggingCaption || !clip) return;
+    const onMove = (ev: PointerEvent) => {
+      const dr = captionDragRef.current;
+      const box = previewStageBoxRef.current;
+      if (!dr || !box) return;
+      const rect = box.getBoundingClientRect();
+      const dx = (ev.clientX - dr.startX) / Math.max(1, rect.width);
+      const dy = (ev.clientY - dr.startY) / Math.max(1, rect.height);
+      let nx = Math.max(0.05, Math.min(0.95, dr.origX + dx));
+      let ny = Math.max(0.08, Math.min(0.92, dr.origY + dy));
+      // Magnetic center snap within +/- 2.5%
+      if (Math.abs(nx - 0.5) <= 0.025) nx = 0.5;
+      if (Math.abs(ny - 0.5) <= 0.025) ny = 0.5;
+      nx = Number(nx.toFixed(3));
+      ny = Number(ny.toFixed(3));
+      dr.latestX = nx;
+      dr.latestY = ny;
+      setCaptionDragDraft({ x: nx, y: ny });
+    };
+    const onUp = () => {
+      const dr = captionDragRef.current;
+      captionDragRef.current = null;
+      setIsDraggingCaption(false);
+      if (dr && clip) {
+        const capPatch: Partial<ViralClip> = {
+          caption_x: dr.latestX,
+          caption_y: dr.latestY,
+          position_x: Math.round(dr.latestX * 100),
+          position_y: Math.round(dr.latestY * 100),
+          position_grid: Math.abs(dr.latestX - 0.5) < 0.03 && Math.abs(dr.latestY - 0.5) < 0.03
+            ? 'center'
+            : clip.position_grid,
+        };
+        if (onUpdateClip) onUpdateClip(capPatch);
+        else if (onApplyFixClip) void onApplyFixClip(clip.id, capPatch);
+      }
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [isDraggingCaption, clip?.id, onUpdateClip, onApplyFixClip]);
 
   useEffect(() => {
     setBlurDraftBoxes(null);
   }, [clip?.id, JSON.stringify(clip?.privacy_blur_boxes || [])]);
 
   useEffect(() => {
-    if (!clip) {
-      setPreflightReport(null);
-      return;
+    if (!clip) return;
+    const ov = clip.framing_override;
+    const cam = clip.source_webcam_region;
+    setFrameBoxDraft({
+      webcam_box: ov?.webcam_box
+        ? { ...ov.webcam_box }
+        : cam && cam.w > 0.05 && cam.h > 0.05
+          ? { x: cam.x, y: cam.y, w: cam.w, h: cam.h }
+          : { x: 0.02, y: 0.02, w: 0.28, h: 0.30 },
+      focus_anchor: ov?.focus_anchor
+        ? { ...ov.focus_anchor }
+        : { x: cam?.face_cx ?? 0.5, y: cam?.face_cy ?? 0.42 },
+      lock_camera: Boolean(ov?.lock_camera),
+    });
+  }, [clip?.id, JSON.stringify(clip?.framing_override || null)]);
+
+  const persistFramingOverride = async (next: {
+    webcam_box?: { x: number; y: number; w: number; h: number };
+    focus_anchor?: { x: number; y: number };
+    lock_camera?: boolean;
+    reset?: boolean;
+  }) => {
+    if (!clip) return;
+    try {
+      const res = await api.updateFramingOverride(clip.project_id, clip.id, next);
+      if (onApplyFixClip) {
+        await onApplyFixClip(clip.id, {
+          framing_override: res.framing_override as FramingOverride | null,
+          source_webcam_region: res.source_webcam_region ?? clip.source_webcam_region,
+        });
+      }
+    } catch (err) {
+      console.error('Failed to persist framing override:', err);
     }
+  };
+
+  useEffect(() => {
+    if (!isEditFrameOpen || !clip) return;
     let cancelled = false;
-    setIsPreflightLoading(true);
-    api
-      .getClipPreflight(clip.project_id, clip.id)
-      .then((rep) => {
-        if (!cancelled) setPreflightReport(rep as PreflightReport);
-      })
-      .catch(() => null)
-      .finally(() => {
-        if (!cancelled) setIsPreflightLoading(false);
-      });
+    const segs: SegPair[] = resolveClipKeepSegments(clip);
+    const { masterT } = mapRelToMasterAndSeg(relCurrentRef.current, segs, clip.merge_crossfade_sec ?? 0.03);
+    Promise.all([
+      api.getFramingMap(clip.project_id, clip.id, false).catch(() => null),
+      api.getPreviewFrame({
+        clip_id: clip.id,
+        project_id: clip.project_id,
+        timestamp: Math.max(0, masterT),
+        aspect_ratio: '16:9',
+        frame_layout: 'fit_blur',
+        burn_captions: false,
+        show_hook_banner: false,
+        clip_size: '540p',
+      }).catch(() => null),
+    ]).then(([fmap, pframe]) => {
+      if (cancelled) return;
+      if (pframe?.frame_url) setSourceFrameUrl(pframe.frame_url);
+      if (fmap) {
+        const ov = fmap.framing_override;
+        const cam = fmap.source_webcam_region || fmap.visual_map?.webcam;
+        const sh = fmap.visual_map?.shots?.[0];
+        setFrameBoxDraft({
+          webcam_box: ov?.webcam_box
+            ? { ...ov.webcam_box }
+            : cam && cam.w > 0.05 && cam.h > 0.05
+              ? { x: cam.x, y: cam.y, w: cam.w, h: cam.h }
+              : { x: 0.02, y: 0.02, w: 0.28, h: 0.30 },
+          focus_anchor: ov?.focus_anchor
+            ? { ...ov.focus_anchor }
+            : { x: sh?.cx ?? 0.5, y: sh?.cy ?? 0.42 },
+          lock_camera: Boolean(ov?.lock_camera),
+        });
+      }
+    });
     return () => {
       cancelled = true;
     };
-  }, [
-    clip?.id,
-    clip?.burn_captions,
-    clip?.censor_profanity,
-    clip?.normalize_audio,
-    clip?.audio_volume,
-    clip?.position_x,
-    clip?.position_y,
-    clip?.aspect_ratio,
-    clip?.spectrum_enabled,
-    clip?.spectrum_position,
-  ]);
+  }, [isEditFrameOpen, clip?.id]);
+
+  useEffect(() => {
+    if (!draggingFrameMode || !clip) return;
+    const onMove = (ev: PointerEvent) => {
+      const dr = frameDragRef.current;
+      const el = frameBoxCanvasRef.current;
+      if (!dr || !el) return;
+      const rect = el.getBoundingClientRect();
+      const dx = (ev.clientX - dr.startX) / Math.max(1, rect.width);
+      const dy = (ev.clientY - dr.startY) / Math.max(1, rect.height);
+      const b = { ...dr.origBox };
+      let anchor = { ...dr.origAnchor };
+      if (dr.target === 'anchor') {
+        anchor = {
+          x: Number(Math.max(0.05, Math.min(0.95, dr.origAnchor.x + dx)).toFixed(3)),
+          y: Number(Math.max(0.05, Math.min(0.95, dr.origAnchor.y + dy)).toFixed(3)),
+        };
+      } else if (dr.target === 'box_move') {
+        b.x = Number(Math.max(0, Math.min(1 - b.w, dr.origBox.x + dx)).toFixed(3));
+        b.y = Number(Math.max(0, Math.min(1 - b.h, dr.origBox.y + dy)).toFixed(3));
+      } else if (dr.target === 'box_se') {
+        b.w = Number(Math.max(0.08, Math.min(1 - b.x, dr.origBox.w + dx)).toFixed(3));
+        b.h = Number(Math.max(0.08, Math.min(1 - b.y, dr.origBox.h + dy)).toFixed(3));
+      } else if (dr.target === 'box_nw') {
+        const nx = Math.max(0, Math.min(dr.origBox.x + dr.origBox.w - 0.08, dr.origBox.x + dx));
+        const ny = Math.max(0, Math.min(dr.origBox.y + dr.origBox.h - 0.08, dr.origBox.y + dy));
+        b.w = Number((dr.origBox.x + dr.origBox.w - nx).toFixed(3));
+        b.h = Number((dr.origBox.y + dr.origBox.h - ny).toFixed(3));
+        b.x = Number(nx.toFixed(3));
+        b.y = Number(ny.toFixed(3));
+      } else if (dr.target === 'box_ne') {
+        const ny = Math.max(0, Math.min(dr.origBox.y + dr.origBox.h - 0.08, dr.origBox.y + dy));
+        b.w = Number(Math.max(0.08, Math.min(1 - b.x, dr.origBox.w + dx)).toFixed(3));
+        b.h = Number((dr.origBox.y + dr.origBox.h - ny).toFixed(3));
+        b.y = Number(ny.toFixed(3));
+      } else if (dr.target === 'box_sw') {
+        const nx = Math.max(0, Math.min(dr.origBox.x + dr.origBox.w - 0.08, dr.origBox.x + dx));
+        b.w = Number((dr.origBox.x + dr.origBox.w - nx).toFixed(3));
+        b.x = Number(nx.toFixed(3));
+        b.h = Number(Math.max(0.08, Math.min(1 - b.y, dr.origBox.h + dy)).toFixed(3));
+      }
+      const next = { ...dr.latest, webcam_box: b, focus_anchor: anchor };
+      dr.latest = next;
+      setFrameBoxDraft(next);
+    };
+    const onUp = () => {
+      const dr = frameDragRef.current;
+      setDraggingFrameMode(null);
+      frameDragRef.current = null;
+      if (dr) {
+        void persistFramingOverride({
+          webcam_box: dr.latest.webcam_box,
+          focus_anchor: dr.latest.focus_anchor,
+          lock_camera: dr.latest.lock_camera,
+        });
+      }
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+  }, [draggingFrameMode, clip?.id]);
 
   useEffect(() => {
     if (draggingBlurIdx === null || !clip) return;
@@ -318,6 +527,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const [isAuditing, setIsAuditing] = useState(false);
   const [auditError, setAuditError] = useState<string | null>(null);
   const [retentionAudit, setRetentionAudit] = useState<RetentionAuditReport | null>(null);
+  const [isPreflightOpen, setIsPreflightOpen] = useState(false);
+  const [isRunningPreflight, setIsRunningPreflight] = useState(false);
+  const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [preflightReport, setPreflightReport] = useState<PreflightReport | null>(null);
   const [draggingHandle, setDraggingHandle] = useState<'in' | 'out' | null>(null);
   const trimDraftRef = useRef<{ start: number; end: number }>({
     start: clip?.start_time ?? 0,
@@ -333,7 +546,30 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     setRetentionAudit(null);
     setAuditError(null);
     setIsAuditOpen(false);
+    setPreflightReport(null);
+    setPreflightError(null);
+    setIsPreflightOpen(false);
   }, [clip?.id]);
+
+  const handleRunPreflight = async (forceKeepOpen = true) => {
+    if (!clip) return;
+    if (forceKeepOpen) setIsPreflightOpen(true);
+    setIsRunningPreflight(true);
+    setPreflightError(null);
+    try {
+      const report = await api.getClipPreflight(clip.project_id, clip.id);
+      setPreflightReport(report as PreflightReport);
+    } catch (err: any) {
+      setPreflightError(err?.message || 'Pre-flight safety scan failed');
+    } finally {
+      setIsRunningPreflight(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!clip || !isPreflightOpen) return;
+    void handleRunPreflight(false);
+  }, [clip?.id, isPreflightOpen]);
 
   useEffect(() => {
     if (!clip?.id || !clip?.project_id) {
@@ -425,20 +661,54 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const resolvedUrl = clip?.video_url || videoUrl;
   const clipIsRendered = Boolean(
     clip &&
-      (clip.status === 'ready' || clip.render_status === 'completed') &&
-      (clip.rendered_path ||
-        clip.rendered_video_path ||
-        (resolvedUrl && !resolvedUrl.includes('/media/masters/')))
+    (clip.status === 'ready' || clip.render_status === 'completed') &&
+    (clip.rendered_path ||
+      clip.rendered_video_path ||
+      (resolvedUrl && !resolvedUrl.includes('/media/masters/')))
   );
   const activeVideoSrc = clipIsRendered ? resolvedUrl : undefined;
 
   useEffect(() => {
-    if (seekTime !== undefined && videoRef.current && clip && clipIsRendered) {
-      videoRef.current.currentTime = seekTime;
+    if (seekTime !== undefined && clip) {
       setCurrentTime(seekTime);
       onPlaybackTimeChange?.(seekTime);
+      setShowExactFrame(false);
+      if (videoRef.current && clipIsRendered) {
+        videoRef.current.currentTime = seekTime;
+      }
     }
   }, [seekTime]);
+
+  useEffect(() => {
+    if (!externalThumbRequest || !clip) return;
+    setThumbHeadline(clip.hook_headline || clip.selected_title || 'WATCH THIS');
+    setThumbFormat(clip.aspect_ratio === '16:9' ? '16:9' : '9:16');
+    setThumbAccentColor(clip.active_color || '#C6F32F');
+    setThumbUsePlayhead(false);
+    setThumbCustomTimestamp(externalThumbRequest.timestamp);
+    setThumbError(null);
+    setIsThumbModalOpen(true);
+  }, [externalThumbRequest?.seq]);
+
+  useEffect(() => {
+    if (!isThumbModalOpen || !clip) return;
+    if (Array.isArray(clip.best_frames) && clip.best_frames.length > 0) {
+      setThumbBestFrames(clip.best_frames);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getBestFrames(clip.project_id, clip.id)
+      .then((res) => {
+        if (!cancelled && Array.isArray(res?.frames)) {
+          setThumbBestFrames(res.frames);
+        }
+      })
+      .catch(() => { });
+    return () => {
+      cancelled = true;
+    };
+  }, [isThumbModalOpen, clip?.id]);
 
   // Force clean <video> reload & reset playback position whenever active clip or rendered URL changes
   useEffect(() => {
@@ -480,7 +750,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       setIsPlaying(false);
     } else {
       setShowExactFrame(false);
-      videoRef.current.play().catch(() => {});
+      videoRef.current.play().catch(() => { });
       setIsPlaying(true);
     }
   };
@@ -534,8 +804,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       typeof targetIdx === 'number'
         ? targetIdx
         : selectedSegIdx !== null
-        ? selectedSegIdx
-        : mapRelToMasterAndSeg(relCurrentRef.current, keepSegments, xfade).segIdx;
+          ? selectedSegIdx
+          : mapRelToMasterAndSeg(relCurrentRef.current, keepSegments, xfade).segIdx;
     if (idx < 0 || idx >= keepSegments.length) return;
     const nextSegs = keepSegments.filter((_, i) => i !== idx);
     setKeepSegments(nextSegs);
@@ -613,7 +883,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       if (detail.type === 'togglePlay' && vid) {
         if (vid.paused) {
           setShowExactFrame(false);
-          vid.play().catch(() => {});
+          vid.play().catch(() => { });
           setIsPlaying(true);
         } else {
           vid.pause();
@@ -704,6 +974,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         webcam_corner: clip.webcam_corner,
         webcam_split_ratio: clip.webcam_split_ratio,
         pip_border_color: clip.pip_border_color,
+        source_webcam_region: clip.source_webcam_region,
+        framing_override: clip.framing_override,
         clip_size: clip.clip_size,
         export_resolution: clip.clip_size,
         watermark_path: clip.watermark_path,
@@ -714,10 +986,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         pan_x_offset: clip.pan_x_offset,
         pan_x: Math.round((clip.pan_x_offset || 0) * 100),
         color_preset: clip.color_preset,
+        preset_intensity: clip.preset_intensity,
         exposure: clip.exposure,
         brightness: clip.brightness,
         contrast: clip.contrast,
         lift_mids: clip.lift_mids,
+        highlights: clip.highlights,
+        shadows: clip.shadows,
         warmth: clip.warmth,
         saturation: clip.saturation,
         black_and_white: clip.black_and_white,
@@ -732,6 +1007,16 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         film_grain: clip.film_grain,
         vignette: typeof clip.vignette === 'number' ? clip.vignette : clip.vignette ? 1.0 : 0.0,
         bottom_fade: clip.bottom_fade,
+        color_temp: clip.color_temp,
+        tint_shift: clip.tint_shift,
+        vibrance: clip.vibrance,
+        matte_fade: clip.matte_fade,
+        halation_glow: clip.halation_glow,
+        lut_path: clip.lut_path,
+        chroma_split: clip.chroma_split,
+        letterbox: clip.letterbox,
+        speed_ramp: clip.speed_ramp,
+        bypass_color: compareOriginal,
         burn_captions: clip.burn_captions,
         timing_offset: clip.timing_offset,
         caption_style: clip.caption_style,
@@ -745,6 +1030,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         active_color: clip.active_color,
         highlight_color: clip.active_color,
         outline_color: clip.outline_color,
+        pill_color: clip.pill_color,
+        pacing_density: clip.pacing_density,
+        text_case: clip.text_case,
         hold_back_alpha: clip.hold_back_alpha,
         hold_back_opacity: clip.hold_back_alpha,
         highlight_shape: clip.highlight_shape,
@@ -753,6 +1041,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         pos_x: clip.position_x,
         position_y: clip.position_y,
         pos_y: clip.position_y,
+        caption_x: clip.caption_x ?? (clip.position_x ?? 50) / 100,
+        caption_y: clip.caption_y ?? (clip.position_y ?? 76) / 100,
+        caption_rotation: clip.caption_rotation ?? 0,
+        caption_max_width: clip.caption_max_width ?? 0.82,
         outline_width: clip.outline_width,
         outline: clip.outline_width,
         shadow_depth: clip.shadow_depth,
@@ -779,6 +1071,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         retention_bar_color: clip.retention_bar_color,
         outro_cta_enabled: clip.outro_cta_enabled,
         outro_cta_text: clip.outro_cta_text,
+        outro_cta_headline: clip.outro_cta_headline,
+        outro_cta_handle: clip.outro_cta_handle,
+        outro_logo_path: clip.outro_logo_path,
         words: clip.transcript_words,
         keep_segments: keepSegments,
         merge_crossfade_sec: clip.merge_crossfade_sec,
@@ -793,18 +1088,12 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         backdrop_blur_intensity: clip.backdrop_blur_intensity,
         backdrop_color: clip.backdrop_color,
         privacy_blur_boxes: clip.privacy_blur_boxes,
-        beat_sync_enabled: clip.beat_sync_enabled,
-        spectrum_enabled: clip.spectrum_enabled,
-        spectrum_position: clip.spectrum_position,
-        spectrum_color: clip.spectrum_color,
-        chapters_enabled: clip.chapters_enabled,
-        chapters: clip.chapters,
-        handle_watermark_enabled: clip.handle_watermark_enabled,
-        handle_text: clip.handle_text,
-        handle_platform_icon: clip.handle_platform_icon,
-        handle_corner: clip.handle_corner,
-        handle_opacity: clip.handle_opacity,
-        handle_display_mode: clip.handle_display_mode
+        use_cold_open: clip.use_cold_open,
+        cold_open_quote: clip.cold_open_quote,
+        auto_trim_dead_air: clip.auto_trim_dead_air,
+        silence_threshold: clip.silence_threshold,
+        dynamic_punch_zoom: clip.dynamic_punch_zoom,
+        punch_zoom_intensity: clip.punch_zoom_intensity
       });
       setExactFrameUrl(res.frame_url);
       setFrameLatencyMs(res.render_time_ms);
@@ -818,115 +1107,136 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
 
   const previewConfigSig = clip
     ? JSON.stringify({
-        aspect_ratio: clip.aspect_ratio,
-        custom_width: clip.custom_width,
-        custom_height: clip.custom_height,
-        frame_layout: clip.frame_layout,
-        webcam_corner: clip.webcam_corner,
-        zoom: clip.zoom,
-        pan_x_offset: clip.pan_x_offset,
-        color_preset: clip.color_preset,
-        exposure: clip.exposure,
-        brightness: clip.brightness,
-        contrast: clip.contrast,
-        lift_mids: clip.lift_mids,
-        warmth: clip.warmth,
-        saturation: clip.saturation,
-        black_and_white: clip.black_and_white,
-        vintage: clip.vintage,
-        tint_color: clip.tint_color,
-        color_tint: clip.tint_color,
-        tint_strength: clip.tint_strength,
-        glow: clip.glow,
-        smooth: clip.smooth,
-        sharpness: clip.sharpness,
-        blur: clip.blur,
-        film_grain: clip.film_grain,
-        vignette: clip.vignette,
-        bottom_fade: clip.bottom_fade,
-        burn_captions: clip.burn_captions,
-        timing_offset: clip.timing_offset,
-        caption_style: clip.caption_style,
-        caption_font: clip.caption_font,
-        caption_animation: clip.caption_animation,
-        font_size_percent: clip.font_size_percent,
-        base_color: clip.base_color,
-        active_color: clip.active_color,
-        outline_color: clip.outline_color,
-        hold_back_alpha: clip.hold_back_alpha,
-        highlight_shape: clip.highlight_shape,
-        position_grid: clip.position_grid,
-        position_x: clip.position_x,
-        position_y: clip.position_y,
-        outline_width: clip.outline_width,
-        shadow_depth: clip.shadow_depth,
-        glow_intensity: clip.glow_intensity,
-        letter_spacing: clip.letter_spacing,
-        bold: clip.bold,
-        italic: clip.italic,
-        all_caps: clip.all_caps,
-        text_align: clip.text_align,
-        emoji_enabled: clip.emoji_enabled,
-        highlight_power_words: clip.highlight_power_words,
-        how_phrase_arrives: clip.how_phrase_arrives,
-        clean_filler_words: clip.clean_filler_words,
-        censor_profanity: clip.censor_profanity,
-        tighten_pacing: clip.tighten_pacing,
-        silence_threshold: clip.silence_threshold,
-        start_time: clip.start_time,
-        end_time: clip.end_time,
-        show_hook_banner: clip.show_hook_banner,
-        hook_headline: clip.hook_headline,
-        transcript_words: clip.transcript_words,
-        clip_size: clip.clip_size,
-        watermark_path: clip.watermark_path,
-        watermark_corner: clip.watermark_corner,
-        watermark_opacity: clip.watermark_opacity,
-        bgm_path: clip.bgm_path,
-        bgm_volume: clip.bgm_volume,
-        audio_volume: clip.audio_volume,
-        normalize_audio: clip.normalize_audio,
-        vocal_clarity: clip.vocal_clarity,
-        voice_isolation: clip.voice_isolation,
-        auto_sfx: clip.auto_sfx,
-        dynamic_punch_zoom: clip.dynamic_punch_zoom,
-        punch_zoom_intensity: clip.punch_zoom_intensity,
-        retention_bar_enabled: clip.retention_bar_enabled,
-        retention_bar_color: clip.retention_bar_color,
-        outro_cta_enabled: clip.outro_cta_enabled,
-        outro_cta_text: clip.outro_cta_text,
-        broll_segments: clip.broll_segments,
-        keep_segments: clip.keep_segments,
-        merge_crossfade_sec: clip.merge_crossfade_sec,
-        speakers: clip.speakers,
-        speaker_lower_thirds: clip.speaker_lower_thirds,
-        face_safe_captions: clip.face_safe_captions,
-        callout_cards: clip.callout_cards,
-        auto_callouts: clip.auto_callouts,
-        bilingual_enabled: clip.bilingual_enabled,
-        secondary_language: clip.secondary_language,
-        dubbing_enabled: clip.dubbing_enabled,
-        dubbing_language: clip.dubbing_language,
-        dubbing_voice: clip.dubbing_voice,
-        dubbing_bed_volume: clip.dubbing_bed_volume,
-        dubbed_audio_path: clip.dubbed_audio_path,
-        backdrop_mode: clip.backdrop_mode,
-        backdrop_blur_intensity: clip.backdrop_blur_intensity,
-        backdrop_color: clip.backdrop_color,
-        privacy_blur_boxes: clip.privacy_blur_boxes,
-        beat_sync_enabled: clip.beat_sync_enabled,
-        spectrum_enabled: clip.spectrum_enabled,
-        spectrum_position: clip.spectrum_position,
-        spectrum_color: clip.spectrum_color,
-        chapters_enabled: clip.chapters_enabled,
-        chapters: clip.chapters,
-        handle_watermark_enabled: clip.handle_watermark_enabled,
-        handle_text: clip.handle_text,
-        handle_platform_icon: clip.handle_platform_icon,
-        handle_corner: clip.handle_corner,
-        handle_opacity: clip.handle_opacity,
-        handle_display_mode: clip.handle_display_mode
-      })
+      aspect_ratio: clip.aspect_ratio,
+      custom_width: clip.custom_width,
+      custom_height: clip.custom_height,
+      frame_layout: clip.frame_layout,
+      webcam_corner: clip.webcam_corner,
+      webcam_split_ratio: clip.webcam_split_ratio,
+      pip_border_color: clip.pip_border_color,
+      source_webcam_region: clip.source_webcam_region,
+      framing_override: clip.framing_override,
+      zoom: clip.zoom,
+      pan_x_offset: clip.pan_x_offset,
+      color_preset: clip.color_preset,
+      preset_intensity: clip.preset_intensity,
+      export_fps: clip.export_fps,
+      exposure: clip.exposure,
+      brightness: clip.brightness,
+      contrast: clip.contrast,
+      lift_mids: clip.lift_mids,
+      highlights: clip.highlights,
+      shadows: clip.shadows,
+      warmth: clip.warmth,
+      saturation: clip.saturation,
+      black_and_white: clip.black_and_white,
+      vintage: clip.vintage,
+      tint_color: clip.tint_color,
+      color_tint: clip.tint_color,
+      tint_strength: clip.tint_strength,
+      glow: clip.glow,
+      smooth: clip.smooth,
+      sharpness: clip.sharpness,
+      blur: clip.blur,
+      film_grain: clip.film_grain,
+      vignette: clip.vignette,
+      bottom_fade: clip.bottom_fade,
+      color_temp: clip.color_temp,
+      tint_shift: clip.tint_shift,
+      vibrance: clip.vibrance,
+      matte_fade: clip.matte_fade,
+      halation_glow: clip.halation_glow,
+      lut_path: clip.lut_path,
+      chroma_split: clip.chroma_split,
+      letterbox: clip.letterbox,
+      speed_ramp: clip.speed_ramp,
+      voice_eq_preset: clip.voice_eq_preset,
+      de_esser: clip.de_esser,
+      loudness_target: clip.loudness_target,
+      burn_captions: clip.burn_captions,
+      timing_offset: clip.timing_offset,
+      caption_style: clip.caption_style,
+      caption_font: clip.caption_font,
+      caption_animation: clip.caption_animation,
+      font_size_percent: clip.font_size_percent,
+      base_color: clip.base_color,
+      active_color: clip.active_color,
+      outline_color: clip.outline_color,
+      pill_color: clip.pill_color,
+      pacing_density: clip.pacing_density,
+      text_case: clip.text_case,
+      hold_back_alpha: clip.hold_back_alpha,
+      highlight_shape: clip.highlight_shape,
+      position_grid: clip.position_grid,
+      position_x: clip.position_x,
+      position_y: clip.position_y,
+      caption_x: clip.caption_x,
+      caption_y: clip.caption_y,
+      caption_rotation: clip.caption_rotation,
+      caption_max_width: clip.caption_max_width,
+      outline_width: clip.outline_width,
+      shadow_depth: clip.shadow_depth,
+      glow_intensity: clip.glow_intensity,
+      letter_spacing: clip.letter_spacing,
+      bold: clip.bold,
+      italic: clip.italic,
+      all_caps: clip.all_caps,
+      text_align: clip.text_align,
+      emoji_enabled: clip.emoji_enabled,
+      highlight_power_words: clip.highlight_power_words,
+      how_phrase_arrives: clip.how_phrase_arrives,
+      clean_filler_words: clip.clean_filler_words,
+      censor_profanity: clip.censor_profanity,
+      tighten_pacing: clip.tighten_pacing,
+      silence_threshold: clip.silence_threshold,
+      start_time: clip.start_time,
+      end_time: clip.end_time,
+      show_hook_banner: clip.show_hook_banner,
+      hook_headline: clip.hook_headline,
+      transcript_words: clip.transcript_words,
+      clip_size: clip.clip_size,
+      watermark_path: clip.watermark_path,
+      watermark_corner: clip.watermark_corner,
+      watermark_opacity: clip.watermark_opacity,
+      bgm_path: clip.bgm_path,
+      bgm_volume: clip.bgm_volume,
+      audio_volume: clip.audio_volume,
+      normalize_audio: clip.normalize_audio,
+      vocal_clarity: clip.vocal_clarity,
+      voice_isolation: clip.voice_isolation,
+      auto_sfx: clip.auto_sfx,
+      use_cold_open: clip.use_cold_open,
+      cold_open_quote: clip.cold_open_quote,
+      auto_trim_dead_air: clip.auto_trim_dead_air,
+      dynamic_punch_zoom: clip.dynamic_punch_zoom,
+      punch_zoom_intensity: clip.punch_zoom_intensity,
+      retention_bar_enabled: clip.retention_bar_enabled,
+      retention_bar_color: clip.retention_bar_color,
+      outro_cta_enabled: clip.outro_cta_enabled,
+      outro_cta_text: clip.outro_cta_text,
+      outro_cta_headline: clip.outro_cta_headline,
+      outro_cta_handle: clip.outro_cta_handle,
+      outro_logo_path: clip.outro_logo_path,
+      broll_segments: clip.broll_segments,
+      keep_segments: clip.keep_segments,
+      merge_crossfade_sec: clip.merge_crossfade_sec,
+      speakers: clip.speakers,
+      speaker_lower_thirds: clip.speaker_lower_thirds,
+      face_safe_captions: clip.face_safe_captions,
+      callout_cards: clip.callout_cards,
+      auto_callouts: clip.auto_callouts,
+      bilingual_enabled: clip.bilingual_enabled,
+      secondary_language: clip.secondary_language,
+      dubbing_enabled: clip.dubbing_enabled,
+      dubbing_language: clip.dubbing_language,
+      dubbing_voice: clip.dubbing_voice,
+      dubbing_bed_volume: clip.dubbing_bed_volume,
+      dubbed_audio_path: clip.dubbed_audio_path,
+      backdrop_mode: clip.backdrop_mode,
+      backdrop_blur_intensity: clip.backdrop_blur_intensity,
+      backdrop_color: clip.backdrop_color,
+      privacy_blur_boxes: clip.privacy_blur_boxes
+    })
     : '';
 
   useEffect(() => {
@@ -1069,8 +1379,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     { value: 'No guide', label: 'None' },
     { value: 'TikTok', label: 'TikTok' },
     { value: 'Instagram', label: 'Reels' },
-    { value: 'YT Shorts', label: 'Shorts' },
-    { value: 'All', label: 'All' }
+    { value: 'YT Shorts', label: 'Shorts' }
   ];
 
   // Exact aspect ratio math for guaranteed zero-overflow sizing
@@ -1107,16 +1416,77 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     clip && isRenderedSource && lastRenderedHashByClipRef.current[clip.id] === previewConfigSig
   );
 
+  // Fetch cached ungraded reference frame when Compare Original (Hold) is active over baked/exact renders
+  useEffect(() => {
+    if (!compareOriginal || !clip || (!showExactFrame && !videoFilterAlreadyBaked)) {
+      if (!compareOriginal) setRawFrameUrl(null);
+      return;
+    }
+    const cacheKey = `${clip.id}_${relCurrent.toFixed(2)}_${clip.frame_layout}_${clip.aspect_ratio}_${clip.webcam_corner}_${clip.zoom}_${clip.pan_x_offset}`;
+    if (rawFrameCacheRef.current[cacheKey]) {
+      setRawFrameUrl(rawFrameCacheRef.current[cacheKey]);
+      return;
+    }
+    let cancelled = false;
+    const { masterT: absTimestamp } = mapRelToMasterAndSeg(
+      relCurrent,
+      keepSegments,
+      clip.merge_crossfade_sec ?? 0.03
+    );
+    api
+      .getPreviewFrame({
+        clip_id: clip.id,
+        project_id: clip.project_id,
+        timestamp: absTimestamp,
+        clip_rel_ts: relCurrent,
+        aspect_ratio: clip.aspect_ratio,
+        custom_width: clip.custom_width,
+        custom_height: clip.custom_height,
+        frame_layout: clip.frame_layout,
+        framing_template: clip.frame_layout,
+        webcam_corner: clip.webcam_corner,
+        webcam_split_ratio: clip.webcam_split_ratio,
+        pip_border_color: clip.pip_border_color,
+        source_webcam_region: clip.source_webcam_region,
+        framing_override: clip.framing_override,
+        clip_size: clip.clip_size,
+        export_resolution: clip.clip_size,
+        zoom: clip.zoom,
+        pan_x_offset: clip.pan_x_offset,
+        pan_x: Math.round((clip.pan_x_offset || 0) * 100),
+        bypass_color: true,
+        burn_captions: clip.burn_captions,
+      })
+      .then((res) => {
+        if (cancelled) return;
+        const rawUrl = res.frame_url.startsWith('http')
+          ? res.frame_url
+          : `http://127.0.0.1:8000${res.frame_url}`;
+        rawFrameCacheRef.current[cacheKey] = rawUrl;
+        setRawFrameUrl(rawUrl);
+      })
+      .catch(() => {
+        // Fallback smoothly to CSS filter bypass
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [compareOriginal, clip?.id, relCurrent, showExactFrame, videoFilterAlreadyBaked]);
+
   const videoCssFilter =
-    clip && !videoFilterAlreadyBaked
-      ? (() => {
-          const b = Math.max(0.25, 1 + (clip.brightness || 0) + (clip.exposure || 0) * 0.65);
-          const c = Math.max(0.3, clip.contrast || 1.0);
+    compareOriginal
+      ? 'none'
+      : clip && !videoFilterAlreadyBaked
+        ? (() => {
+          const expShift = (clip.exposure || 0) * 0.65 + (clip.shadows || 0) / 500 + (clip.highlights || 0) / 600;
+          const b = Math.max(0.25, 1 + (clip.brightness || 0) + expShift);
+          const c = Math.max(0.3, (clip.contrast ?? 1.0) - (clip.matte_fade || 0) / 500);
           const bw = Math.max(0, Math.min(1, clip.black_and_white || 0));
-          const s = Math.max(0, (clip.saturation ?? 1.0) * (1 - bw));
-          const sep = Math.max(0, Math.min(1, (clip.vintage || 0) * 0.65));
+          const vib = 1 + (clip.vibrance || 0) / 220;
+          const s = Math.max(0, (clip.saturation ?? 1.0) * (1 - bw) * vib);
+          const sep = Math.max(0, Math.min(0.45, Math.max(0, (clip.color_temp || 0) / 160) + (clip.vintage || 0) * 0.65));
           const bl = Math.max(0, (clip.blur || 0) * 6);
-          const wHue = (clip.warmth || 0) * -22;
+          const tempDeg = ((clip.color_temp || 0) / 100) * -12 + (clip.warmth || 0) * -22 + ((clip.tint_shift || 0) / 100) * 14;
           const parts = [
             `brightness(${b.toFixed(2)})`,
             `contrast(${c.toFixed(2)})`,
@@ -1124,11 +1494,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           ];
           if (bw > 0.01) parts.push(`grayscale(${bw.toFixed(2)})`);
           if (sep > 0.01) parts.push(`sepia(${sep.toFixed(2)})`);
-          if (Math.abs(wHue) > 0.5) parts.push(`hue-rotate(${wHue.toFixed(1)}deg)`);
+          if (Math.abs(tempDeg) > 0.5) parts.push(`hue-rotate(${tempDeg.toFixed(1)}deg)`);
           if (bl > 0.05) parts.push(`blur(${bl.toFixed(1)}px)`);
           return parts.join(' ');
         })()
-      : 'none';
+        : 'none';
 
   const handleOpenPublish = () => {
     if (clip) {
@@ -1179,7 +1549,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   };
 
   const handleCopyText = (key: string, text: string) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
+    navigator.clipboard?.writeText(text).catch(() => { });
     setCopiedField(key);
     window.dispatchEvent(
       new CustomEvent('lh-toast', {
@@ -1210,92 +1580,194 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
 
   return (
     <aside className="w-[340px] xl:w-[390px] shrink-0 h-full min-h-0 box-border overflow-hidden border-l border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none">
-      {/* Top Control Strip: Safe-Zone Pills + Auto-render + Exact Frame */}
-      <div className="px-3 py-2 border-b border-[var(--border-subtle)] flex items-center justify-between gap-1.5 shrink-0">
-        <div className="flex items-center gap-0.5 bg-[var(--bg-input)] p-0.5 rounded-lg border border-[var(--border-subtle)] min-w-0">
-          {safeZones.map((g) => (
+      {/* Top Control Strip: 2-Row Responsive Toolbar (Studio Tools + Safe-Zone Guide Switcher) */}
+      <div className="px-3 py-2 border-b border-[var(--border-subtle)] space-y-1.5 shrink-0">
+        {/* Row 1: Status & Studio Tools */}
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
-              key={g.value}
               type="button"
-              onClick={() => onSafeZoneChange(g.value)}
-              className={`px-1.5 py-1 rounded-md text-[10px] font-semibold transition whitespace-nowrap ${
-                safeZoneGuide === g.value
-                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-              }`}
+              onClick={toggleAutoRender}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap ${autoRender
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              title="Automatically render fast preview MP4 when edits change (900ms debounce)"
             >
-              {g.label}
+              {isAutoRendering ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : (
+                <Zap className="w-3 h-3" />
+              )}
+              <span>{isAutoRendering ? 'Syncing' : 'Auto-render'}</span>
             </button>
-          ))}
+
+            <button
+              type="button"
+              onClick={() => {
+                if (!showExactFrame) fetchExactFrame();
+                else setShowExactFrame(false);
+              }}
+              disabled={isRenderingFrame || !clip}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 tabular-nums whitespace-nowrap ${showExactFrame
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              title="Render single exact graded FFmpeg frame"
+            >
+              {isRenderingFrame ? (
+                <RefreshCw className="w-3 h-3 animate-spin text-[var(--accent-primary)]" />
+              ) : (
+                <Eye className="w-3 h-3" />
+              )}
+              <span>
+                {isRenderingFrame
+                  ? 'Frame'
+                  : showExactFrame
+                    ? `Live${frameLatencyMs !== null ? ` ${frameLatencyMs}ms` : ''}`
+                    : 'Frame'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => void handleRunRetentionAudit()}
+              disabled={isAuditing || !clip}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 tabular-nums whitespace-nowrap ${isAuditOpen
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              title="Second-by-second retention curve & drop-off auditor"
+            >
+              {isAuditing ? (
+                <Loader2 className="w-3 h-3 animate-spin text-[var(--accent-primary)]" />
+              ) : (
+                <Activity className="w-3 h-3" />
+              )}
+              <span>
+                {retentionAudit ? `${retentionAudit.overall_score}` : 'Audit'}
+              </span>
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1 shrink-0">
+            {onOpenAnalysisWorkstation && (
+              <button
+                type="button"
+                disabled={!clip}
+                onClick={onOpenAnalysisWorkstation}
+                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-primary)] hover:border-[var(--accent-primary)]/50 transition shrink-0 whitespace-nowrap disabled:opacity-45"
+                title="Open AI Analysis & Best-Frame Workstation"
+              >
+                <Sparkles className="w-3 h-3 text-[var(--accent-primary)]" />
+                <span>AI Analysis</span>
+              </button>
+            )}
+            <button
+              type="button"
+              disabled={!clip}
+              onClick={() => setIsEditFrameOpen((prev) => !prev)}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap disabled:opacity-45 ${isEditFrameOpen
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-primary)]/40'
+                }`}
+              title="Visually drag or resize source webcam box and subject focus anchor"
+            >
+              <Crop className="w-3 h-3" />
+              <span>Edit Frame Box</span>
+            </button>
+            <button
+              type="button"
+              disabled={!clip}
+              onClick={() => {
+                if (!clip) return;
+                setThumbHeadline(clip.hook_headline || clip.selected_title || 'WATCH THIS');
+                setThumbFormat(clip.aspect_ratio === '16:9' ? '16:9' : '9:16');
+                setThumbAccentColor(clip.active_color || '#C6F32F');
+                setThumbCustomTimestamp(null);
+                setThumbError(null);
+                setIsThumbModalOpen(true);
+              }}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-primary)]/40 transition shrink-0 whitespace-nowrap disabled:opacity-45"
+              title="Open AI Thumbnail & Cover Designer"
+            >
+              <ImageIcon className="w-3 h-3 text-[var(--accent-primary)]" />
+              <span>Cover</span>
+            </button>
+            <button
+              type="button"
+              disabled={!clip}
+              onClick={() => setIsPreflightOpen((prev) => !prev)}
+              className={`px-2 py-1 rounded-lg text-[10px] font-bold border transition shrink-0 tabular-nums whitespace-nowrap disabled:opacity-45 ${!preflightReport || preflightReport.status === 'pass'
+                ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-400'
+                : preflightReport.status === 'warn'
+                  ? 'bg-amber-500/10 border-amber-500/40 text-amber-400'
+                  : 'bg-red-500/10 border-red-500/40 text-red-400'
+                }`}
+              title="Toggle Pre-Flight Readiness Checklist"
+            >
+              {preflightReport ? `${preflightReport.readiness_score}/100` : 'Safe'}
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-1 shrink-0">
-          <button
-            type="button"
-            onClick={toggleAutoRender}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition whitespace-nowrap ${
-              autoRender
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
-            title="Automatically render fast preview MP4 when edits change (900ms debounce)"
-          >
-            {isAutoRendering ? (
-              <Loader2 className="w-3 h-3 animate-spin" />
-            ) : (
-              <Zap className="w-3 h-3" />
-            )}
-            <span>{isAutoRendering ? 'Syncing' : 'Auto-render'}</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              if (!showExactFrame) fetchExactFrame();
-              else setShowExactFrame(false);
-            }}
-            disabled={isRenderingFrame || !clip}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 tabular-nums whitespace-nowrap ${
-              showExactFrame
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
-            title="Render single exact graded FFmpeg frame"
-          >
-            {isRenderingFrame ? (
-              <RefreshCw className="w-3 h-3 animate-spin text-[var(--accent-primary)]" />
-            ) : (
-              <Eye className="w-3 h-3" />
-            )}
-            <span>
-              {isRenderingFrame
-                ? 'Frame'
-                : showExactFrame
-                ? `Live${frameLatencyMs !== null ? ` ${frameLatencyMs}ms` : ''}`
-                : 'Frame'}
+        {/* Row 2: Safe-Zone Guide Switcher + Compare Original (Hold) */}
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider shrink-0">
+              Safe Zone:
             </span>
-          </button>
+            <div className="flex items-center gap-0.5 bg-[var(--bg-input)] p-0.5 rounded-lg border border-[var(--border-subtle)] shrink-0">
+              {safeZones.map((g) => (
+                <button
+                  key={g.value}
+                  type="button"
+                  onClick={() => onSafeZoneChange(g.value)}
+                  className={`px-2 py-0.5 rounded-md text-[10px] font-semibold transition whitespace-nowrap shrink-0 ${safeZoneGuide === g.value
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
+          </div>
 
-          <button
-            type="button"
-            onClick={() => void handleRunRetentionAudit()}
-            disabled={isAuditing || !clip}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 tabular-nums whitespace-nowrap ${
-              isAuditOpen
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-            }`}
-            title="Second-by-second retention curve & drop-off auditor"
-          >
-            {isAuditing ? (
-              <Loader2 className="w-3 h-3 animate-spin text-[var(--accent-primary)]" />
-            ) : (
-              <Activity className="w-3 h-3" />
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              disabled={!clip}
+              onClick={() => setFreeformCaptionMode((prev) => !prev)}
+              className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${freeformCaptionMode
+                ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
+                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              title="Toggle free-form interactive caption drag box"
+            >
+              <Move className="w-3 h-3" />
+              <span>Drag Captions</span>
+            </button>
+
+            {onCompareOriginalChange && (
+              <button
+                type="button"
+                disabled={!clip}
+                onPointerDown={() => onCompareOriginalChange(true)}
+                onPointerUp={() => onCompareOriginalChange(false)}
+                onPointerLeave={() => onCompareOriginalChange(false)}
+                onPointerCancel={() => onCompareOriginalChange(false)}
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${compareOriginal
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                title="Hold to bypass color grade & preview raw source frame"
+              >
+                <Eye className="w-3 h-3" />
+                <span>Original (Hold)</span>
+              </button>
             )}
-            <span>
-              {retentionAudit ? `${retentionAudit.overall_score}` : 'Audit'}
-            </span>
-          </button>
+          </div>
         </div>
       </div>
 
@@ -1310,13 +1782,12 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </span>
               {retentionAudit && (
                 <span
-                  className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full tabular-nums ${
-                    retentionAudit.overall_score >= 78
-                      ? 'bg-emerald-500/15 text-emerald-400'
-                      : retentionAudit.overall_score >= 58
+                  className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full tabular-nums ${retentionAudit.overall_score >= 78
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : retentionAudit.overall_score >= 58
                       ? 'bg-amber-500/15 text-amber-400'
                       : 'bg-red-500/15 text-red-400'
-                  }`}
+                    }`}
                 >
                   {retentionAudit.overall_score}/100
                 </span>
@@ -1440,8 +1911,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                       w.severity === 'high'
                         ? 'bg-red-500/15 text-red-400 border-red-500/30'
                         : w.severity === 'medium'
-                        ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
-                        : 'bg-sky-500/15 text-sky-400 border-sky-500/30';
+                          ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                          : 'bg-sky-500/15 text-sky-400 border-sky-500/30';
                     return (
                       <div
                         key={w.id}
@@ -1477,6 +1948,109 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         </div>
       )}
 
+      {/* Expandable Pre-Flight Readiness & Platform Safety Checklist */}
+      {isPreflightOpen && clip && (
+        <div className="border-b border-[var(--border-subtle)] bg-[var(--bg-surface)] px-3 py-2.5 space-y-2 shrink-0 max-h-56 overflow-y-auto">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <Shield className="w-3.5 h-3.5 text-[var(--accent-primary)] shrink-0" />
+              <span className="text-[11px] font-bold text-[var(--text-primary)] truncate">
+                Pre-Flight Checklist
+              </span>
+              {preflightReport && (
+                <span
+                  className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full tabular-nums ${preflightReport.status === 'pass'
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : preflightReport.status === 'warn'
+                      ? 'bg-amber-500/15 text-amber-400'
+                      : 'bg-red-500/15 text-red-400'
+                    }`}
+                >
+                  {preflightReport.readiness_score}/100
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => void handleRunPreflight(true)}
+                disabled={isRunningPreflight}
+                className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                title="Re-scan pre-flight readiness"
+              >
+                <RefreshCw className={`w-3 h-3 ${isRunningPreflight ? 'animate-spin' : ''}`} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsPreflightOpen(false)}
+                className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                title="Close pre-flight checklist"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+
+          {isRunningPreflight && !preflightReport && (
+            <div className="py-3 flex items-center justify-center gap-2 text-[11px] text-[var(--text-secondary)]">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--accent-primary)]" />
+              <span>Checking loudness, safe margins, frame rate &amp; resolution...</span>
+            </div>
+          )}
+
+          {preflightError && (
+            <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-2.5 py-1.5">
+              {preflightError}
+            </div>
+          )}
+
+          {preflightReport && (
+            <div className="space-y-1.5">
+              {preflightReport.checks.map((chk: PreflightCheck) => {
+                const badgeCls =
+                  chk.status === 'pass'
+                    ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                    : chk.status === 'warn'
+                      ? 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                      : 'bg-red-500/15 text-red-400 border-red-500/30';
+                return (
+                  <div
+                    key={chk.id}
+                    className="flex items-center justify-between gap-2 p-1.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[10px]"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`px-1 py-0.5 rounded border uppercase font-bold text-[9px] shrink-0 ${badgeCls}`}>
+                          {chk.status}
+                        </span>
+                        <span className="font-semibold text-[var(--text-primary)] truncate">
+                          {chk.title}
+                        </span>
+                      </div>
+                      <p className="text-[var(--text-secondary)] mt-0.5 leading-snug">
+                        {chk.detail}
+                      </p>
+                    </div>
+                    {chk.fix_patch && onApplyFixClip && (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await onApplyFixClip(clip.id, chk.fix_patch as Partial<ViralClip>);
+                          await handleRunPreflight(true);
+                        }}
+                        className="px-2 py-1 rounded-md bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold shrink-0 hover:brightness-110 transition"
+                      >
+                        {chk.fix_label || 'Fix'}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Auto-Scaled Preview Stage */}
       <div
         ref={stageRef}
@@ -1490,7 +2064,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             ref={previewStageBoxRef}
             className="relative w-full h-full rounded-[18px] overflow-hidden bg-[#0A0A0A] flex items-center justify-center"
           >
-            {showExactFrame && exactFrameUrl ? (
+            {compareOriginal && rawFrameUrl ? (
+              <img
+                src={rawFrameUrl}
+                alt="Original Ungraded Frame"
+                className="w-full h-full object-cover"
+              />
+            ) : showExactFrame && exactFrameUrl ? (
               <img
                 src={exactFrameUrl}
                 alt="Exact FFmpeg Graded Frame"
@@ -1517,7 +2097,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                     vid.currentTime = restore.relTime;
                     setCurrentTime(restore.relTime);
                     if (restore.shouldPlay) {
-                      vid.play().catch(() => {});
+                      vid.play().catch(() => { });
                     }
                     pendingRestoreRef.current = null;
                   } else {
@@ -1525,7 +2105,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                     setCurrentTime(0);
                     if (shouldAutoPlayRef.current) {
                       shouldAutoPlayRef.current = false;
-                      vid.play().catch(() => {});
+                      vid.play().catch(() => { });
                     }
                   }
                 }}
@@ -1562,8 +2142,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             )}
 
-            {/* Top Hook Banner Overlay */}
-            {clip?.show_hook_banner && clip?.hook_headline && (
+            {/* Top Hook Banner Fallback ONLY when showing raw unrendered video (never duplicate backend PNG/MP4 banners) */}
+            {!showExactFrame && !isRenderedSource && clip?.show_hook_banner && clip?.hook_headline && (
               <div className="absolute top-6 left-3 right-3 z-20 pointer-events-none flex justify-center">
                 <div className="px-2.5 py-1 rounded-lg bg-black/80 border border-yellow-400 text-yellow-300 font-black text-[10px] uppercase tracking-wide shadow text-center leading-tight">
                   ★ {clip.hook_headline} ★
@@ -1571,8 +2151,119 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             )}
 
+            {/* Free-Form Interactive Caption Drag & Snap Alignment Overlay */}
+            {freeformCaptionMode && !isEditFrameOpen && clip && clip.burn_captions && (() => {
+              const effCapX = captionDragDraft?.x ?? clip.caption_x ?? ((clip.position_x ?? 50) / 100);
+              const effCapY = captionDragDraft?.y ?? clip.caption_y ?? ((clip.position_y ?? 76) / 100);
+              const capRot = clip.caption_rotation ?? 0;
+              const capW = Math.max(0.45, Math.min(0.90, clip.caption_max_width ?? 0.82));
+              const snapCenterX = Math.abs(effCapX - 0.5) <= 0.015;
+              const snapCenterY = Math.abs(effCapY - 0.5) <= 0.015;
+              const commitQuickCap = (vals: Partial<ViralClip>) => {
+                if (onUpdateClip) onUpdateClip(vals);
+                else if (onApplyFixClip) void onApplyFixClip(clip.id, vals);
+              };
+              return (
+                <>
+                  {/* Magnetic Center-X and Center-Y Snap Guides */}
+                  {(isDraggingCaption || snapCenterX) && snapCenterX && (
+                    <div className="pointer-events-none absolute inset-y-0 left-1/2 -translate-x-1/2 border-l border-dashed border-cyan-400/90 z-25" />
+                  )}
+                  {(isDraggingCaption || snapCenterY) && snapCenterY && (
+                    <div className="pointer-events-none absolute inset-x-0 top-1/2 -translate-y-1/2 border-t border-dashed border-lime-400/90 z-25" />
+                  )}
+
+                  {/* Interactive Draggable Caption Bounding Box */}
+                  <div
+                    onPointerDown={(ev) => {
+                      ev.preventDefault();
+                      ev.stopPropagation();
+                      captionDragRef.current = {
+                        startX: ev.clientX,
+                        startY: ev.clientY,
+                        origX: effCapX,
+                        origY: effCapY,
+                        latestX: effCapX,
+                        latestY: effCapY,
+                      };
+                      setCaptionDragDraft({ x: effCapX, y: effCapY });
+                      setIsDraggingCaption(true);
+                    }}
+                    style={{
+                      left: `${effCapX * 100}%`,
+                      top: `${effCapY * 100}%`,
+                      width: `${capW * 100}%`,
+                      transform: `translate(-50%, -50%) rotate(${capRot}deg)`,
+                    }}
+                    className={`absolute z-30 min-h-[38px] px-2 py-1.5 rounded-lg border-2 border-dashed cursor-grab active:cursor-grabbing select-none flex flex-col items-center justify-center transition-colors ${isDraggingCaption
+                      ? 'border-cyan-300 bg-cyan-500/20 shadow-[0_0_0_2px_rgba(34,211,238,0.25)]'
+                      : 'border-[var(--accent-primary)]/85 bg-black/25 hover:bg-black/40'
+                      }`}
+                    title="Drag anywhere on canvas to reposition captions (snaps to center)"
+                  >
+                    <div className="flex items-center gap-1 text-[9px] font-mono font-bold text-white drop-shadow">
+                      <Move className="w-2.5 h-2.5 text-[var(--accent-primary)]" />
+                      <span>
+                        CAPTION ({Math.round(effCapX * 100)}%, {Math.round(effCapY * 100)}%)
+                        {Math.abs(capRot) > 0.2 ? ` · ${capRot}°` : ''}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Compact Quick Position Reset Pills */}
+                  <div
+                    onClick={(ev) => ev.stopPropagation()}
+                    className="absolute bottom-1.5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-black/80 border border-white/15 backdrop-blur-sm"
+                  >
+                    {[
+                      { label: 'Center Bottom', x: 0.5, y: 0.76, rot: 0, grid: 'bottom_center' },
+                      { label: 'Dead Center', x: 0.5, y: 0.5, rot: 0, grid: 'center' },
+                      { label: 'Top Safe', x: 0.5, y: 0.18, rot: 0, grid: 'top_center' },
+                    ].map((qp) => (
+                      <button
+                        key={qp.label}
+                        type="button"
+                        onClick={() =>
+                          commitQuickCap({
+                            caption_x: qp.x,
+                            caption_y: qp.y,
+                            caption_rotation: qp.rot,
+                            position_x: Math.round(qp.x * 100),
+                            position_y: Math.round(qp.y * 100),
+                            position_grid: qp.grid,
+                          })
+                        }
+                        className="px-1.5 py-0.5 rounded text-[8px] font-semibold text-zinc-200 hover:text-black hover:bg-[var(--accent-primary)] transition whitespace-nowrap"
+                      >
+                        {qp.label}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitQuickCap({
+                          caption_x: 0.5,
+                          caption_y: 0.76,
+                          caption_rotation: 0,
+                          caption_max_width: 0.82,
+                          position_x: 50,
+                          position_y: 76,
+                          position_grid: 'bottom_center',
+                        })
+                      }
+                      className="px-1 py-0.5 rounded text-[8px] font-semibold text-amber-300 hover:text-white flex items-center gap-0.5 whitespace-nowrap"
+                      title="Reset caption coordinates and tilt"
+                    >
+                      <RotateCcw className="w-2.5 h-2.5" />
+                      <span>Reset</span>
+                    </button>
+                  </div>
+                </>
+              );
+            })()}
+
             {/* Interactive Tracked Privacy / HUD Blur Box Handles */}
-            {(blurDraftBoxes || clip?.privacy_blur_boxes || []).map((box, bIdx, allBoxes) => (
+            {!isEditFrameOpen && (blurDraftBoxes || clip?.privacy_blur_boxes || []).map((box, bIdx, allBoxes) => (
               <div
                 key={box.id || bIdx}
                 onPointerDown={(ev) => {
@@ -1620,41 +2311,191 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             ))}
 
+            {/* Interactive On-Canvas Source Frame Box & Focus Anchor Editor */}
+            {isEditFrameOpen && clip && (
+              <div className="absolute inset-0 z-40 bg-black/92 flex flex-col justify-between p-2 select-none">
+                <div className="flex items-center justify-between gap-1 bg-black/75 border border-white/15 rounded-lg px-2 py-1 text-[9px] text-white">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextLock = !frameBoxDraft.lock_camera;
+                      const next = { ...frameBoxDraft, lock_camera: nextLock };
+                      setFrameBoxDraft(next);
+                      void persistFramingOverride(next);
+                    }}
+                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-semibold ${frameBoxDraft.lock_camera
+                      ? 'bg-amber-500/25 border-amber-400 text-amber-300'
+                      : 'border-white/20 text-white/80 hover:text-white'
+                      }`}
+                    title="Lock camera smoothly onto Subject Focus crosshair"
+                  >
+                    {frameBoxDraft.lock_camera ? <Lock className="w-2.5 h-2.5" /> : <Unlock className="w-2.5 h-2.5" />}
+                    <span>{frameBoxDraft.lock_camera ? 'Locked' : 'Lock'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void persistFramingOverride({ reset: true })}
+                    className="px-1.5 py-0.5 rounded border border-white/20 text-white/80 hover:text-white font-semibold"
+                  >
+                    Reset
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsEditFrameOpen(false)}
+                    className="px-1.5 py-0.5 rounded bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold"
+                  >
+                    Done
+                  </button>
+                </div>
+
+                <div className="flex-1 flex items-center justify-center min-h-0 my-1">
+                  <div
+                    ref={frameBoxCanvasRef}
+                    style={{ aspectRatio: '16 / 9' }}
+                    className="relative w-full max-h-full bg-zinc-900 rounded border border-white/20 overflow-hidden"
+                  >
+                    {sourceFrameUrl && (
+                      <img
+                        src={sourceFrameUrl}
+                        alt="16:9 Source Frame"
+                        className="w-full h-full object-contain pointer-events-none select-none"
+                      />
+                    )}
+                    {/* Draggable & 4-Corner Resizable Webcam Crop Box */}
+                    <div
+                      onPointerDown={(ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        frameDragRef.current = {
+                          target: 'box_move',
+                          startX: ev.clientX,
+                          startY: ev.clientY,
+                          origBox: { ...frameBoxDraft.webcam_box },
+                          origAnchor: { ...frameBoxDraft.focus_anchor },
+                          latest: { ...frameBoxDraft },
+                        };
+                        setDraggingFrameMode('box_move');
+                      }}
+                      style={{
+                        left: `${frameBoxDraft.webcam_box.x * 100}%`,
+                        top: `${frameBoxDraft.webcam_box.y * 100}%`,
+                        width: `${frameBoxDraft.webcam_box.w * 100}%`,
+                        height: `${frameBoxDraft.webcam_box.h * 100}%`,
+                      }}
+                      className="absolute border-2 border-dashed border-emerald-400 bg-emerald-500/15 cursor-move"
+                      title="Drag to position Webcam Box; drag corners to resize"
+                    >
+                      <span className="absolute -top-3.5 left-0 px-1 rounded bg-emerald-500 text-black font-mono font-bold text-[8px] whitespace-nowrap pointer-events-none">
+                        WEBCAM
+                      </span>
+                      {(['box_nw', 'box_ne', 'box_sw', 'box_se'] as const).map((hCorner) => {
+                        const posCls =
+                          hCorner === 'box_nw'
+                            ? '-top-1.5 -left-1.5 cursor-nwse-resize'
+                            : hCorner === 'box_ne'
+                              ? '-top-1.5 -right-1.5 cursor-nesw-resize'
+                              : hCorner === 'box_sw'
+                                ? '-bottom-1.5 -left-1.5 cursor-nesw-resize'
+                                : '-bottom-1.5 -right-1.5 cursor-nwse-resize';
+                        return (
+                          <div
+                            key={hCorner}
+                            onPointerDown={(ev) => {
+                              ev.preventDefault();
+                              ev.stopPropagation();
+                              frameDragRef.current = {
+                                target: hCorner,
+                                startX: ev.clientX,
+                                startY: ev.clientY,
+                                origBox: { ...frameBoxDraft.webcam_box },
+                                origAnchor: { ...frameBoxDraft.focus_anchor },
+                                latest: { ...frameBoxDraft },
+                              };
+                              setDraggingFrameMode(hCorner);
+                            }}
+                            className={`absolute w-3 h-3 rounded-sm bg-emerald-400 border border-black ${posCls}`}
+                          />
+                        );
+                      })}
+                    </div>
+
+                    {/* Draggable Subject Focus Crosshair */}
+                    <div
+                      onPointerDown={(ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        frameDragRef.current = {
+                          target: 'anchor',
+                          startX: ev.clientX,
+                          startY: ev.clientY,
+                          origBox: { ...frameBoxDraft.webcam_box },
+                          origAnchor: { ...frameBoxDraft.focus_anchor },
+                          latest: { ...frameBoxDraft },
+                        };
+                        setDraggingFrameMode('anchor');
+                      }}
+                      style={{
+                        left: `${frameBoxDraft.focus_anchor.x * 100}%`,
+                        top: `${frameBoxDraft.focus_anchor.y * 100}%`,
+                        transform: 'translate(-50%, -50%)',
+                      }}
+                      className="absolute w-6 h-6 rounded-full border-2 border-amber-400 bg-amber-500/25 flex items-center justify-center cursor-grab active:cursor-grabbing shadow"
+                      title="Drag Subject Focus Anchor crosshair"
+                    >
+                      <Crosshair className="w-3.5 h-3.5 text-amber-300" />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="text-center text-[9px] text-white/70 font-mono truncate">
+                  Box: {Math.round(frameBoxDraft.webcam_box.w * 100)}%×{Math.round(frameBoxDraft.webcam_box.h * 100)}% • Anchor: {Math.round(frameBoxDraft.focus_anchor.x * 100)}%,{Math.round(frameBoxDraft.focus_anchor.y * 100)}%
+                </div>
+              </div>
+            )}
+
             {/* Platform Safe-Zone Overlay */}
             {safeZoneGuide !== 'No guide' && (
-              <div className="absolute inset-0 pointer-events-none z-10 flex flex-col justify-between p-3">
-                <div className="w-full border-t border-dashed border-[var(--accent-primary)]/60 pt-0.5 text-[9px] text-[var(--accent-primary)] font-mono">
+              <div className="absolute inset-0 pointer-events-none z-10">
+                <div
+                  style={{ left: '9%', right: '9%', top: '4%' }}
+                  className="absolute border-t border-dashed border-[var(--accent-primary)]/60 pt-0.5 text-[9px] text-[var(--accent-primary)] font-mono text-center"
+                >
                   {safeZoneGuide} Safe Top
                 </div>
 
-                {(safeZoneGuide === 'TikTok' || safeZoneGuide === 'YT Shorts' || safeZoneGuide === 'All') && (
-                  <div className="absolute right-2 bottom-16 flex flex-col items-center gap-2.5 text-white/80">
+                {(safeZoneGuide === 'TikTok' || safeZoneGuide === 'YT Shorts' || safeZoneGuide === 'Instagram' || safeZoneGuide === 'All') && (
+                  <div className="absolute right-2 bottom-14 flex flex-col items-center gap-2 text-white/75">
                     <div className="flex flex-col items-center">
-                      <div className="w-7 h-7 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
-                        <Heart className="w-3.5 h-3.5 text-white" />
+                      <div className="w-6 h-6 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
+                        <Heart className="w-3 h-3 text-white" />
                       </div>
-                      <span className="text-[8px] font-mono mt-0.5">84K</span>
+                      <span className="text-[7px] font-mono mt-0.5">84K</span>
                     </div>
                     <div className="flex flex-col items-center">
-                      <div className="w-7 h-7 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
-                        <MessageCircle className="w-3.5 h-3.5 text-white" />
+                      <div className="w-6 h-6 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
+                        <MessageCircle className="w-3 h-3 text-white" />
                       </div>
-                      <span className="text-[8px] font-mono mt-0.5">1.2K</span>
+                      <span className="text-[7px] font-mono mt-0.5">1.2K</span>
                     </div>
                     <div className="flex flex-col items-center">
-                      <div className="w-7 h-7 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
-                        <Share2 className="w-3.5 h-3.5 text-white" />
+                      <div className="w-6 h-6 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
+                        <Share2 className="w-3 h-3 text-white" />
                       </div>
-                      <span className="text-[8px] font-mono mt-0.5">Share</span>
+                      <span className="text-[7px] font-mono mt-0.5">Share</span>
                     </div>
-                    <div className="w-6 h-6 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
-                      <Music className="w-3 h-3 text-white" />
+                    <div className="w-5 h-5 rounded-full bg-black/45 flex items-center justify-center border border-white/20">
+                      <Music className="w-2.5 h-2.5 text-white" />
                     </div>
                   </div>
                 )}
 
-                <div className="w-full border-b border-dashed border-[var(--accent-primary)]/60 pb-1 text-[9px] text-[var(--accent-primary)] font-mono">
-                  Caption Safe Zone
+                <div
+                  style={{ left: '9%', right: '9%', bottom: '16%', height: '18%' }}
+                  className="absolute rounded-lg border border-dashed border-[var(--accent-primary)]/65 bg-[var(--accent-primary)]/5 flex items-end justify-center pb-1"
+                >
+                  <span className="text-[9px] text-[var(--accent-primary)] font-mono tracking-tight">
+                    Caption Safe Zone
+                  </span>
                 </div>
               </div>
             )}
@@ -1758,11 +2599,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         setSelectedSegIdx(idx);
                         seekToRelTime(mapMasterToRel(segS + 0.05, keepSegments, xfade));
                       }}
-                      className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 transition tabular-nums ${
-                        isSel
-                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)] font-bold'
-                          : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-mono border shrink-0 transition tabular-nums ${isSel
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)] font-bold'
+                        : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
                       title={`Select & seek to Segment ${idx + 1} (${segS.toFixed(1)}s - ${segE.toFixed(1)}s)`}
                     >
                       S{idx + 1} {segS.toFixed(1)}-{segE.toFixed(1)}s
@@ -1846,11 +2686,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   return (
                     <div
                       key={`ov-${idx}`}
-                      className={`absolute inset-y-0 border-x pointer-events-none ${
-                        isSel
-                          ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/12'
-                          : 'border-white/25'
-                      }`}
+                      className={`absolute inset-y-0 border-x pointer-events-none ${isSel
+                        ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/12'
+                        : 'border-white/25'
+                        }`}
                       style={{ left: `${sPct}%`, width: `${ePct - sPct}%` }}
                     />
                   );
@@ -1930,118 +2769,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       })()}
 
       {/* Dedicated Export & Action Dock */}
-      <div className="p-3 border-t border-[var(--border-subtle)] bg-[var(--bg-card)] space-y-2 shrink-0 relative">
-        {clip && (
-          <div className="flex items-center justify-between gap-2">
-            <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
-              Export Dock
-            </span>
-            <button
-              type="button"
-              onClick={async () => {
-                if (!clip) return;
-                const nextOpen = !isPreflightOpen;
-                setIsPreflightOpen(nextOpen);
-                if (nextOpen) {
-                  try {
-                    setIsPreflightLoading(true);
-                    const rep = await api.getClipPreflight(clip.project_id, clip.id);
-                    setPreflightReport(rep as PreflightReport);
-                  } catch {
-                    // ignore transient offline scan error
-                  } finally {
-                    setIsPreflightLoading(false);
-                  }
-                }
-              }}
-              className={`px-2 py-0.5 rounded-full border text-[10px] font-bold flex items-center gap-1 transition ${
-                !preflightReport || preflightReport.status === 'pass'
-                  ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-400 hover:bg-emerald-500/20'
-                  : preflightReport.status === 'warn'
-                  ? 'bg-amber-500/10 border-amber-500/40 text-amber-400 hover:bg-amber-500/20'
-                  : 'bg-red-500/10 border-red-500/40 text-red-400 hover:bg-red-500/20'
-              }`}
-              title="Run Demonetization, Audio Clipping & Safe-Zone Pre-Flight Check"
-            >
-              <Shield className="w-3 h-3" />
-              <span>
-                {isPreflightLoading
-                  ? 'Scanning...'
-                  : preflightReport
-                  ? `Readiness ${preflightReport.readiness_score}/100`
-                  : 'Pre-Flight Check'}
-              </span>
-            </button>
-          </div>
-        )}
-
-        {clip && isPreflightOpen && (
-          <div className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-2.5 space-y-2 shadow-xl text-left">
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-bold text-[var(--text-primary)] flex items-center gap-1.5">
-                <Shield className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                Pre-Flight Readiness ({preflightReport?.readiness_score ?? '--'}/100)
-              </span>
-              <button
-                type="button"
-                onClick={() => setIsPreflightOpen(false)}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)]"
-              >
-                <X className="w-3.5 h-3.5" />
-              </button>
-            </div>
-            {isPreflightLoading && !preflightReport ? (
-              <div className="text-[10px] text-[var(--text-secondary)] py-1">Running safety audit...</div>
-            ) : (
-              <div className="space-y-1.5 max-h-[160px] overflow-y-auto pr-0.5">
-                {(preflightReport?.checks || []).map((chk) => (
-                  <div
-                    key={chk.id}
-                    className="p-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] flex items-start justify-between gap-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5 text-[10px] font-bold">
-                        <span
-                          className={`inline-block w-1.5 h-1.5 rounded-full ${
-                            chk.status === 'pass'
-                              ? 'bg-emerald-400'
-                              : chk.status === 'warn'
-                              ? 'bg-amber-400'
-                              : 'bg-red-400'
-                          }`}
-                        />
-                        <span className="text-[var(--text-primary)]">{chk.title}</span>
-                      </div>
-                      <p className="text-[10px] text-[var(--text-secondary)] mt-0.5 leading-snug">
-                        {chk.detail}
-                      </p>
-                    </div>
-                    {chk.fix_patch && onApplyFixClip && (
-                      <button
-                        type="button"
-                        disabled={fixingPreflightId === chk.id}
-                        onClick={async () => {
-                          if (!clip || !chk.fix_patch) return;
-                          try {
-                            setFixingPreflightId(chk.id);
-                            await onApplyFixClip(clip.id, chk.fix_patch);
-                            const refreshed = await api.getClipPreflight(clip.project_id, clip.id);
-                            setPreflightReport(refreshed as PreflightReport);
-                          } finally {
-                            setFixingPreflightId(null);
-                          }
-                        }}
-                        className="shrink-0 px-2 py-1 rounded bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-[9px] font-bold hover:opacity-90 transition disabled:opacity-50"
-                      >
-                        {fixingPreflightId === chk.id ? 'Fixing...' : chk.fix_label || '1-Click Fix'}
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+      <div className="p-3 border-t border-[var(--border-subtle)] bg-[var(--bg-card)] space-y-2 shrink-0">
         {isRendering && (
           <div className="space-y-1 tabular-nums">
             <div className="flex justify-between text-[10px] font-mono text-[var(--text-secondary)]">
@@ -2229,11 +2957,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                       key={tab.id}
                       type="button"
                       onClick={() => setActiveCopyPlatform(tab.id)}
-                      className={`py-1 rounded-md text-[11px] font-bold transition ${
-                        activeCopyPlatform === tab.id
-                          ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                          : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
+                      className={`py-1 rounded-md text-[11px] font-bold transition ${activeCopyPlatform === tab.id
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
                     >
                       {tab.label}
                     </button>
@@ -2348,11 +3075,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
 
               {publishResult && (
                 <div
-                  className={`p-3 rounded-xl text-xs flex items-center justify-between ${
-                    publishResult.startsWith('Error')
-                      ? 'bg-red-500/10 border border-red-500/30 text-red-400'
-                      : 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-400'
-                  }`}
+                  className={`p-3 rounded-xl text-xs flex items-center justify-between ${publishResult.startsWith('Error')
+                    ? 'bg-red-500/10 border border-red-500/30 text-red-400'
+                    : 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-400'
+                    }`}
                 >
                   <span className="break-all">{publishResult}</span>
                   {publishResult.startsWith('http') && (
@@ -2462,6 +3188,54 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   </label>
                 </div>
 
+                {thumbBestFrames.length > 0 && (
+                  <div className="space-y-1.5 pt-1">
+                    <div className="flex items-center justify-between text-[10px] font-semibold text-[var(--text-secondary)]">
+                      <span>Best Frames Strip (Click frame for cover)</span>
+                      <span className="font-mono text-[var(--accent-primary)]">
+                        {thumbUsePlayhead
+                          ? `Playhead ${relCurrent.toFixed(1)}s`
+                          : thumbCustomTimestamp !== null
+                            ? `${thumbCustomTimestamp.toFixed(2)}s`
+                            : 'Auto Peak'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {thumbBestFrames.slice(0, 6).map((bf) => {
+                        const isSel =
+                          !thumbUsePlayhead &&
+                          thumbCustomTimestamp !== null &&
+                          Math.abs(thumbCustomTimestamp - bf.t) < 0.05;
+                        return (
+                          <button
+                            key={bf.index}
+                            type="button"
+                            onClick={() => {
+                              setThumbUsePlayhead(false);
+                              setThumbCustomTimestamp(bf.t);
+                            }}
+                            className={`rounded-lg overflow-hidden border text-left transition bg-[var(--bg-input)] ${isSel
+                              ? 'border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]'
+                              : 'border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50'
+                              }`}
+                          >
+                            {bf.image_url && (
+                              <img
+                                src={bf.image_url}
+                                alt={bf.role}
+                                className="w-full h-11 object-cover bg-black"
+                              />
+                            )}
+                            <div className="px-1.5 py-1 text-[9px] font-semibold truncate text-[var(--text-primary)]">
+                              {bf.role.replace(/_/g, ' ')}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 <div className="flex items-center justify-between px-3 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)]">
                   <span className="text-[var(--text-secondary)] font-semibold">Accent Color</span>
                   <input
@@ -2485,7 +3259,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         clip.merge_crossfade_sec ?? 0.03
                       );
                       const res = await api.generateThumbnail(clip.project_id, clip.id, {
-                        timestamp: thumbUsePlayhead ? masterT : undefined,
+                        timestamp: thumbUsePlayhead ? masterT : (thumbCustomTimestamp ?? undefined),
                         headline: thumbHeadline,
                         format: thumbFormat,
                         depth_layer: thumbDepthLayer,

@@ -256,11 +256,17 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
 
   const handleToggleGeminiBoost = async (val: boolean) => {
     setGeminiBoost(val);
-    broadcastSettingsUpdate({ gemini_enabled: val, gemini_boost_enabled: val });
+    const modePatch: Partial<StudioSettings> = {
+      gemini_enabled: val,
+      gemini_boost_enabled: val,
+      ai_mode: val ? 'gemini' : 'offline',
+      ai_provider: val ? 'gemini' : 'offline',
+    };
+    broadcastSettingsUpdate(modePatch);
     try {
       await Promise.all([
-        api.updateSystemSettings({ gemini_boost_enabled: val, gemini_enabled: val }),
-        api.updateSettings({ gemini_enabled: val, gemini_boost_enabled: val })
+        api.updateSystemSettings(modePatch),
+        api.updateSettings(modePatch)
       ]);
     } catch (err) {
       console.error('Failed to update gemini boost:', err);
@@ -303,7 +309,9 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
         gemini_analysis_mode: geminiAnalysisMode,
         auto_fallback_offline: autoFallbackOffline,
         gemini_enabled: true,
-        gemini_boost_enabled: true
+        gemini_boost_enabled: true,
+        ai_mode: 'gemini',
+        ai_provider: 'gemini'
       };
       if (geminiApiKey.trim()) {
         payload.gemini_api_key = geminiApiKey.trim();
@@ -319,6 +327,8 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
         gemini_model: activeModel,
         gemini_enabled: true,
         gemini_boost_enabled: true,
+        ai_mode: 'gemini',
+        ai_provider: 'gemini',
         ...(geminiApiKey.trim() ? { gemini_configured: true } : {})
       });
       await loadGeminiModels(geminiApiKey.trim() || undefined);

@@ -1,4 +1,5 @@
 import os
+import re
 import wave
 import logging
 import subprocess
@@ -263,6 +264,153 @@ def map_output_time_to_source_time(
     return round(abs_segments[-1][1], 3)
 
 
+def detect_ffmpeg_silences(
+    video_path: str,
+    start_sec: float = 0.0,
+    duration_sec: float = 0.0,
+    noise_db: float = -34.0,
+    min_dur: float = 0.35,
+) -> List[Tuple[float, float]]:
+    """
+    Run FFmpeg `silencedetect=noise={noise_db}dB:d={min_dur}` over `[start_sec, start_sec + duration_sec]`
+    and return clip-relative `(silence_start, silence_end)` intervals.
+    """
+    if not video_path or not os.path.exists(video_path):
+        return []
+    dur = max(0.2, float(duration_sec or 0.0))
+    if duration_sec <= 0.0:
+        try:
+            meta = probe_video(video_path)
+            dur = max(0.2, float(meta.get("duration") or 0.0) - max(0.0, float(start_sec)))
+        except Exception:
+            dur = 0.0
+    if dur <= min_dur:
+        return []
+
+    ffmpeg = get_ffmpeg_cmd()
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-ss", f"{max(0.0, float(start_sec)):.3f}",
+        "-t", f"{dur:.3f}",
+        "-i", os.path.abspath(video_path),
+        "-vn",
+        "-af", f"silencedetect=noise={float(noise_db):.1f}dB:d={float(min_dur):.2f}",
+        "-f", "null",
+        "-",
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        stderr = res.stderr or ""
+    except Exception as exc:
+        logger.debug("FFmpeg silencedetect failed: %s", exc)
+        return []
+
+    silences: List[Tuple[float, float]] = []
+    cur_start: Optional[float] = None
+    for line in stderr.splitlines():
+        m_s = re.search(r"silence_start:\s*([-0-9.]+)", line)
+        if m_s:
+            cur_start = max(0.0, float(m_s.group(1)))
+            continue
+        m_e = re.search(r"silence_end:\s*([-0-9.]+)", line)
+        if m_e and cur_start is not None:
+            end_val = min(dur, float(m_e.group(1)))
+            if end_val - cur_start >= min_dur * 0.9:
+                silences.append((round(cur_start, 3), round(end_val, 3)))
+            cur_start = None
+    if cur_start is not None and dur - cur_start >= min_dur * 0.9:
+        silences.append((round(cur_start, 3), round(dur, 3)))
+    return silences
+
+
+def select_cold_open_climax_window(
+    video_path: str,
+    clip_start_time: float,
+    clip_duration: float,
+    words: Optional[List[Dict[str, Any]]] = None,
+    cold_open_quote: str = "",
+    window_sec: float = 2.50,
+) -> Optional[Tuple[float, float]]:
+    """
+    Pick the highest-excitement `window_sec` (default 2.5s) segment from the SECOND HALF
+    of a clip (only when clip duration >= 8.0s). Combines acoustic RMS energy, vocal
+    emphasis punctuation/speech density, and optional `cold_open_quote` anchor.
+    Returns `(abs_start, abs_end)` in master-video seconds, or `None` if clip < 8.0s.
+    """
+    dur = float(clip_duration or 0.0)
+    if dur < 8.0:
+        return None
+    w_len = min(max(1.5, float(window_sec or 2.5)), dur * 0.35)
+    search_start_rel = dur * 0.50
+    search_end_rel = max(search_start_rel + 0.1, dur - w_len)
+    abs_anchor = max(0.0, float(clip_start_time or 0.0))
+
+    # Quote match hint if inside second half
+    quote_rel_start: Optional[float] = None
+    clean_q = re.sub(r"[^\w\s]", "", str(cold_open_quote or "")).lower().strip()
+    if clean_q and words:
+        norm_w = _normalize_word_list(words, abs_anchor, dur)
+        q_toks = clean_q.split()
+        w_toks = [re.sub(r"[^\w\s]", "", str(w.get("word", ""))).lower().strip() for w in norm_w]
+        if q_toks and len(w_toks) >= len(q_toks):
+            for idx in range(len(w_toks) - len(q_toks) + 1):
+                if w_toks[idx:idx + len(q_toks)] == q_toks:
+                    cand = float(norm_w[idx].get("start", 0.0))
+                    if cand >= dur * 0.42:
+                        quote_rel_start = max(search_start_rel, min(search_end_rel, cand))
+                        break
+
+    # Extract fine audio RMS profile (10 Hz) over second half via face_tracker helper
+    rms_bins: List[float] = []
+    if video_path and os.path.exists(video_path):
+        try:
+            from app.services.face_tracker import extract_audio_rms_profile
+            rms_bins = extract_audio_rms_profile(
+                video_path,
+                abs_anchor + search_start_rel,
+                abs_anchor + dur,
+                sample_fps=10.0,
+            )
+        except Exception:
+            rms_bins = []
+
+    norm_w = _normalize_word_list(words or [], abs_anchor, dur) if words else []
+    step = 0.25
+    best_rel = min(search_end_rel, max(search_start_rel, dur * 0.65))
+    best_score = -1.0
+    cur = search_start_rel
+    while cur <= search_end_rel + 1e-4:
+        win_e = cur + w_len
+        score = 0.0
+        # Audio RMS energy component (0..1)
+        if rms_bins:
+            i0 = max(0, int(round((cur - search_start_rel) * 10.0)))
+            i1 = min(len(rms_bins), max(i0 + 1, int(round((win_e - search_start_rel) * 10.0))))
+            seg_vals = rms_bins[i0:i1]
+            if seg_vals:
+                score += float(np.mean(seg_vals)) * 1.6 + float(np.max(seg_vals)) * 0.8
+        # Word density & exclamation/question excitement component
+        win_words = [
+            w for w in norm_w
+            if not w.get("deleted") and not w.get("cut_from_video")
+            and float(w.get("end", 0.0)) >= cur and float(w.get("start", 0.0)) <= win_e
+        ]
+        score += min(1.0, len(win_words) / 8.0) * 0.9
+        if any(any(p in str(w.get("word", "")) for p in ("!", "?")) for w in win_words):
+            score += 0.35
+        if quote_rel_start is not None and abs(cur - quote_rel_start) <= 1.2:
+            score += 1.25 * max(0.0, 1.0 - abs(cur - quote_rel_start) / 1.2)
+        if score > best_score:
+            best_score = score
+            best_rel = cur
+        cur += step
+
+    co_s = round(abs_anchor + best_rel, 3)
+    co_e = round(min(abs_anchor + dur, co_s + w_len), 3)
+    return co_s, co_e
+
+
 def compute_kept_segments_and_remapped_words(
     words: List[Dict[str, Any]],
     clip_start_time: float,
@@ -272,6 +420,8 @@ def compute_kept_segments_and_remapped_words(
     clean_filler_words: bool = False,
     crossfade_sec: float = 0.03,
     explicit_keep_segments: Optional[List[Tuple[float, float]]] = None,
+    auto_trim_dead_air: bool = False,
+    video_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Convert explicit blade `keep_segments`, transcript word cuts (`cut_from_video`), optional filler-word cuts,
@@ -319,25 +469,60 @@ def compute_kept_segments_and_remapped_words(
         else:
             active_spoken.append(w)
 
-    # Dead-air silence cuts when tighten_pacing is active
-    thresh = max(0.25, min(1.5, float(silence_threshold or 0.45)))
-    if tighten_pacing and active_spoken:
-        cushion = 0.08
-        # Leading silence
-        if active_spoken[0]["start"] > thresh + cushion:
-            raw_cuts.append((0.0, round(active_spoken[0]["start"] - cushion, 3)))
-        # Inter-word gaps
-        for idx in range(len(active_spoken) - 1):
-            gap_s = active_spoken[idx]["end"]
-            gap_e = active_spoken[idx + 1]["start"]
-            if gap_e - gap_s > thresh:
-                c_s = round(gap_s + cushion, 3)
-                c_e = round(gap_e - cushion, 3)
-                if c_e > c_s + 0.08:
-                    raw_cuts.append((c_s, c_e))
-        # Trailing silence
-        if clip_dur - active_spoken[-1]["end"] > thresh + cushion:
-            raw_cuts.append((round(active_spoken[-1]["end"] + cushion, 3), clip_dur))
+    # Dead-air silence cuts when auto_trim_dead_air or tighten_pacing is active
+    thresh = (
+        0.35
+        if (auto_trim_dead_air and not tighten_pacing)
+        else max(0.25, min(1.5, float(silence_threshold or 0.45)))
+    )
+    if tighten_pacing or auto_trim_dead_air:
+        cushion = 0.09 if auto_trim_dead_air else 0.08
+        if auto_trim_dead_air and video_path and os.path.exists(video_path):
+            ff_silences = detect_ffmpeg_silences(
+                video_path,
+                start_sec=clip_start_time,
+                duration_sec=clip_dur,
+                noise_db=-34.0,
+                min_dur=0.35,
+            )
+            for ss, se in ff_silences:
+                c_s = round(ss + cushion, 3)
+                c_e = round(se - cushion, 3)
+                if c_e <= c_s + 0.08:
+                    continue
+                # Protect spoken word intervals against cutting inside speech
+                sub_cuts: List[Tuple[float, float]] = [(c_s, c_e)]
+                for w in active_spoken:
+                    ws = max(0.0, float(w["start"]) - cushion * 0.5)
+                    we = min(clip_dur, float(w["end"]) + cushion * 0.5)
+                    next_subs: List[Tuple[float, float]] = []
+                    for a, b in sub_cuts:
+                        if we <= a or ws >= b:
+                            next_subs.append((a, b))
+                        else:
+                            if ws - a > 0.08:
+                                next_subs.append((a, round(ws, 3)))
+                            if b - we > 0.08:
+                                next_subs.append((round(we, 3), b))
+                    sub_cuts = next_subs
+                raw_cuts.extend(sub_cuts)
+
+        if active_spoken:
+            # Leading silence
+            if active_spoken[0]["start"] > thresh + cushion:
+                raw_cuts.append((0.0, round(active_spoken[0]["start"] - cushion, 3)))
+            # Inter-word gaps
+            for idx in range(len(active_spoken) - 1):
+                gap_s = active_spoken[idx]["end"]
+                gap_e = active_spoken[idx + 1]["start"]
+                if gap_e - gap_s > thresh:
+                    c_s = round(gap_s + cushion, 3)
+                    c_e = round(gap_e - cushion, 3)
+                    if c_e > c_s + 0.08:
+                        raw_cuts.append((c_s, c_e))
+            # Trailing silence
+            if clip_dur - active_spoken[-1]["end"] > thresh + cushion:
+                raw_cuts.append((round(active_spoken[-1]["end"] + cushion, 3), clip_dur))
 
     # Merge overlapping or nearly touching cut intervals
     raw_cuts = [(max(0.0, s), min(clip_dur, e)) for s, e in raw_cuts if e > s + 0.04]

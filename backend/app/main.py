@@ -23,7 +23,8 @@ from app.models import (
     RenderClipRequest, TrimClipRequest, UpdateSegmentsRequest, MergeClipsRequest,
     DiarizeClipRequest, UpdateSpeakersRequest, ExtractCalloutsRequest,
     TranslateClipRequest, DubClipRequest, CompileTrailerRequest, GenerateThumbnailRequest,
-    GenerateChaptersRequest, ImportAnalyticsCsvRequest, ExportEvent,
+    GenerateChaptersRequest, ImportAnalyticsCsvRequest, ExportEvent, UpdateWebcamRegionRequest,
+    FramingOverrideRequest,
     SettingsUpdateRequest, PreviewFrameRequest, PreviewFrameResponse,
     CreateBrandPresetRequest, CreateCaptionStyleRequest,
     ProvideKeyRequest, RetryProjectRequest, TestGeminiRequest
@@ -117,8 +118,9 @@ storage_fonts = storage_path / "fonts"
 storage_models = storage_path / "models"
 storage_projects = storage_path / "projects"
 storage_thumbnails = storage_path / "thumbnails"
+storage_luts = storage_path / "luts"
 
-for p in [storage_renders, storage_masters, storage_previews, storage_assets, storage_fonts, storage_models, storage_projects, storage_thumbnails]:
+for p in [storage_renders, storage_masters, storage_previews, storage_assets, storage_fonts, storage_models, storage_projects, storage_thumbnails, storage_luts]:
     p.mkdir(parents=True, exist_ok=True)
 
 app.mount("/media/renders", StaticFiles(directory=str(storage_renders)), name="renders")
@@ -126,6 +128,7 @@ app.mount("/media/masters", StaticFiles(directory=str(storage_masters)), name="m
 app.mount("/media/previews", StaticFiles(directory=str(storage_previews)), name="previews")
 app.mount("/media/assets", StaticFiles(directory=str(storage_assets)), name="assets")
 app.mount("/media/thumbnails", StaticFiles(directory=str(storage_thumbnails)), name="thumbnails")
+app.mount("/media/luts", StaticFiles(directory=str(storage_luts)), name="luts")
 
 def _hydrate_settings_from_disk() -> None:
     """Hydrate runtime Settings & RUNTIME_SETTINGS from persisted settings.json on startup."""
@@ -304,6 +307,23 @@ def get_system_settings():
     gemini_enabled = persisted.get("gemini_enabled", RUNTIME_SETTINGS.get("gemini_boost_enabled", True))
     RUNTIME_SETTINGS["gemini_enabled"] = gemini_enabled
     RUNTIME_SETTINGS["gemini_boost_enabled"] = gemini_enabled
+    raw_ai_mode = persisted.get("ai_mode")
+    if raw_ai_mode in ("gemini", "offline"):
+        eff_ai_mode = raw_ai_mode
+    elif persisted.get("ai_provider") == "offline" or gemini_enabled is False:
+        eff_ai_mode = "offline"
+    elif RUNTIME_SETTINGS["gemini_configured"]:
+        eff_ai_mode = "gemini"
+    else:
+        eff_ai_mode = "needs_api_key_or_offline_choice"
+    RUNTIME_SETTINGS["ai_mode"] = raw_ai_mode
+    RUNTIME_SETTINGS["effective_ai_mode"] = eff_ai_mode
+    RUNTIME_SETTINGS["needs_api_key_or_offline_choice"] = (eff_ai_mode == "needs_api_key_or_offline_choice")
+    try:
+        from app.services.transcriber import get_whisper_runtime_info
+        RUNTIME_SETTINGS["whisper_badge"] = get_whisper_runtime_info().get("badge", "CPU int8")
+    except Exception:
+        RUNTIME_SETTINGS["whisper_badge"] = "CPU int8"
     RUNTIME_SETTINGS["active_theme"] = persisted.get("active_theme", RUNTIME_SETTINGS.get("active_theme", "Hicksfield"))
     RUNTIME_SETTINGS["pexels_api_key"] = persisted.get("pexels_api_key", "")
     RUNTIME_SETTINGS["watch_folder_path"] = persisted.get("watch_folder_path", "")
@@ -363,6 +383,25 @@ def update_system_settings(req: Dict[str, Any]):
         ap = str(req["ai_provider"])
         settings.AI_PROVIDER = ap
         persisted["ai_provider"] = ap
+    if "ai_mode" in req:
+        am_req = str(req["ai_mode"] or "").strip().lower()
+        if am_req in ("gemini", "offline"):
+            persisted["ai_mode"] = am_req
+            RUNTIME_SETTINGS["ai_mode"] = am_req
+            if am_req == "offline":
+                persisted["ai_provider"] = "offline"
+                settings.AI_PROVIDER = "offline"
+                persisted["gemini_enabled"] = False
+                persisted["gemini_boost_enabled"] = False
+                RUNTIME_SETTINGS["gemini_enabled"] = False
+                RUNTIME_SETTINGS["gemini_boost_enabled"] = False
+            else:
+                persisted["ai_provider"] = "gemini"
+                settings.AI_PROVIDER = "gemini"
+                persisted["gemini_enabled"] = True
+                persisted["gemini_boost_enabled"] = True
+                RUNTIME_SETTINGS["gemini_enabled"] = True
+                RUNTIME_SETTINGS["gemini_boost_enabled"] = True
     if "ollama_endpoint" in req:
         oe = str(req["ollama_endpoint"])
         settings.OLLAMA_ENDPOINT = oe
@@ -452,6 +491,10 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
     clip_duration = 0.0
     clip_keep_segments = req.keep_segments
     clip_merge_cf = float(req.merge_crossfade_sec) if req.merge_crossfade_sec is not None else 0.03
+    clip_webcam_region = req.source_webcam_region
+    clip_visual_map = None
+    clip_framing_override = None
+    clip_best_frames = None
     proj_id = req.project_id
 
     if req.clip_id:
@@ -463,12 +506,26 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
                 clip_keep_segments = clip.get_keep_segments()
             if req.merge_crossfade_sec is None:
                 clip_merge_cf = float(getattr(clip, "merge_crossfade_sec", 0.03) or 0.03)
+            if clip_webcam_region is None:
+                clip_webcam_region = clip.get_source_webcam_region()
+            clip_visual_map = clip.get_visual_map()
+            clip_framing_override = clip.get_framing_override()
+            clip_best_frames = clip.get_best_frames()
             clip_start_time = float(clip.start_time or 0.0)
             clip_duration = float(clip.duration or 0.0)
             proj_id = clip.project_id
             project = session.get(Project, clip.project_id)
             if project and project.source_path and os.path.exists(project.source_path):
                 target_video_path = project.source_path
+
+    clip_visual_map = clip_visual_map if "clip_visual_map" in locals() else None
+    clip_obj = clip if req.clip_id and "clip" in locals() and clip else None
+    rflags = req.resolved_retention_flags(clip=clip_obj)
+    clip_opts = clip_obj.get_options() if clip_obj else {}
+    if isinstance(req.options, dict):
+        clip_opts = {**clip_opts, **req.options}
+    if req.framing_override is not None:
+        clip_framing_override = req.framing_override
 
     if not target_video_path and proj_id:
         project = session.get(Project, proj_id)
@@ -484,10 +541,13 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
 
     color_grading = {
         "preset": req.color_preset,
+        "preset_intensity": req.preset_intensity if req.preset_intensity is not None else clip_opts.get("preset_intensity", 100.0),
         "exposure": req.exposure,
         "brightness": req.brightness,
         "contrast": req.contrast,
         "lift_mids": req.lift_mids,
+        "highlights": req.highlights if req.highlights is not None else clip_opts.get("highlights", 0.0),
+        "shadows": req.shadows if req.shadows is not None else clip_opts.get("shadows", 0.0),
         "warmth": req.warmth,
         "saturation": req.saturation,
         "black_and_white": req.black_and_white,
@@ -500,7 +560,16 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "blur": req.blur,
         "film_grain": req.film_grain,
         "vignette": req.vignette,
-        "bottom_fade": req.bottom_fade
+        "bottom_fade": req.bottom_fade,
+        "color_temp": req.color_temp if req.color_temp is not None else clip_opts.get("color_temp", 0.0),
+        "tint_shift": req.tint_shift if req.tint_shift is not None else clip_opts.get("tint_shift", 0.0),
+        "vibrance": req.vibrance if req.vibrance is not None else clip_opts.get("vibrance", 0.0),
+        "matte_fade": req.matte_fade if req.matte_fade is not None else clip_opts.get("matte_fade", 0.0),
+        "halation_glow": req.halation_glow if req.halation_glow is not None else clip_opts.get("halation_glow", 0.0),
+        "lut_path": req.lut_path if req.lut_path is not None else clip_opts.get("lut_path"),
+        "chroma_split": req.chroma_split if req.chroma_split is not None else clip_opts.get("chroma_split", 0.0),
+        "letterbox": req.letterbox if req.letterbox is not None else clip_opts.get("letterbox", "none"),
+        "bypass_color": bool(req.bypass_color),
     }
 
     caption_options = {
@@ -511,11 +580,18 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "base_color": req.base_color,
         "active_color": req.highlight_color or req.active_color,
         "outline_color": req.outline_color,
+        "pill_color": req.pill_color if req.pill_color is not None else (clip_obj.get_options().get("pill_color") if clip_obj else None),
+        "pacing_density": req.pacing_density if req.pacing_density is not None else (clip_obj.get_options().get("pacing_density", "3-4 Words Viral") if clip_obj else "3-4 Words Viral"),
+        "text_case": req.text_case if req.text_case is not None else (clip_obj.get_options().get("text_case") if clip_obj else None),
         "hold_back_alpha": req.hold_back_opacity if req.hold_back_opacity is not None else req.hold_back_alpha,
         "highlight_shape": req.highlight_shape,
         "position_grid": req.position_grid,
         "position_x": req.pos_x if req.pos_x is not None else req.position_x,
         "position_y": req.pos_y if req.pos_y is not None else req.position_y,
+        "caption_x": req.caption_x if req.caption_x is not None else clip_opts.get("caption_x"),
+        "caption_y": req.caption_y if req.caption_y is not None else clip_opts.get("caption_y"),
+        "caption_rotation": req.caption_rotation if req.caption_rotation is not None else clip_opts.get("caption_rotation", 0.0),
+        "caption_max_width": req.caption_max_width if req.caption_max_width is not None else clip_opts.get("caption_max_width", 0.82),
         "outline_width": req.outline if req.outline is not None else req.outline_width,
         "shadow_depth": req.shadow if req.shadow is not None else req.shadow_depth,
         "glow_intensity": req.glow_intensity,
@@ -537,6 +613,10 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "retention_bar_color": req.retention_bar_color,
         "outro_cta_enabled": req.outro_cta_enabled,
         "outro_cta_text": req.outro_cta_text,
+        "outro_cta_headline": req.outro_cta_headline if req.outro_cta_headline is not None else clip_opts.get("outro_cta_headline", ""),
+        "outro_cta_handle": req.outro_cta_handle if req.outro_cta_handle is not None else clip_opts.get("outro_cta_handle", ""),
+        "outro_logo_path": req.outro_logo_path if req.outro_logo_path is not None else clip_opts.get("outro_logo_path"),
+        "speed_ramp": req.speed_ramp if req.speed_ramp is not None else clip_opts.get("speed_ramp", 1.0),
         "speakers": req.speakers,
         "speaker_lower_thirds": req.speaker_lower_thirds,
         "face_safe_captions": req.face_safe_captions,
@@ -547,6 +627,9 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "backdrop_mode": req.backdrop_mode,
         "backdrop_blur_intensity": req.backdrop_blur_intensity,
         "backdrop_color": req.backdrop_color,
+        "camera_motion": req.camera_motion,
+        "whip_pan_cuts": req.whip_pan_cuts,
+        "depth_pop": req.depth_pop,
         "privacy_blur_boxes": req.privacy_blur_boxes,
         "beat_sync_enabled": req.beat_sync_enabled,
         "spectrum_enabled": req.spectrum_enabled,
@@ -560,6 +643,10 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "handle_corner": req.handle_corner,
         "handle_opacity": req.handle_opacity,
         "handle_display_mode": req.handle_display_mode,
+        "tighten_pacing": bool(getattr(clip_obj, "tighten_pacing", False)) if clip_obj else False,
+        "clean_filler_words": req.clean_filler_words,
+        "auto_trim_dead_air": rflags["auto_trim_dead_air"],
+        "silence_threshold": rflags["silence_threshold"],
     }
 
     try:
@@ -572,6 +659,12 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             frame_layout=req.framing_template or req.frame_layout,
             webcam_corner=req.webcam_corner,
             webcam_split_ratio=req.webcam_split_ratio,
+            source_webcam_region=clip_webcam_region,
+            visual_map=clip_visual_map,
+            framing_override=clip_framing_override,
+            best_frames=clip_best_frames,
+            camera_motion=req.camera_motion,
+            whip_pan_cuts=req.whip_pan_cuts,
             pip_border_color=req.pip_border_color,
             zoom=req.zoom,
             pan_x_offset=req.pan_x_offset,
@@ -595,6 +688,7 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             backdrop_mode=req.backdrop_mode,
             backdrop_blur_intensity=req.backdrop_blur_intensity,
             backdrop_color=req.backdrop_color,
+            depth_pop=req.depth_pop,
             privacy_blur_boxes=req.privacy_blur_boxes,
             beat_sync_enabled=req.beat_sync_enabled,
             spectrum_enabled=req.spectrum_enabled,
@@ -608,6 +702,12 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             handle_corner=req.handle_corner,
             handle_opacity=req.handle_opacity,
             handle_display_mode=req.handle_display_mode,
+            use_cold_open=rflags["use_cold_open"],
+            cold_open_quote=rflags["cold_open_quote"],
+            auto_trim_dead_air=rflags["auto_trim_dead_air"],
+            silence_threshold=rflags["silence_threshold"],
+            dynamic_punch_zoom=rflags["dynamic_punch_zoom"],
+            punch_zoom_intensity=rflags["punch_zoom_intensity"],
         )
         return result
     except Exception as e:
@@ -718,6 +818,7 @@ def create_caption_style(req: CreateCaptionStyleRequest, session: Session = Depe
 # -------------------------------------------------------------
 
 @app.get("/api/fonts")
+@app.get("/api/system/fonts")
 def list_fonts():
     fonts = list(FONT_MAP.keys())
     fonts_dir = Path(settings.STORAGE_DIR) / "fonts"
@@ -731,18 +832,20 @@ def list_fonts():
     return sorted(list(set(fonts)))
 
 @app.post("/api/fonts/upload")
+@app.post("/api/system/fonts")
 async def upload_font(file: UploadFile = File(...)):
     fonts_dir = Path(settings.STORAGE_DIR) / "fonts"
     fonts_dir.mkdir(parents=True, exist_ok=True)
 
-    dest = fonts_dir / file.filename
+    safe_name = Path(file.filename or "custom_font.ttf").name
+    dest = fonts_dir / safe_name
     with open(dest, "wb") as buffer:
         while chunk := await file.read(1024 * 512):
             buffer.write(chunk)
 
-    font_name = Path(file.filename).stem
+    font_name = Path(safe_name).stem
     FONT_MAP[font_name] = font_name
-    return {"status": "uploaded", "font_name": font_name}
+    return {"status": "uploaded", "font_name": font_name, "filename": safe_name}
 
 @app.post("/api/assets/upload")
 async def upload_asset(file: UploadFile = File(...)):
@@ -760,6 +863,52 @@ async def upload_asset(file: UploadFile = File(...)):
         "url": f"/media/assets/{filename}",
         "filename": filename,
         "path": str(dest)
+    }
+
+
+@app.get("/api/system/luts")
+def list_luts():
+    luts_dir = Path(settings.STORAGE_DIR) / "luts"
+    luts_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        {"name": f.stem, "filename": f.name, "path": str(f)}
+        for f in sorted(luts_dir.glob("*.cube"))
+    ]
+
+
+@app.post("/api/system/luts")
+async def upload_lut(file: UploadFile = File(...)):
+    luts_dir = Path(settings.STORAGE_DIR) / "luts"
+    luts_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{Path(file.filename or 'lut.cube').stem}_{int(time.time())}.cube"
+    dest = luts_dir / safe_name
+    with open(dest, "wb") as buffer:
+        while chunk := await file.read(1024 * 512):
+            buffer.write(chunk)
+    return {
+        "status": "uploaded",
+        "name": Path(file.filename or safe_name).stem,
+        "filename": safe_name,
+        "path": str(dest),
+        "url": f"/media/luts/{safe_name}",
+    }
+
+
+@app.post("/api/system/brand-logo")
+async def upload_brand_logo(file: UploadFile = File(...)):
+    assets_dir = Path(settings.STORAGE_DIR) / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename or "logo.png").suffix or ".png"
+    filename = f"brand_logo_{int(time.time())}{ext}"
+    dest = assets_dir / filename
+    with open(dest, "wb") as buffer:
+        while chunk := await file.read(1024 * 512):
+            buffer.write(chunk)
+    return {
+        "status": "uploaded",
+        "filename": filename,
+        "url": f"/media/assets/{filename}",
+        "path": str(dest),
     }
 
 # -------------------------------------------------------------
@@ -974,6 +1123,10 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     cdict["backdrop_mode"] = str(getattr(clip, "backdrop_mode", "none") or "none")
     cdict["backdrop_blur_intensity"] = float(getattr(clip, "backdrop_blur_intensity", 18.0) or 18.0)
     cdict["backdrop_color"] = str(getattr(clip, "backdrop_color", "#18181B") or "#18181B")
+    cdict["camera_motion"] = str(getattr(clip, "camera_motion", "steady") or "steady")
+    cdict["whip_pan_cuts"] = bool(getattr(clip, "whip_pan_cuts", False))
+    cdict["broll_layout"] = str(getattr(clip, "broll_layout", "fullscreen") or "fullscreen")
+    cdict["depth_pop"] = float(getattr(clip, "depth_pop", 0.0) or 0.0)
     cdict["privacy_blur_boxes"] = clip.get_privacy_blur_boxes()
     cdict["beat_sync_enabled"] = bool(getattr(clip, "beat_sync_enabled", False))
     cdict["spectrum_enabled"] = bool(getattr(clip, "spectrum_enabled", False))
@@ -987,6 +1140,56 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     cdict["handle_corner"] = str(getattr(clip, "handle_corner", "bottom_right") or "bottom_right")
     cdict["handle_opacity"] = float(getattr(clip, "handle_opacity", 0.65) or 0.65)
     cdict["handle_display_mode"] = str(getattr(clip, "handle_display_mode", "always") or "always")
+    cdict["source_webcam_region"] = clip.get_source_webcam_region()
+    cdict["framing_override"] = clip.get_framing_override()
+    cdict["best_frames"] = clip.get_best_frames()
+    opts = clip.get_options()
+    cdict["options"] = opts
+    cdict["pill_color"] = opts.get("pill_color", "")
+    cdict["pacing_density"] = opts.get("pacing_density", "3-4 Words Viral")
+    cdict["text_case"] = opts.get("text_case", "ALL CAPS" if clip.all_caps else "As Spoken")
+    for k_opt, k_def in (
+        ("caption_x", None),
+        ("caption_y", None),
+        ("caption_rotation", 0.0),
+        ("caption_max_width", 0.82),
+        ("preset_intensity", 100.0),
+        ("highlights", 0.0),
+        ("shadows", 0.0),
+        ("export_fps", "source"),
+        ("color_temp", 0.0),
+        ("tint_shift", 0.0),
+        ("vibrance", 0.0),
+        ("matte_fade", 0.0),
+        ("halation_glow", 0.0),
+        ("lut_path", None),
+        ("voice_eq_preset", "Raw"),
+        ("de_esser", False),
+        ("loudness_target", "-14 LUFS"),
+        ("speed_ramp", 1.0),
+        ("chroma_split", 0.0),
+        ("letterbox", "none"),
+        ("outro_cta_headline", ""),
+        ("outro_cta_handle", ""),
+        ("outro_logo_path", None),
+    ):
+        cdict[k_opt] = opts.get(k_opt, k_def)
+    cdict["caption_x"] = float(opts["caption_x"]) if opts.get("caption_x") is not None else round(float(clip.position_x or 50.0) / 100.0, 4)
+    cdict["caption_y"] = float(opts["caption_y"]) if opts.get("caption_y") is not None else round(float(clip.position_y or 76.0) / 100.0, 4)
+    cdict["narrative_arc"] = opts.get("narrative_arc")
+    cdict["arc_label"] = opts.get("arc_label")
+    cdict["dominant_emotion"] = opts.get("dominant_emotion")
+    cdict["vocal_emotion"] = opts.get("vocal_emotion")
+    cdict["emotion_arousal"] = opts.get("emotion_arousal")
+    cdict["emotion_valence"] = opts.get("emotion_valence")
+    cdict["acoustic_events"] = opts.get("acoustic_events") or []
+    vmap = clip.get_visual_map()
+    cdict["visual_map_summary"] = vmap.get("summary") if isinstance(vmap, dict) else None
+    if project is not None:
+        mm = project.get_multimodal_analysis()
+        if isinstance(mm, dict):
+            cdict["multimodal_summary"] = mm.get("summary")
+            cdict["emotion_summary"] = mm.get("emotion_summary")
     try:
         cdict["broll_segments"] = json.loads(getattr(clip, "broll_json", "[]") or "[]")
     except Exception:
@@ -1203,6 +1406,10 @@ def provide_key_endpoint(
     persisted = get_persisted_settings()
     persisted["gemini_api_key"] = req.api_key
     persisted["gemini_enabled"] = True
+    persisted["gemini_boost_enabled"] = True
+    persisted["ai_mode"] = "gemini"
+    persisted["ai_provider"] = "gemini"
+    settings.AI_PROVIDER = "gemini"
     if req.model:
         settings.GEMINI_MODEL = req.model
         persisted["gemini_model"] = req.model
@@ -1227,6 +1434,7 @@ async def upload_video(
     topic_focus: Optional[str] = Form(None),
     caption_language: Optional[str] = Form("As spoken"),
     hardware_mode: Optional[str] = Form("gpu"),
+    ai_mode: Optional[str] = Form(None),
     batch_queue: Optional[bool] = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     session: Session = Depends(get_session)
@@ -1271,7 +1479,8 @@ async def upload_video(
         clip_count=clip_count or 5,
         caption_language=caption_language or "As spoken",
         topic_focus=topic_focus,
-        hardware_mode=hardware_mode or "gpu"
+        hardware_mode=hardware_mode or "gpu",
+        ai_mode=ai_mode,
     )
 
     if batch_queue:
@@ -1337,7 +1546,8 @@ async def import_youtube(
         clip_count=req.clip_count or 5,
         caption_language=req.caption_language or "As spoken",
         topic_focus=req.topic_focus,
-        hardware_mode=req.hardware_mode or "gpu"
+        hardware_mode=req.hardware_mode or "gpu",
+        ai_mode=req.ai_mode,
     )
 
     background_tasks.add_task(job_manager.run_pipeline, project.id)
@@ -1435,12 +1645,24 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.show_hook_banner = req.show_hook_banner
     if req.cold_open_quote is not None:
         clip.cold_open_quote = req.cold_open_quote
-    if req.use_cold_open is not None:
-        clip.use_cold_open = req.use_cold_open
-    if req.auto_trim_dead_air is not None:
-        clip.auto_trim_dead_air = req.auto_trim_dead_air
-    if req.dynamic_punch_zoom is not None:
-        clip.dynamic_punch_zoom = req.dynamic_punch_zoom
+    if req.cold_open_climax is not None:
+        clip.use_cold_open = bool(req.cold_open_climax)
+    elif req.cold_open is not None:
+        clip.use_cold_open = bool(req.cold_open)
+    elif req.use_cold_open is not None:
+        clip.use_cold_open = bool(req.use_cold_open)
+    if req.trim_dead_air is not None:
+        clip.auto_trim_dead_air = bool(req.trim_dead_air)
+    elif req.auto_trim_dead_air is not None:
+        clip.auto_trim_dead_air = bool(req.auto_trim_dead_air)
+    if req.punch_zoom_fx is not None:
+        clip.dynamic_punch_zoom = bool(req.punch_zoom_fx)
+    elif req.punch_zoom is not None:
+        clip.dynamic_punch_zoom = bool(req.punch_zoom)
+    elif req.dynamic_punch_zoom is not None:
+        clip.dynamic_punch_zoom = bool(req.dynamic_punch_zoom)
+    if req.options is not None and isinstance(req.options, dict):
+        clip.set_options(req.options)
 
     # Step 1: Layout & Framing
     if req.aspect_ratio is not None:
@@ -1457,6 +1679,10 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.webcam_corner = req.webcam_corner
     if req.webcam_split_ratio is not None:
         clip.webcam_split_ratio = req.webcam_split_ratio
+    if req.source_webcam_region is not None:
+        clip.set_source_webcam_region(req.source_webcam_region)
+    if req.framing_override is not None:
+        clip.set_framing_override(req.framing_override)
     if req.pip_border_color is not None:
         clip.pip_border_color = req.pip_border_color
     if req.zoom is not None:
@@ -1483,6 +1709,13 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.active_color = req.active_color
     if req.outline_color is not None:
         clip.outline_color = req.outline_color
+    if req.pill_color is not None:
+        clip.set_options({"pill_color": req.pill_color})
+    if req.pacing_density is not None:
+        clip.set_options({"pacing_density": req.pacing_density})
+    if req.text_case is not None:
+        clip.set_options({"text_case": req.text_case})
+        clip.all_caps = req.text_case.strip().lower() in ("all caps", "all_caps", "uppercase")
     if req.font_size is not None:
         clip.font_size = req.font_size
     if req.font_size_percent is not None:
@@ -1491,16 +1724,33 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.bold = req.bold
     if req.italic is not None:
         clip.italic = req.italic
-    if req.all_caps is not None:
+    if req.all_caps is not None and req.text_case is None:
         clip.all_caps = req.all_caps
+        clip.set_options({"text_case": "ALL CAPS" if req.all_caps else "As Spoken"})
     if req.text_align is not None:
         clip.text_align = req.text_align
     if req.position_grid is not None:
         clip.position_grid = req.position_grid
-    if req.position_x is not None:
-        clip.position_x = req.position_x
-    if req.position_y is not None:
-        clip.position_y = req.position_y
+    if req.caption_x is not None:
+        cx_norm = max(0.05, min(0.95, float(req.caption_x)))
+        clip.position_x = round(cx_norm * 100.0, 2)
+        clip.set_options({"caption_x": round(cx_norm, 4)})
+    elif req.position_x is not None:
+        px = max(5.0, min(95.0, float(req.position_x)))
+        clip.position_x = px
+        clip.set_options({"caption_x": round(px / 100.0, 4)})
+    if req.caption_y is not None:
+        cy_norm = max(0.08, min(0.92, float(req.caption_y)))
+        clip.position_y = round(cy_norm * 100.0, 2)
+        clip.set_options({"caption_y": round(cy_norm, 4)})
+    elif req.position_y is not None:
+        py = max(8.0, min(92.0, float(req.position_y)))
+        clip.position_y = py
+        clip.set_options({"caption_y": round(py / 100.0, 4)})
+    if req.caption_rotation is not None:
+        clip.set_options({"caption_rotation": max(-15.0, min(15.0, float(req.caption_rotation)))})
+    if req.caption_max_width is not None:
+        clip.set_options({"caption_max_width": max(0.45, min(0.90, float(req.caption_max_width)))})
     if req.hold_back_alpha is not None:
         clip.hold_back_alpha = req.hold_back_alpha
     if req.highlight_shape is not None:
@@ -1571,6 +1821,30 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.vignette = req.vignette
     if req.bottom_fade is not None:
         clip.bottom_fade = req.bottom_fade
+    for opt_field in (
+        "preset_intensity",
+        "highlights",
+        "shadows",
+        "export_fps",
+        "color_temp",
+        "tint_shift",
+        "vibrance",
+        "matte_fade",
+        "halation_glow",
+        "lut_path",
+        "chroma_split",
+        "letterbox",
+        "speed_ramp",
+        "voice_eq_preset",
+        "de_esser",
+        "loudness_target",
+        "outro_cta_headline",
+        "outro_cta_handle",
+        "outro_logo_path",
+    ):
+        val = getattr(req, opt_field, None)
+        if val is not None:
+            clip.set_options({opt_field: val})
 
     # Step 4: Branding & Audio
     if req.watermark_path is not None:
@@ -1637,6 +1911,14 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.backdrop_blur_intensity = max(2.0, min(55.0, float(req.backdrop_blur_intensity)))
     if req.backdrop_color is not None:
         clip.backdrop_color = req.backdrop_color
+    if req.camera_motion is not None:
+        clip.camera_motion = str(req.camera_motion)
+    if req.whip_pan_cuts is not None:
+        clip.whip_pan_cuts = bool(req.whip_pan_cuts)
+    if req.broll_layout is not None:
+        clip.broll_layout = str(req.broll_layout)
+    if req.depth_pop is not None:
+        clip.depth_pop = float(req.depth_pop)
     if req.privacy_blur_boxes is not None:
         clip.set_privacy_blur_boxes(req.privacy_blur_boxes)
     if req.beat_sync_enabled is not None:
@@ -2231,6 +2513,7 @@ def generate_thumbnail_endpoint(
         accent_color=req.accent_color or "#C6F32F",
         rim_glow=bool(req.rim_glow),
         badge_text=req.badge_text or "",
+        best_frames=clip.get_best_frames(),
     )
     return {"status": "generated", **res}
 
@@ -2312,6 +2595,553 @@ def get_analytics_formula_endpoint(session: Session = Depends(get_session)):
     from app.services.analytics_ledger import compute_top_performing_formula
 
     return compute_top_performing_formula(session)
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/webcam-region")
+def get_clip_webcam_region_endpoint(
+    project_id: int,
+    clip_id: int,
+    refresh: bool = False,
+    session: Session = Depends(get_session),
+):
+    """Return SQLite-cached or freshly detected 16-frame source webcam crop box."""
+    from app.services.webcam_detector import detect_source_webcam
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    cached = clip.get_source_webcam_region()
+    if cached and not refresh:
+        return {"clip_id": clip.id, "project_id": project_id, **cached}
+
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+
+    locked = (cached or {}).get("locked_zone") if cached else None
+    region = detect_source_webcam(
+        video_path=project.source_path,
+        start_time=float(clip.start_time or 0.0),
+        end_time=float(clip.end_time or (float(clip.start_time or 0.0) + max(1.0, float(clip.duration or 5.0)))),
+        num_samples=16,
+        locked_zone=locked if (locked and locked != "auto") else None,
+    )
+    clip.set_source_webcam_region(region)
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {"clip_id": clip.id, "project_id": project_id, **region}
+
+
+@app.patch("/api/clips/{project_id}/{clip_id}/webcam-region")
+def update_clip_webcam_region_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: UpdateWebcamRegionRequest,
+    session: Session = Depends(get_session),
+):
+    """Update or lock source camera zone (Auto / Top Left / Top Right / Bottom Left / Bottom Right / Center)."""
+    from app.services.webcam_detector import detect_source_webcam, compute_zone_crop_box
+    from app.services.proxy import probe_video
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    src_path = project.source_path if (project and project.source_path and os.path.exists(project.source_path)) else None
+
+    existing = clip.get_source_webcam_region() or {}
+    zone = (req.source_zone or existing.get("locked_zone") or "auto").strip().lower()
+
+    if req.x is not None and req.y is not None and req.w is not None and req.h is not None:
+        rw = max(0.10, min(1.0, float(req.w)))
+        rh = max(0.10, min(1.0, float(req.h)))
+        rx = max(0.0, min(1.0 - rw, float(req.x)))
+        ry = max(0.0, min(1.0 - rh, float(req.y)))
+        src_w, src_h = 1920, 1080
+        if src_path:
+            try:
+                m = probe_video(src_path)
+                src_w, src_h = m.get("width") or 1920, m.get("height") or 1080
+            except Exception:
+                pass
+        region = {
+            "detected": True,
+            "webcam_detected": True,
+            "source_zone": zone if zone != "auto" else "custom",
+            "locked_zone": zone if zone != "auto" else "custom",
+            "x": round(rx, 4),
+            "y": round(ry, 4),
+            "w": round(rw, 4),
+            "h": round(rh, 4),
+            "aspect_ratio": round((rw * src_w) / max(1e-4, rh * src_h), 4),
+            "face_cx": round(rx + rw * 0.5, 4),
+            "face_cy": round(ry + rh * 0.38, 4),
+            "action_cx": 0.5,
+            "action_cy": 0.48,
+        }
+    elif src_path:
+        region = detect_source_webcam(
+            video_path=src_path,
+            start_time=float(clip.start_time or 0.0),
+            end_time=float(clip.end_time or (float(clip.start_time or 0.0) + max(1.0, float(clip.duration or 5.0)))),
+            num_samples=16,
+            locked_zone=None if zone == "auto" else zone,
+        )
+    else:
+        region = compute_zone_crop_box("top_left" if zone == "auto" else zone, 1920, 1080)
+
+    clip.set_source_webcam_region(region)
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {"clip_id": clip.id, "project_id": project_id, **region}
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/framing-map")
+def get_clip_framing_map_endpoint(
+    project_id: int,
+    clip_id: int,
+    refresh: bool = False,
+    session: Session = Depends(get_session),
+):
+    """Return SQLite-cached or freshly analyzed 5-fps scene/shot/face/webcam visual map & AI framing recommendation."""
+    from app.services.vision_analyzer import analyze_clip_visuals
+    from app.services.auto_framer import recommend_optimal_framing
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+
+    vmap = clip.get_visual_map()
+    if not vmap or refresh:
+        cached_cam = clip.get_source_webcam_region() or {}
+        locked_z = cached_cam.get("locked_zone")
+        vmap = analyze_clip_visuals(
+            video_path=project.source_path,
+            start_time=float(clip.start_time or 0.0),
+            end_time=float(clip.end_time or (float(clip.start_time or 0.0) + max(1.0, float(clip.duration or 5.0)))),
+            locked_zone=locked_z if (locked_z and locked_z not in ("auto", "custom")) else None,
+            use_cache=not refresh,
+        )
+        clip.set_visual_map(vmap)
+        if not cached_cam and vmap.get("webcam"):
+            clip.set_source_webcam_region(vmap["webcam"])
+        session.add(clip)
+        session.commit()
+        session.refresh(clip)
+
+    return {
+        "clip_id": clip.id,
+        "project_id": project_id,
+        "visual_map": vmap,
+        "framing_override": clip.get_framing_override(),
+        "source_webcam_region": clip.get_source_webcam_region(),
+        "recommended": recommend_optimal_framing(vmap),
+    }
+
+
+@app.patch("/api/clips/{project_id}/{clip_id}/framing-override")
+def update_clip_framing_override_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: FramingOverrideRequest,
+    session: Session = Depends(get_session),
+):
+    """Persist custom interactive webcam crop box, subject focus anchor, and camera lock state."""
+    from app.services.proxy import probe_video
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    src_path = project.source_path if (project and project.source_path and os.path.exists(project.source_path)) else None
+
+    if req.reset:
+        clip.set_framing_override(None)
+        session.add(clip)
+        session.commit()
+        session.refresh(clip)
+        return {
+            "clip_id": clip.id,
+            "project_id": project_id,
+            "framing_override": None,
+            "source_webcam_region": clip.get_source_webcam_region(),
+            "visual_map": clip.get_visual_map(),
+        }
+
+    existing = clip.get_framing_override() or {}
+    updated = dict(existing)
+
+    if req.webcam_box is not None and isinstance(req.webcam_box, dict):
+        bw = max(0.08, min(1.0, float(req.webcam_box.get("w", 0.30))))
+        bh = max(0.08, min(1.0, float(req.webcam_box.get("h", 0.30))))
+        bx = max(0.0, min(1.0 - bw, float(req.webcam_box.get("x", 0.0))))
+        by = max(0.0, min(1.0 - bh, float(req.webcam_box.get("y", 0.0))))
+        clean_box = {
+            "x": round(bx, 4),
+            "y": round(by, 4),
+            "w": round(bw, 4),
+            "h": round(bh, 4),
+        }
+        updated["webcam_box"] = clean_box
+
+        src_w, src_h = 1920, 1080
+        if src_path:
+            try:
+                m = probe_video(src_path)
+                src_w, src_h = m.get("width") or 1920, m.get("height") or 1080
+            except Exception:
+                pass
+        pix_ar = round((bw * src_w) / max(1e-4, bh * src_h), 4)
+        cam_reg = {
+            "detected": True,
+            "webcam_detected": True,
+            "source_zone": "custom",
+            "locked_zone": "custom",
+            "x": clean_box["x"],
+            "y": clean_box["y"],
+            "w": clean_box["w"],
+            "h": clean_box["h"],
+            "aspect": pix_ar,
+            "aspect_ratio": pix_ar,
+            "face_cx": round(clean_box["x"] + clean_box["w"] * 0.5, 4),
+            "face_cy": round(clean_box["y"] + clean_box["h"] * 0.38, 4),
+            "action_cx": 0.5,
+            "action_cy": 0.48,
+        }
+        clip.set_source_webcam_region(cam_reg)
+
+    if req.focus_anchor is not None and isinstance(req.focus_anchor, dict):
+        ax = max(0.05, min(0.95, float(req.focus_anchor.get("x", 0.5))))
+        ay = max(0.05, min(0.95, float(req.focus_anchor.get("y", 0.42))))
+        updated["focus_anchor"] = {"x": round(ax, 4), "y": round(ay, 4)}
+
+    if req.lock_camera is not None:
+        updated["lock_camera"] = bool(req.lock_camera)
+
+    clip.set_framing_override(updated)
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+    return {
+        "clip_id": clip.id,
+        "project_id": project_id,
+        "framing_override": clip.get_framing_override(),
+        "source_webcam_region": clip.get_source_webcam_region(),
+        "visual_map": clip.get_visual_map(),
+    }
+
+
+@app.post("/api/projects/{project_id}/auto-frame-all")
+def auto_frame_all_clips_endpoint(
+    project_id: int,
+    session: Session = Depends(get_session),
+):
+    """Run unified visual analyzer + Smart Auto-Frame AI Router across every clip in a project."""
+    from app.services.vision_analyzer import analyze_clip_visuals
+    from app.services.auto_framer import recommend_optimal_framing
+
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+
+    project_clips = session.exec(
+        select(ViralClip).where(ViralClip.project_id == project_id)
+    ).all()
+    updated_count = 0
+    for c in project_clips:
+        vmap = analyze_clip_visuals(
+            video_path=project.source_path,
+            start_time=float(c.start_time or 0.0),
+            end_time=float(c.end_time or (float(c.start_time or 0.0) + max(1.0, float(c.duration or 5.0)))),
+            use_cache=True,
+        )
+        rec = recommend_optimal_framing(vmap)
+        c.frame_layout = rec["frame_layout"]
+        c.webcam_corner = rec["webcam_corner"]
+        c.set_visual_map(vmap)
+        if rec.get("source_webcam_region"):
+            c.set_source_webcam_region(rec["source_webcam_region"])
+        session.add(c)
+        updated_count += 1
+
+    session.commit()
+    for c in project_clips:
+        session.refresh(c)
+
+    return {
+        "status": "completed",
+        "project_id": project_id,
+        "updated_count": updated_count,
+        "clips": [_serialize_clip(c, project) for c in project_clips],
+    }
+
+
+def _ensure_clip_multimodal_and_best_frames(
+    project: Project,
+    clip: ViralClip,
+    session: Session,
+    *,
+    force_reanalyze: bool = False,
+) -> Dict[str, Any]:
+    """
+    Lazy-compute or refresh Project multimodal analysis (`audio_analyzer` + `video_analyzer` +
+    `multimodal_fusion`) and Clip Top 6 Best Frames, persisting both to SQLite.
+    """
+    from app.services.audio_analyzer import analyze_audio_track
+    from app.services.video_analyzer import analyze_video_track
+    from app.services.multimodal_fusion import fuse_multimodal_tracks
+    from app.services.best_frame_engine import extract_best_frames
+
+    project_id = int(project.id or 0)
+    clip_id = int(clip.id or 0)
+    mm_data = project.get_multimodal_analysis() if not force_reanalyze else None
+    vid_analysis: Optional[Dict[str, Any]] = None
+    aud_analysis: Optional[Dict[str, Any]] = None
+
+    p_dir = Path(settings.STORAGE_DIR) / "projects" / str(project_id)
+    audio_wav = p_dir / "audio_16k.wav"
+    words_all: List[Dict[str, Any]] = []
+    tr_json = p_dir / "transcript.json"
+    if tr_json.exists():
+        try:
+            loaded_w = json.loads(tr_json.read_text(encoding="utf-8"))
+            if isinstance(loaded_w, list):
+                words_all = loaded_w
+        except Exception:
+            words_all = []
+    if not words_all:
+        # Reconstruct project-level words from clip transcript shifted by clip start_time
+        for w in clip.get_transcript():
+            words_all.append({
+                "word": w.get("word", ""),
+                "start": float(w.get("start", 0.0)) + float(clip.start_time or 0.0),
+                "end": float(w.get("end", 0.0)) + float(clip.start_time or 0.0),
+            })
+
+    if force_reanalyze or not mm_data or not mm_data.get("multimodal_timeline"):
+        audio_src = str(audio_wav) if audio_wav.exists() else project.source_path
+        aud_analysis = analyze_audio_track(audio_src, word_segments=words_all)
+        vid_analysis = analyze_video_track(project.source_path, sample_fps=4.0)
+        mm_data = fuse_multimodal_tracks(
+            aud_analysis,
+            vid_analysis,
+            word_segments=words_all,
+            duration=float(project.duration or vid_analysis.get("summary", {}).get("duration") or 10.0),
+        )
+        project.set_multimodal_analysis(mm_data)
+        session.add(project)
+        session.commit()
+        session.refresh(project)
+    else:
+        aud_analysis = {
+            "summary": mm_data.get("summary") or {},
+            "timeline": mm_data.get("multimodal_timeline") or [],
+        }
+
+    existing_bf = clip.get_best_frames() if not force_reanalyze else []
+    imgs_valid = bool(existing_bf) and all(
+        bf.get("image_path") and os.path.exists(str(bf["image_path"]))
+        for bf in existing_bf
+    )
+
+    suggested_start: Optional[float] = None
+    if not imgs_valid or force_reanalyze:
+        bf_dir = Path(settings.STORAGE_DIR) / "assets" / "best_frames" / str(project_id)
+        bf_dir.mkdir(parents=True, exist_ok=True)
+        bf_res = extract_best_frames(
+            video_path=project.source_path,
+            video_analysis=vid_analysis,
+            audio_analysis=aud_analysis,
+            start_time=float(clip.start_time or 0.0),
+            end_time=float(clip.end_time or (float(clip.start_time or 0.0) + max(1.0, float(clip.duration or 5.0)))),
+            output_dir=str(bf_dir),
+            clip_id=clip_id,
+            project_id=project_id,
+        )
+        existing_bf = bf_res.get("frames") or []
+        suggested_start = bf_res.get("suggested_start_time")
+        clip.set_best_frames(existing_bf)
+        session.add(clip)
+        session.commit()
+        session.refresh(clip)
+
+    # Filter multimodal timeline to clip window while preserving full project context summary
+    clip_s = float(clip.start_time or 0.0)
+    clip_e = float(clip.end_time or (clip_s + max(1.0, float(clip.duration or 5.0))))
+    full_tl = mm_data.get("multimodal_timeline") or []
+    clip_tl = [
+        pt for pt in full_tl
+        if (clip_s - 0.15) <= float(pt.get("t", -1.0)) <= (clip_e + 0.15)
+    ] or full_tl
+
+    clip_shifts = [
+        sh for sh in (mm_data.get("emotion_shifts") or [])
+        if (clip_s - 0.15) <= float(sh.get("t", -1.0)) <= (clip_e + 0.15)
+    ]
+    clip_ac_events = [
+        ev for ev in (mm_data.get("acoustic_events") or [])
+        if float(ev.get("end", ev.get("t", -1.0))) >= (clip_s - 0.25) and float(ev.get("t", -1.0)) <= (clip_e + 0.25)
+    ]
+
+    # Build localized window emotion breakdown for Emotion Breakdown Card
+    from app.services.multimodal_fusion import score_window_from_fusion
+    win_emo = score_window_from_fusion(mm_data, clip_s, clip_e) or {}
+    f_dist: Dict[str, int] = {}
+    v_dist: Dict[str, int] = {}
+    for pt in clip_tl:
+        fe = str(pt.get("dominant_emotion") or "neutral")
+        ve = str(pt.get("vocal_emotion") or "calm_storytelling")
+        f_dist[fe] = f_dist.get(fe, 0) + 1
+        v_dist[ve] = v_dist.get(ve, 0) + 1
+    n_tl = max(1, len(clip_tl))
+    facial_dist_clip = {k: round(v / float(n_tl), 3) for k, v in sorted(f_dist.items(), key=lambda x: -x[1])}
+    vocal_dist_clip = {k: round(v / float(n_tl), 3) for k, v in sorted(v_dist.items(), key=lambda x: -x[1])}
+    opts = clip.get_options()
+
+    return {
+        "clip_id": clip_id,
+        "project_id": project_id,
+        "start_time": clip_s,
+        "end_time": clip_e,
+        "suggested_start_time": suggested_start,
+        "frames": existing_bf,
+        "multimodal_summary": mm_data.get("summary") or {},
+        "emotion_summary": mm_data.get("emotion_summary") or {},
+        "emotion_shifts": clip_shifts,
+        "acoustic_events": clip_ac_events,
+        "clip_emotion_breakdown": {
+            "dominant_facial_emotion": win_emo.get("dominant_facial_emotion") or opts.get("dominant_emotion") or "neutral",
+            "dominant_vocal_emotion": win_emo.get("dominant_vocal_emotion") or opts.get("vocal_emotion") or "calm_storytelling",
+            "avg_arousal": win_emo.get("avg_arousal", opts.get("emotion_arousal", 40.0)),
+            "peak_arousal": win_emo.get("peak_arousal", opts.get("emotion_arousal", 45.0)),
+            "avg_valence": win_emo.get("avg_valence", opts.get("emotion_valence", 0.0)),
+            "emotion_delta_peak": win_emo.get("emotion_delta_peak", 0.0),
+            "narrative_arc": opts.get("narrative_arc"),
+            "arc_label": opts.get("arc_label"),
+            "facial_distribution": facial_dist_clip,
+            "vocal_distribution": vocal_dist_clip,
+        },
+        "multimodal_timeline": clip_tl,
+        "scene_cuts": [
+            c for c in (mm_data.get("scene_cuts") or [])
+            if clip_s <= float(c.get("t", -1.0)) <= clip_e
+        ],
+        "black_intervals": mm_data.get("black_intervals") or [],
+        "peak_moments": mm_data.get("peak_moments") or [],
+    }
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/best-frames")
+def get_clip_best_frames_endpoint(
+    project_id: int,
+    clip_id: int,
+    session: Session = Depends(get_session),
+):
+    """Return Top 6 Best Frames and synchronized multimodal telemetry for the clip."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+    return _ensure_clip_multimodal_and_best_frames(project, clip, session, force_reanalyze=False)
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/best-frames/{frame_index}/image")
+def get_clip_best_frame_image_endpoint(
+    project_id: int,
+    clip_id: int,
+    frame_index: int,
+    session: Session = Depends(get_session),
+):
+    """Serve high-res JPEG still for Best Frame `frame_index` (0..5)."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+
+    data = _ensure_clip_multimodal_and_best_frames(project, clip, session, force_reanalyze=False)
+    frames = data.get("frames") or []
+    match = next((bf for bf in frames if int(bf.get("index", -1)) == int(frame_index)), None)
+    if match is None and 0 <= int(frame_index) < len(frames):
+        match = frames[int(frame_index)]
+    if not match or not match.get("image_path") or not os.path.exists(str(match["image_path"])):
+        raise HTTPException(status_code=404, detail="Best frame image not found")
+    return FileResponse(str(match["image_path"]), media_type="image/jpeg")
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/preset-previews")
+def get_clip_preset_previews_endpoint(
+    project_id: int,
+    clip_id: int,
+    lut_path: Optional[str] = None,
+    force: bool = False,
+    session: Session = Depends(get_session),
+):
+    """Return cached 160x90 real FFmpeg-graded thumbnail previews for all 9 Studio Color Presets + custom LUT."""
+    from app.services.filters import generate_clip_preset_previews
+
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+
+    clip_opts = clip.get_options()
+    eff_lut = lut_path if lut_path is not None else clip_opts.get("lut_path")
+
+    # Prefer the top-ranked clearest reference frame from best_frames if cached, otherwise clip midpoint
+    ref_ts = (float(clip.start_time) + float(clip.end_time)) * 0.5
+    best_frames = clip.get_best_frames()
+    if isinstance(best_frames, list) and best_frames:
+        first_bf = best_frames[0]
+        if isinstance(first_bf, dict):
+            cand_ts = first_bf.get("timestamp", first_bf.get("t"))
+            if cand_ts is not None:
+                try:
+                    t_val = float(cand_ts)
+                    if float(clip.start_time) <= t_val <= float(clip.end_time):
+                        ref_ts = t_val
+                except (TypeError, ValueError):
+                    pass
+
+    return generate_clip_preset_previews(
+        video_path=project.source_path,
+        project_id=project_id,
+        clip_id=clip_id,
+        ref_timestamp=ref_ts,
+        lut_path=eff_lut,
+        force=force,
+    )
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/reanalyze")
+def reanalyze_clip_multimodal_endpoint(
+    project_id: int,
+    clip_id: int,
+    session: Session = Depends(get_session),
+):
+    """Force fresh acoustic prosody, frame-quality vision analysis, and Best Frame extraction."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project or not project.source_path or not os.path.exists(project.source_path):
+        raise HTTPException(status_code=404, detail="Project source video not found")
+    payload = _ensure_clip_multimodal_and_best_frames(project, clip, session, force_reanalyze=True)
+    return {"status": "reanalyzed", **payload}
 
 
 @app.get("/api/clips/{project_id}/{clip_id}/broll-suggestions")
@@ -2686,6 +3516,10 @@ def _render_clip_from_snapshot(
         frame_layout=clip_data["frame_layout"],
         webcam_corner=clip_data["webcam_corner"],
         webcam_split_ratio=clip_data["webcam_split_ratio"],
+        source_webcam_region=clip_data.get("source_webcam_region"),
+        visual_map=clip_data.get("visual_map"),
+        framing_override=clip_data.get("framing_override"),
+        best_frames=clip_data.get("best_frames"),
         pip_border_color=clip_data["pip_border_color"],
         zoom=clip_data["zoom"],
         pan_x_offset=clip_data["pan_x_offset"],
@@ -2780,6 +3614,10 @@ def _render_clip_from_snapshot(
         backdrop_mode=str(clip_data.get("backdrop_mode", "none") or "none"),
         backdrop_blur_intensity=float(clip_data.get("backdrop_blur_intensity", 18.0) or 18.0),
         backdrop_color=str(clip_data.get("backdrop_color", "#18181B") or "#18181B"),
+        camera_motion=str(clip_data.get("camera_motion", "steady") or "steady"),
+        whip_pan_cuts=bool(clip_data.get("whip_pan_cuts", False)),
+        broll_layout=str(clip_data.get("broll_layout", "fullscreen") or "fullscreen"),
+        depth_pop=float(clip_data.get("depth_pop", 0.0) or 0.0),
         privacy_blur_boxes=clip_data.get("privacy_blur_boxes") or [],
         beat_sync_enabled=bool(clip_data.get("beat_sync_enabled", False)),
         spectrum_enabled=bool(clip_data.get("spectrum_enabled", False)),
@@ -2793,6 +3631,7 @@ def _render_clip_from_snapshot(
         handle_corner=str(clip_data.get("handle_corner", "bottom_right") or "bottom_right"),
         handle_opacity=float(clip_data.get("handle_opacity", 0.65) or 0.65),
         handle_display_mode=str(clip_data.get("handle_display_mode", "always") or "always"),
+        options=clip_data.get("options") or {},
     )
 
 
@@ -2832,6 +3671,10 @@ def _snapshot_clip(clip: ViralClip) -> Dict[str, Any]:
     snap["backdrop_mode"] = str(getattr(clip, "backdrop_mode", "none") or "none")
     snap["backdrop_blur_intensity"] = float(getattr(clip, "backdrop_blur_intensity", 18.0) or 18.0)
     snap["backdrop_color"] = str(getattr(clip, "backdrop_color", "#18181B") or "#18181B")
+    snap["camera_motion"] = str(getattr(clip, "camera_motion", "steady") or "steady")
+    snap["whip_pan_cuts"] = bool(getattr(clip, "whip_pan_cuts", False))
+    snap["broll_layout"] = str(getattr(clip, "broll_layout", "fullscreen") or "fullscreen")
+    snap["depth_pop"] = float(getattr(clip, "depth_pop", 0.0) or 0.0)
     snap["privacy_blur_boxes"] = clip.get_privacy_blur_boxes()
     snap["beat_sync_enabled"] = bool(getattr(clip, "beat_sync_enabled", False))
     snap["spectrum_enabled"] = bool(getattr(clip, "spectrum_enabled", False))
@@ -2845,6 +3688,11 @@ def _snapshot_clip(clip: ViralClip) -> Dict[str, Any]:
     snap["handle_corner"] = str(getattr(clip, "handle_corner", "bottom_right") or "bottom_right")
     snap["handle_opacity"] = float(getattr(clip, "handle_opacity", 0.65) or 0.65)
     snap["handle_display_mode"] = str(getattr(clip, "handle_display_mode", "always") or "always")
+    snap["source_webcam_region"] = clip.get_source_webcam_region()
+    snap["visual_map"] = clip.get_visual_map()
+    snap["framing_override"] = clip.get_framing_override()
+    snap["best_frames"] = clip.get_best_frames()
+    snap["options"] = clip.get_options()
     return snap
 
 
@@ -2950,6 +3798,71 @@ def trigger_render(
     clip = session.get(ViralClip, clip_id)
     if not clip or (project_id is not None and clip.project_id != project_id):
         raise HTTPException(status_code=404, detail="Clip not found")
+
+    if req is not None:
+        dirty_req = False
+        if req.cold_open_climax is not None:
+            clip.use_cold_open = bool(req.cold_open_climax); dirty_req = True
+        elif req.cold_open is not None:
+            clip.use_cold_open = bool(req.cold_open); dirty_req = True
+        elif req.use_cold_open is not None:
+            clip.use_cold_open = bool(req.use_cold_open); dirty_req = True
+        if req.trim_dead_air is not None:
+            clip.auto_trim_dead_air = bool(req.trim_dead_air); dirty_req = True
+        elif req.auto_trim_dead_air is not None:
+            clip.auto_trim_dead_air = bool(req.auto_trim_dead_air); dirty_req = True
+        if req.punch_zoom_fx is not None:
+            clip.dynamic_punch_zoom = bool(req.punch_zoom_fx); dirty_req = True
+        elif req.punch_zoom is not None:
+            clip.dynamic_punch_zoom = bool(req.punch_zoom); dirty_req = True
+        elif req.dynamic_punch_zoom is not None:
+            clip.dynamic_punch_zoom = bool(req.dynamic_punch_zoom); dirty_req = True
+        if req.punch_zoom_intensity is not None:
+            clip.punch_zoom_intensity = max(1.04, min(1.35, float(req.punch_zoom_intensity))); dirty_req = True
+        if req.silence_threshold is not None:
+            clip.silence_threshold = max(0.25, min(2.0, float(req.silence_threshold))); dirty_req = True
+        if req.caption_animation is not None:
+            clip.caption_animation = req.caption_animation; dirty_req = True
+        if req.highlight_shape is not None:
+            clip.highlight_shape = req.highlight_shape; dirty_req = True
+        if req.pill_color is not None:
+            clip.set_options({"pill_color": req.pill_color}); dirty_req = True
+        if req.pacing_density is not None:
+            clip.set_options({"pacing_density": req.pacing_density}); dirty_req = True
+        if req.text_case is not None:
+            clip.set_options({"text_case": req.text_case})
+            clip.all_caps = req.text_case.strip().lower() in ("all caps", "all_caps", "uppercase")
+            dirty_req = True
+        for opt_r in ("color_preset", "outro_cta_enabled"):
+            rv = getattr(req, opt_r, None)
+            if rv is not None:
+                setattr(clip, opt_r, rv); dirty_req = True
+        for opt_o in (
+            "caption_x",
+            "caption_y",
+            "caption_rotation",
+            "caption_max_width",
+            "preset_intensity",
+            "highlights",
+            "shadows",
+            "export_fps",
+            "lut_path",
+            "voice_eq_preset",
+            "de_esser",
+            "loudness_target",
+            "speed_ramp",
+            "chroma_split",
+            "letterbox",
+        ):
+            ov = getattr(req, opt_o, None)
+            if ov is not None:
+                clip.set_options({opt_o: ov}); dirty_req = True
+        if req.options is not None and isinstance(req.options, dict):
+            clip.set_options(req.options); dirty_req = True
+        if dirty_req:
+            session.add(clip)
+            session.commit()
+            session.refresh(clip)
 
     quality_mode = (req.quality_mode if req and req.quality_mode else "final_hq").strip().lower()
     if quality_mode == "fast_preview":
@@ -3193,10 +4106,28 @@ def get_studio_settings():
     has_gemini = bool(active_key and active_key != "your_gemini_api_key_here")
     has_youtube = is_youtube_authenticated()
     gemini_enabled = persisted.get("gemini_enabled", True)
+    raw_ai_mode = persisted.get("ai_mode")
+    if raw_ai_mode in ("gemini", "offline"):
+        eff_ai_mode = raw_ai_mode
+    elif persisted.get("ai_provider") == "offline" or gemini_enabled is False:
+        eff_ai_mode = "offline"
+    elif has_gemini:
+        eff_ai_mode = "gemini"
+    else:
+        eff_ai_mode = "needs_api_key_or_offline_choice"
+    try:
+        from app.services.transcriber import get_whisper_runtime_info
+        whisper_badge = get_whisper_runtime_info().get("badge", "CPU int8")
+    except Exception:
+        whisper_badge = "CPU int8"
     return {
         "gemini_configured": has_gemini,
         "gemini_enabled": gemini_enabled,
         "gemini_boost_enabled": gemini_enabled,
+        "ai_mode": raw_ai_mode,
+        "effective_ai_mode": eff_ai_mode,
+        "needs_api_key_or_offline_choice": (eff_ai_mode == "needs_api_key_or_offline_choice"),
+        "whisper_badge": whisper_badge,
         "gemini_model": persisted.get("gemini_model", settings.GEMINI_MODEL),
         "gemini_fallback_model": persisted.get("gemini_fallback_model", settings.GEMINI_FALLBACK_MODEL),
         "gemini_analysis_mode": persisted.get("gemini_analysis_mode", settings.GEMINI_ANALYSIS_MODE),
@@ -3235,6 +4166,20 @@ def update_studio_settings(req: SettingsUpdateRequest):
     if req.ai_provider is not None:
         settings.AI_PROVIDER = req.ai_provider
         persisted["ai_provider"] = req.ai_provider
+    if req.ai_mode is not None:
+        am_val = str(req.ai_mode).strip().lower()
+        if am_val in ("gemini", "offline"):
+            persisted["ai_mode"] = am_val
+            if am_val == "offline":
+                settings.AI_PROVIDER = "offline"
+                persisted["ai_provider"] = "offline"
+                persisted["gemini_enabled"] = False
+                persisted["gemini_boost_enabled"] = False
+            else:
+                settings.AI_PROVIDER = "gemini"
+                persisted["ai_provider"] = "gemini"
+                persisted["gemini_enabled"] = True
+                persisted["gemini_boost_enabled"] = True
     if req.ollama_endpoint is not None:
         settings.OLLAMA_ENDPOINT = req.ollama_endpoint
         persisted["ollama_endpoint"] = req.ollama_endpoint

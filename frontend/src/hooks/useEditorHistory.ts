@@ -23,6 +23,8 @@ export type EditableClipSnapshot = Pick<
   | 'frame_layout'
   | 'webcam_corner'
   | 'webcam_split_ratio'
+  | 'source_webcam_region'
+  | 'framing_override'
   | 'pip_border_color'
   | 'zoom'
   | 'pan_x_offset'
@@ -34,6 +36,9 @@ export type EditableClipSnapshot = Pick<
   | 'base_color'
   | 'active_color'
   | 'outline_color'
+  | 'pill_color'
+  | 'pacing_density'
+  | 'text_case'
   | 'font_size'
   | 'font_size_percent'
   | 'bold'
@@ -75,6 +80,21 @@ export type EditableClipSnapshot = Pick<
   | 'film_grain'
   | 'vignette'
   | 'bottom_fade'
+  | 'color_temp'
+  | 'tint_shift'
+  | 'vibrance'
+  | 'matte_fade'
+  | 'halation_glow'
+  | 'lut_path'
+  | 'chroma_split'
+  | 'letterbox'
+  | 'speed_ramp'
+  | 'voice_eq_preset'
+  | 'de_esser'
+  | 'loudness_target'
+  | 'outro_cta_headline'
+  | 'outro_cta_handle'
+  | 'outro_logo_path'
   | 'watermark_corner'
   | 'watermark_opacity'
   | 'watermark_size'
@@ -105,6 +125,10 @@ export type EditableClipSnapshot = Pick<
   | 'backdrop_mode'
   | 'backdrop_blur_intensity'
   | 'backdrop_color'
+  | 'camera_motion'
+  | 'whip_pan_cuts'
+  | 'broll_layout'
+  | 'depth_pop'
   | 'privacy_blur_boxes'
   | 'beat_sync_enabled'
   | 'spectrum_enabled'
@@ -155,6 +179,12 @@ export function extractEditableSnapshot(clip: ViralClip): EditableClipSnapshot {
     webcam_corner: clip.webcam_corner,
     webcam_split_ratio: clip.webcam_split_ratio,
     pip_border_color: clip.pip_border_color,
+    source_webcam_region: clip.source_webcam_region
+      ? { ...clip.source_webcam_region }
+      : clip.source_webcam_region ?? null,
+    framing_override: clip.framing_override
+      ? JSON.parse(JSON.stringify(clip.framing_override))
+      : clip.framing_override ?? null,
     zoom: clip.zoom,
     pan_x_offset: clip.pan_x_offset,
     burn_captions: clip.burn_captions,
@@ -165,6 +195,9 @@ export function extractEditableSnapshot(clip: ViralClip): EditableClipSnapshot {
     base_color: clip.base_color,
     active_color: clip.active_color,
     outline_color: clip.outline_color,
+    pill_color: clip.pill_color,
+    pacing_density: clip.pacing_density,
+    text_case: clip.text_case,
     font_size: clip.font_size,
     font_size_percent: clip.font_size_percent,
     bold: clip.bold,
@@ -206,6 +239,21 @@ export function extractEditableSnapshot(clip: ViralClip): EditableClipSnapshot {
     film_grain: clip.film_grain,
     vignette: clip.vignette,
     bottom_fade: clip.bottom_fade,
+    color_temp: clip.color_temp,
+    tint_shift: clip.tint_shift,
+    vibrance: clip.vibrance,
+    matte_fade: clip.matte_fade,
+    halation_glow: clip.halation_glow,
+    lut_path: clip.lut_path,
+    chroma_split: clip.chroma_split,
+    letterbox: clip.letterbox,
+    speed_ramp: clip.speed_ramp,
+    voice_eq_preset: clip.voice_eq_preset,
+    de_esser: clip.de_esser,
+    loudness_target: clip.loudness_target,
+    outro_cta_headline: clip.outro_cta_headline,
+    outro_cta_handle: clip.outro_cta_handle,
+    outro_logo_path: clip.outro_logo_path,
     watermark_corner: clip.watermark_corner,
     watermark_opacity: clip.watermark_opacity,
     watermark_size: clip.watermark_size,
@@ -238,6 +286,10 @@ export function extractEditableSnapshot(clip: ViralClip): EditableClipSnapshot {
     backdrop_mode: clip.backdrop_mode,
     backdrop_blur_intensity: clip.backdrop_blur_intensity,
     backdrop_color: clip.backdrop_color,
+    camera_motion: clip.camera_motion,
+    whip_pan_cuts: clip.whip_pan_cuts,
+    broll_layout: clip.broll_layout,
+    depth_pop: clip.depth_pop,
     privacy_blur_boxes: Array.isArray(clip.privacy_blur_boxes)
       ? clip.privacy_blur_boxes.map((b) => ({ ...b }))
       : undefined,

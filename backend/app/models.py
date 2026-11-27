@@ -32,8 +32,25 @@ class Project(SQLModel, table=True):
     caption_language: str = SQLField(default="As spoken") # As spoken, Hinglish, English, Hindi, Spanish, French, German, Arabic, Portuguese, Japanese
     hardware_mode: str = SQLField(default="gpu") # gpu (Graphics card) or cpu (Processor only)
     topic_focus: Optional[str] = SQLField(default=None) # Optional creative guidance for Gemini
+    multimodal_analysis_json: str = SQLField(default="") # Persistent audio+video multimodal timeline & summary
 
     created_at: str = SQLField(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def get_multimodal_analysis(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = (self.multimodal_analysis_json or "").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def set_multimodal_analysis(self, payload: Optional[Dict[str, Any]]):
+        if payload is None:
+            self.multimodal_analysis_json = ""
+        elif isinstance(payload, dict):
+            self.multimodal_analysis_json = json.dumps(payload)
 
 
 class BrandPreset(SQLModel, table=True):
@@ -118,7 +135,13 @@ class ViralClip(SQLModel, table=True):
     custom_height: int = SQLField(default=1920)
     frame_layout: str = SQLField(default="auto_track") # auto_track, webcam_gameplay_split, webcam_gameplay_pip, split_podcast, fit_blur
     webcam_corner: str = SQLField(default="auto") # auto, top_left, top_right, bottom_left, bottom_right
-    webcam_split_ratio: float = SQLField(default=0.35) # 0.25 to 0.50
+    webcam_split_ratio: float = SQLField(default=0.40) # 0.25 to 0.50
+    source_webcam_region_json: str = SQLField(default="")
+    visual_map_json: str = SQLField(default="")
+    framing_override_json: str = SQLField(default="")
+    best_frames_json: str = SQLField(default="[]")
+    camera_motion: str = SQLField(default="steady") # steady, dolly_in, dolly_out, beat_punch
+    whip_pan_cuts: bool = SQLField(default=False)
     pip_border_color: str = SQLField(default="#F59E0B") # ClipShlip amber
     zoom: float = SQLField(default=1.0) # 1.0 to 1.8
     pan_x_offset: float = SQLField(default=0.0) # -0.40 to +0.40
@@ -194,6 +217,7 @@ class ViralClip(SQLModel, table=True):
     outro_cta_enabled: bool = SQLField(default=False)
     outro_cta_text: str = SQLField(default="Subscribe for More")
     broll_json: str = SQLField(default="[]")
+    broll_layout: str = SQLField(default="fullscreen") # fullscreen, reaction_pip
     speakers_json: str = SQLField(default="{}")
     speaker_lower_thirds: bool = SQLField(default=False)
     face_safe_captions: bool = SQLField(default=True)
@@ -209,6 +233,7 @@ class ViralClip(SQLModel, table=True):
     backdrop_mode: str = SQLField(default="none")
     backdrop_blur_intensity: float = SQLField(default=18.0)
     backdrop_color: str = SQLField(default="#18181B")
+    depth_pop: float = SQLField(default=0.0)
     privacy_blur_json: str = SQLField(default="[]")
     beat_sync_enabled: bool = SQLField(default=False)
     spectrum_enabled: bool = SQLField(default=False)
@@ -228,6 +253,7 @@ class ViralClip(SQLModel, table=True):
     transcript_json: Optional[str] = SQLField(default="[]")
     keep_segments_json: str = SQLField(default="[]")
     merge_crossfade_sec: float = SQLField(default=0.03)
+    options_json: str = SQLField(default="{}")
 
     # Publishing metadata
     youtube_titles: str = SQLField(default="[]") # JSON list of 3 titles
@@ -342,6 +368,84 @@ class ViralClip(SQLModel, table=True):
     def set_chapters(self, chapters: List[Dict[str, Any]]):
         self.chapters_json = json.dumps(chapters[:8] if isinstance(chapters, list) else [])
 
+    def get_source_webcam_region(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = (self.source_webcam_region_json or "").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def set_source_webcam_region(self, region: Optional[Dict[str, Any]]):
+        if region is None:
+            self.source_webcam_region_json = ""
+        elif isinstance(region, dict):
+            self.source_webcam_region_json = json.dumps(region)
+
+    def get_visual_map(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = (self.visual_map_json or "").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def set_visual_map(self, visual_map: Optional[Dict[str, Any]]):
+        if visual_map is None:
+            self.visual_map_json = ""
+        elif isinstance(visual_map, dict):
+            self.visual_map_json = json.dumps(visual_map)
+
+    def get_framing_override(self) -> Optional[Dict[str, Any]]:
+        try:
+            raw = (self.framing_override_json or "").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def set_framing_override(self, override: Optional[Dict[str, Any]]):
+        if override is None:
+            self.framing_override_json = ""
+        elif isinstance(override, dict):
+            self.framing_override_json = json.dumps(override)
+
+    def get_best_frames(self) -> List[Dict[str, Any]]:
+        try:
+            raw = (self.best_frames_json or "[]").strip()
+            if not raw:
+                return []
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def set_best_frames(self, frames: Optional[List[Dict[str, Any]]]):
+        if not frames:
+            self.best_frames_json = "[]"
+        elif isinstance(frames, list):
+            self.best_frames_json = json.dumps(frames)
+
+    def get_options(self) -> Dict[str, Any]:
+        try:
+            raw = getattr(self, "options_json", "{}") or "{}"
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def set_options(self, patch: Optional[Dict[str, Any]], replace: bool = False):
+        cur = {} if replace else self.get_options()
+        if isinstance(patch, dict):
+            cur.update(patch)
+        self.options_json = json.dumps(cur)
+
 
 # -------------------------------------------------------------
 # Gemini Structured Output Schemas
@@ -396,7 +500,11 @@ class PreviewFrameRequest(BaseModel):
     frame_layout: str = "auto_track"
     framing_template: Optional[str] = None
     webcam_corner: str = "top_left"
-    webcam_split_ratio: float = 0.38
+    webcam_split_ratio: float = 0.40
+    source_webcam_region: Optional[Dict[str, Any]] = None
+    framing_override: Optional[Dict[str, Any]] = None
+    camera_motion: str = "steady"
+    whip_pan_cuts: bool = False
     pip_border_color: str = "#F59E0B"
     zoom: float = 1.0
     pan_x_offset: float = 0.0
@@ -409,13 +517,30 @@ class PreviewFrameRequest(BaseModel):
     watermark_opacity: float = 0.85
     watermark_size: float = 0.15
 
-    # Grading
+    # Grading & Lens/Motion/Audio FX
     color_preset: str = "none"
+    preset_intensity: Optional[float] = None
+    bypass_color: bool = False
     exposure: float = 0.0
     brightness: float = 0.0
     contrast: float = 1.0
     lift_mids: float = 0.0
+    highlights: Optional[float] = None
+    shadows: Optional[float] = None
     warmth: float = 0.0
+    color_temp: Optional[float] = None
+    tint_shift: Optional[float] = None
+    vibrance: Optional[float] = None
+    matte_fade: Optional[float] = None
+    halation_glow: Optional[float] = None
+    lut_path: Optional[str] = None
+    chroma_split: Optional[float] = None
+    letterbox: Optional[str] = None
+    export_fps: Optional[str] = None
+    speed_ramp: Optional[float] = None
+    voice_eq_preset: Optional[str] = None
+    de_esser: Optional[bool] = None
+    loudness_target: Optional[str] = None
     saturation: float = 1.0
     black_and_white: float = 0.0
     vintage: float = 0.0
@@ -452,6 +577,9 @@ class PreviewFrameRequest(BaseModel):
     active_color: str = "#C6F32F"
     highlight_color: Optional[str] = None
     outline_color: str = "#000000"
+    pill_color: Optional[str] = None
+    pacing_density: Optional[str] = None
+    text_case: Optional[str] = None
     hold_back_alpha: float = 1.0
     hold_back_opacity: Optional[float] = None
     highlight_shape: str = "Colour only"
@@ -459,6 +587,10 @@ class PreviewFrameRequest(BaseModel):
     pos_x: Optional[float] = None
     position_y: float = 78.0
     pos_y: Optional[float] = None
+    caption_x: Optional[float] = None
+    caption_y: Optional[float] = None
+    caption_rotation: Optional[float] = None
+    caption_max_width: Optional[float] = None
     outline_width: float = 4.0
     outline: Optional[float] = None
     shadow_depth: float = 3.0
@@ -480,6 +612,9 @@ class PreviewFrameRequest(BaseModel):
     retention_bar_color: str = "#C6F32F"
     outro_cta_enabled: bool = False
     outro_cta_text: str = "Subscribe for More"
+    outro_cta_headline: Optional[str] = None
+    outro_cta_handle: Optional[str] = None
+    outro_logo_path: Optional[str] = None
     words: Optional[List[Dict[str, Any]]] = None
     keep_segments: Optional[List[List[float]]] = None
     merge_crossfade_sec: Optional[float] = None
@@ -493,6 +628,7 @@ class PreviewFrameRequest(BaseModel):
     backdrop_mode: str = "none"
     backdrop_blur_intensity: float = 18.0
     backdrop_color: str = "#18181B"
+    depth_pop: float = 0.0
     privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None
     beat_sync_enabled: bool = False
     spectrum_enabled: bool = False
@@ -506,6 +642,79 @@ class PreviewFrameRequest(BaseModel):
     handle_corner: str = "bottom_right"
     handle_opacity: float = 0.65
     handle_display_mode: str = "always"
+    # Retention FX canonical + alias flags
+    use_cold_open: Optional[bool] = None
+    cold_open: Optional[bool] = None
+    cold_open_climax: Optional[bool] = None
+    cold_open_quote: Optional[str] = None
+    auto_trim_dead_air: Optional[bool] = None
+    trim_dead_air: Optional[bool] = None
+    silence_threshold: Optional[float] = None
+    dynamic_punch_zoom: Optional[bool] = None
+    punch_zoom: Optional[bool] = None
+    punch_zoom_fx: Optional[bool] = None
+    punch_zoom_intensity: Optional[float] = None
+    options: Optional[Dict[str, Any]] = None
+
+    def resolved_retention_flags(self, clip: Optional[Any] = None) -> Dict[str, Any]:
+        co = (
+            bool(self.cold_open_climax)
+            if self.cold_open_climax is not None
+            else (
+                bool(self.cold_open)
+                if self.cold_open is not None
+                else (
+                    bool(self.use_cold_open)
+                    if self.use_cold_open is not None
+                    else bool(getattr(clip, "use_cold_open", False))
+                )
+            )
+        )
+        tda = (
+            bool(self.trim_dead_air)
+            if self.trim_dead_air is not None
+            else (
+                bool(self.auto_trim_dead_air)
+                if self.auto_trim_dead_air is not None
+                else bool(getattr(clip, "auto_trim_dead_air", False))
+            )
+        )
+        pz = (
+            bool(self.punch_zoom_fx)
+            if self.punch_zoom_fx is not None
+            else (
+                bool(self.punch_zoom)
+                if self.punch_zoom is not None
+                else (
+                    bool(self.dynamic_punch_zoom)
+                    if self.dynamic_punch_zoom is not None
+                    else bool(getattr(clip, "dynamic_punch_zoom", False))
+                )
+            )
+        )
+        pzi_raw = (
+            self.punch_zoom_intensity
+            if self.punch_zoom_intensity is not None
+            else getattr(clip, "punch_zoom_intensity", 1.14)
+        )
+        co_quote = (
+            self.cold_open_quote
+            if self.cold_open_quote is not None
+            else str(getattr(clip, "cold_open_quote", "") or "")
+        )
+        sil_t = (
+            self.silence_threshold
+            if self.silence_threshold is not None
+            else float(getattr(clip, "silence_threshold", 0.45) or 0.45)
+        )
+        return {
+            "use_cold_open": co,
+            "cold_open_quote": co_quote,
+            "auto_trim_dead_air": tda,
+            "silence_threshold": float(sil_t),
+            "dynamic_punch_zoom": pz,
+            "punch_zoom_intensity": max(1.04, min(1.35, float(pzi_raw or 1.14))),
+        }
 
 
 class PreviewFrameResponse(BaseModel):
@@ -522,6 +731,7 @@ class YouTubeImportRequest(BaseModel):
     topic_focus: Optional[str] = None
     caption_language: Optional[str] = "As spoken"
     hardware_mode: Optional[str] = "gpu"
+    ai_mode: Optional[str] = None
 
 
 class UpdateClipRequest(BaseModel):
@@ -531,9 +741,15 @@ class UpdateClipRequest(BaseModel):
     show_hook_banner: Optional[bool] = None
     cold_open_quote: Optional[str] = None
     use_cold_open: Optional[bool] = None
+    cold_open: Optional[bool] = None
+    cold_open_climax: Optional[bool] = None
     auto_trim_dead_air: Optional[bool] = None
+    trim_dead_air: Optional[bool] = None
     dynamic_punch_zoom: Optional[bool] = None
+    punch_zoom: Optional[bool] = None
+    punch_zoom_fx: Optional[bool] = None
     punch_zoom_intensity: Optional[float] = None
+    options: Optional[Dict[str, Any]] = None
 
     # Step 1: Layout & Framing
     aspect_ratio: Optional[str] = None
@@ -543,6 +759,10 @@ class UpdateClipRequest(BaseModel):
     framing_template: Optional[str] = None
     webcam_corner: Optional[str] = None
     webcam_split_ratio: Optional[float] = None
+    source_webcam_region: Optional[Dict[str, Any]] = None
+    framing_override: Optional[Dict[str, Any]] = None
+    camera_motion: Optional[str] = None
+    whip_pan_cuts: Optional[bool] = None
     pip_border_color: Optional[str] = None
     zoom: Optional[float] = None
     pan_x_offset: Optional[float] = None
@@ -557,6 +777,9 @@ class UpdateClipRequest(BaseModel):
     base_color: Optional[str] = None
     active_color: Optional[str] = None
     outline_color: Optional[str] = None
+    pill_color: Optional[str] = None
+    pacing_density: Optional[str] = None
+    text_case: Optional[str] = None
     font_size: Optional[int] = None
     font_size_percent: Optional[int] = None
     bold: Optional[bool] = None
@@ -566,6 +789,10 @@ class UpdateClipRequest(BaseModel):
     position_grid: Optional[str] = None
     position_x: Optional[float] = None
     position_y: Optional[float] = None
+    caption_x: Optional[float] = None
+    caption_y: Optional[float] = None
+    caption_rotation: Optional[float] = None
+    caption_max_width: Optional[float] = None
     hold_back_alpha: Optional[float] = None
     highlight_shape: Optional[str] = None
     emoji_enabled: Optional[bool] = None
@@ -583,11 +810,15 @@ class UpdateClipRequest(BaseModel):
     # Step 3: Color Grading & Effects
     clip_size: Optional[str] = None
     export_resolution: Optional[str] = None
+    export_fps: Optional[str] = None
     color_preset: Optional[str] = None
+    preset_intensity: Optional[float] = None
     exposure: Optional[float] = None
     brightness: Optional[float] = None
     contrast: Optional[float] = None
     lift_mids: Optional[float] = None
+    highlights: Optional[float] = None
+    shadows: Optional[float] = None
     warmth: Optional[float] = None
     saturation: Optional[float] = None
     black_and_white: Optional[float] = None
@@ -602,6 +833,18 @@ class UpdateClipRequest(BaseModel):
     film_grain: Optional[float] = None
     vignette: Optional[float] = None
     bottom_fade: Optional[float] = None
+    color_temp: Optional[float] = None
+    tint_shift: Optional[float] = None
+    vibrance: Optional[float] = None
+    matte_fade: Optional[float] = None
+    halation_glow: Optional[float] = None
+    lut_path: Optional[str] = None
+    chroma_split: Optional[float] = None
+    letterbox: Optional[str] = None
+    speed_ramp: Optional[float] = None
+    voice_eq_preset: Optional[str] = None
+    de_esser: Optional[bool] = None
+    loudness_target: Optional[str] = None
 
     # Step 4: Branding & BGM / Audio
     watermark_path: Optional[str] = None
@@ -620,7 +863,11 @@ class UpdateClipRequest(BaseModel):
     retention_bar_color: Optional[str] = None
     outro_cta_enabled: Optional[bool] = None
     outro_cta_text: Optional[str] = None
+    outro_cta_headline: Optional[str] = None
+    outro_cta_handle: Optional[str] = None
+    outro_logo_path: Optional[str] = None
     broll_segments: Optional[List[Dict[str, Any]]] = None
+    broll_layout: Optional[str] = None
     speakers: Optional[Dict[str, Any]] = None
     speaker_lower_thirds: Optional[bool] = None
     face_safe_captions: Optional[bool] = None
@@ -636,6 +883,7 @@ class UpdateClipRequest(BaseModel):
     backdrop_mode: Optional[str] = None
     backdrop_blur_intensity: Optional[float] = None
     backdrop_color: Optional[str] = None
+    depth_pop: Optional[float] = None
     privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None
     beat_sync_enabled: Optional[bool] = None
     spectrum_enabled: Optional[bool] = None
@@ -701,6 +949,22 @@ class GenerateThumbnailRequest(BaseModel):
     badge_text: str = ""
 
 
+class UpdateWebcamRegionRequest(BaseModel):
+    source_zone: Optional[str] = None
+    x: Optional[float] = None
+    y: Optional[float] = None
+    w: Optional[float] = None
+    h: Optional[float] = None
+    refresh: bool = False
+
+
+class FramingOverrideRequest(BaseModel):
+    webcam_box: Optional[Dict[str, float]] = None
+    focus_anchor: Optional[Dict[str, float]] = None
+    lock_camera: Optional[bool] = None
+    reset: bool = False
+
+
 class GenerateChaptersRequest(BaseModel):
     max_chapters: int = 4
     enable: bool = True
@@ -716,6 +980,39 @@ class UpdateClipMetadataRequest(BaseModel):
 
 class RenderClipRequest(BaseModel):
     quality_mode: str = "final_hq"
+    use_cold_open: Optional[bool] = None
+    cold_open: Optional[bool] = None
+    cold_open_climax: Optional[bool] = None
+    auto_trim_dead_air: Optional[bool] = None
+    trim_dead_air: Optional[bool] = None
+    dynamic_punch_zoom: Optional[bool] = None
+    punch_zoom: Optional[bool] = None
+    punch_zoom_fx: Optional[bool] = None
+    punch_zoom_intensity: Optional[float] = None
+    silence_threshold: Optional[float] = None
+    caption_animation: Optional[str] = None
+    highlight_shape: Optional[str] = None
+    pill_color: Optional[str] = None
+    pacing_density: Optional[str] = None
+    text_case: Optional[str] = None
+    caption_x: Optional[float] = None
+    caption_y: Optional[float] = None
+    caption_rotation: Optional[float] = None
+    caption_max_width: Optional[float] = None
+    color_preset: Optional[str] = None
+    preset_intensity: Optional[float] = None
+    highlights: Optional[float] = None
+    shadows: Optional[float] = None
+    export_fps: Optional[str] = None
+    lut_path: Optional[str] = None
+    voice_eq_preset: Optional[str] = None
+    de_esser: Optional[bool] = None
+    loudness_target: Optional[str] = None
+    speed_ramp: Optional[float] = None
+    chroma_split: Optional[float] = None
+    letterbox: Optional[str] = None
+    outro_cta_enabled: Optional[bool] = None
+    options: Optional[Dict[str, Any]] = None
 
 
 class TrimClipRequest(BaseModel):
@@ -789,6 +1086,7 @@ class SettingsUpdateRequest(BaseModel):
     gemini_analysis_mode: Optional[str] = None
     auto_fallback_offline: Optional[bool] = None
     ai_provider: Optional[str] = None
+    ai_mode: Optional[str] = None
     ollama_endpoint: Optional[str] = None
     ollama_model: Optional[str] = None
     whisper_model: Optional[str] = None

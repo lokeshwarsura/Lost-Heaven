@@ -10,6 +10,8 @@ interface ClipFeedProps {
   isMerging?: boolean;
   onCompileTrailer?: () => Promise<void>;
   isCompilingTrailer?: boolean;
+  onAutoFrameAll?: () => Promise<void>;
+  isAutoFramingAll?: boolean;
 }
 
 export const ClipFeed: React.FC<ClipFeedProps> = ({
@@ -20,6 +22,8 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
   isMerging = false,
   onCompileTrailer,
   isCompilingTrailer = false,
+  onAutoFrameAll,
+  isAutoFramingAll = false,
 }) => {
   const [sortBy, setSortBy] = useState<'score' | 'timeline'>('score');
   const [mergeMode, setMergeMode] = useState(false);
@@ -77,7 +81,19 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
           </h2>
         </div>
 
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex flex-wrap items-center justify-end gap-1 shrink-0">
+          {onAutoFrameAll && clips.length > 0 && (
+            <button
+              type="button"
+              disabled={isAutoFramingAll}
+              onClick={() => void onAutoFrameAll()}
+              className="px-2 py-1 rounded-lg border bg-[var(--accent-subtle)] border-[var(--accent-primary)]/50 text-[var(--accent-primary)] hover:brightness-110 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50"
+              title="Automatically analyze scene composition and apply ideal framing template to every clip"
+            >
+              {isAutoFramingAll ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
+              <span>{isAutoFramingAll ? 'Framing...' : 'Smart Auto-Frame All'}</span>
+            </button>
+          )}
           {onCompileTrailer && clips.length > 0 && (
             <button
               type="button"
@@ -97,11 +113,10 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
                 setMergeMode((v) => !v);
                 setMergeSelection([]);
               }}
-              className={`px-2 py-1 rounded-lg border text-[10px] font-bold flex items-center gap-1 transition ${
-                mergeMode
-                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
-                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)]'
-              }`}
+              className={`px-2 py-1 rounded-lg border text-[10px] font-bold flex items-center gap-1 transition ${mergeMode
+                ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)]'
+                }`}
               title="Select 2+ clips to stitch together"
             >
               <GitMerge className="w-3 h-3" />
@@ -170,13 +185,12 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
               <div
                 key={clip.id}
                 onClick={() => (mergeMode ? toggleMergeSelection(clip.id) : onSelectClip(clip))}
-                className={`group rounded-xl p-3 border transition-all cursor-pointer space-y-2 ${
-                  mergeMode && isCheckedForMerge
-                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
-                    : isSelected
+                className={`group rounded-xl p-3 border transition-all cursor-pointer space-y-2 ${mergeMode && isCheckedForMerge
+                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
+                  : isSelected
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
                     : 'bg-[var(--bg-card)] border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/45'
-                }`}
+                  }`}
               >
                 {/* Top Row: Rank pill, Duration + Range, Virality Score Badge */}
                 <div className="flex items-center justify-between gap-2">
@@ -223,6 +237,27 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
                     <p className="text-xs text-[var(--text-secondary)] line-clamp-2 leading-relaxed">
                       {clip.viral_rationale}
                     </p>
+                  )}
+
+                  {/* Affective Emotion, Narrative Arc & Engine Tags */}
+                  {(clip.dominant_emotion || clip.arc_label || clip.analysis_source?.startsWith('offline')) && (
+                    <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                      {(clip.dominant_emotion || clip.options?.dominant_emotion) && (
+                        <span className="px-1.5 py-0.5 rounded-md bg-purple-500/15 text-purple-300 border border-purple-500/30 text-[10px] font-bold capitalize">
+                          {String(clip.dominant_emotion || clip.options?.dominant_emotion).replace(/_/g, ' ')}
+                        </span>
+                      )}
+                      {(clip.arc_label || clip.options?.arc_label) && (
+                        <span className="px-1.5 py-0.5 rounded-md bg-[var(--bg-input)] text-[var(--text-secondary)] border border-[var(--border-subtle)] text-[10px] font-semibold">
+                          {clip.arc_label || clip.options?.arc_label}
+                        </span>
+                      )}
+                      {clip.analysis_source?.startsWith('offline') && (
+                        <span className="px-1.5 py-0.5 rounded-md bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-[9px] font-bold">
+                          Offline AI
+                        </span>
+                      )}
+                    </div>
                   )}
                 </div>
 

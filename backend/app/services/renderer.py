@@ -13,7 +13,11 @@ from typing import Dict, Any, Optional, Callable, List
 from app.config import settings
 from app.services.proxy import get_ffmpeg_cmd, detect_hardware_encoder, probe_video
 from app.services.caption_renderer import build_caption_ffconcat
-from app.services.face_tracker import track_faces_in_clip, detect_punch_zoom_peaks
+from app.services.face_tracker import (
+    track_faces_in_clip,
+    detect_punch_zoom_peaks,
+    compute_punch_focus_anchor,
+)
 from app.services.audio_mastering import (
     resolve_local_media_asset,
     stage_ascii_asset,
@@ -42,12 +46,14 @@ from app.services.timeline_editor import (
     compute_kept_segments_and_remapped_words,
     build_timeline_trim_concat_filter,
     build_profanity_bleep_filter,
+    select_cold_open_climax_window,
 )
 from app.services.reframer import (
     resolve_target_dimensions,
     build_multi_aspect_filter,
     canonicalize_framing_template,
     build_filter_complex_args,
+    prepare_clip_framing_data,
 )
 from app.services.filters import build_advanced_color_filter
 
@@ -198,7 +204,13 @@ def render_clip_ultra(
     custom_height: int = 1920,
     frame_layout: str = "auto_track",
     webcam_corner: str = "auto",
-    webcam_split_ratio: float = 0.38,
+    webcam_split_ratio: float = 0.40,
+    source_webcam_region: Optional[Dict[str, Any]] = None,
+    visual_map: Optional[Dict[str, Any]] = None,
+    framing_override: Optional[Dict[str, Any]] = None,
+    best_frames: Optional[List[Dict[str, Any]]] = None,
+    camera_motion: str = "steady",
+    whip_pan_cuts: bool = False,
     pip_border_color: str = "#F59E0B",
     zoom: float = 1.0,
     pan_x_offset: float = 0.0,
@@ -272,6 +284,7 @@ def render_clip_ultra(
     outro_cta_enabled: bool = False,
     outro_cta_text: str = "Subscribe for More",
     broll_segments: Optional[List[Dict[str, Any]]] = None,
+    broll_layout: str = "fullscreen",
     export_resolution: Optional[str] = None,
     hardware_mode: str = "gpu",
     # Hooks & Retention FX
@@ -301,6 +314,7 @@ def render_clip_ultra(
     backdrop_mode: str = "none",
     backdrop_blur_intensity: float = 18.0,
     backdrop_color: str = "#18181B",
+    depth_pop: float = 0.0,
     privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None,
     beat_sync_enabled: bool = False,
     spectrum_enabled: bool = False,
@@ -314,6 +328,7 @@ def render_clip_ultra(
     handle_corner: str = "bottom_right",
     handle_opacity: float = 0.65,
     handle_display_mode: str = "always",
+    options: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Complete ClipShip studio rendering pipeline:
@@ -388,28 +403,24 @@ def render_clip_ultra(
     )
 
     render_words = [dict(w) for w in (words or []) if not w.get("muted", False)]
-    cold_open_offset = 0.0
-    if use_cold_open and cold_open_quote:
-        co_start, co_end = find_cold_open_segment(render_words, cold_open_quote, duration)
-        cold_open_offset = co_end - co_start + 0.3
-        for w in render_words:
-            w["start"] = round(float(w.get("start", 0.0)) + cold_open_offset, 3)
-            w["end"] = round(float(w.get("end", 0.0)) + cold_open_offset, 3)
 
-    # Plan transcript-native & blade-split kept segments cleanly before tracking faces
+    # Plan transcript-native, dead-air silence, & blade-split kept segments cleanly BEFORE cold-open / face tracking
+    eff_cf_sec = (
+        max(0.03, float(merge_crossfade_sec or 0.03))
+        if (tighten_pacing or auto_trim_dead_air)
+        else float(merge_crossfade_sec or 0.03)
+    )
     tl_plan = compute_kept_segments_and_remapped_words(
         words=render_words,
         clip_start_time=source_start_anchor,
         clip_duration=source_span,
         tighten_pacing=tighten_pacing,
+        auto_trim_dead_air=auto_trim_dead_air,
         silence_threshold=silence_threshold,
         clean_filler_words=clean_filler_words,
-        crossfade_sec=(
-            max(0.04, float(merge_crossfade_sec or 0.04))
-            if tighten_pacing
-            else float(merge_crossfade_sec or 0.03)
-        ),
+        crossfade_sec=eff_cf_sec,
         explicit_keep_segments=explicit_abs_segs,
+        video_path=master_video_path,
     )
     kept_segments = tl_plan["kept_segments"]
     kept_segments_abs = tl_plan.get("kept_segments_abs") or [
@@ -417,53 +428,54 @@ def render_clip_ultra(
         for s, e in kept_segments
     ]
     has_cuts = tl_plan["has_cuts"]
-    effective_duration = float(tl_plan["effective_duration"])
+    main_duration = float(tl_plan["effective_duration"])
     post_cut_words = tl_plan["remapped_words"]
     use_multi_input = len(kept_segments_abs) > 1
 
-    # Track faces dynamically (stitching per-segment keyframes cleanly for multi-segment/merged clips)
-    if use_multi_input:
-        stitched_kfs: List[Dict[str, float]] = []
-        out_t_cursor = 0.0
-        cf_track = float(tl_plan.get("crossfade_sec", merge_crossfade_sec or 0.03))
-        detected_corner = "top_left"
-        for seg_idx, (seg_s, seg_e) in enumerate(kept_segments_abs):
-            seg_len = max(0.2, seg_e - seg_s)
-            seg_ft = track_faces_in_clip(
-                video_path=master_video_path,
-                start_sec=seg_s,
-                end_sec=seg_e,
-                mode="dual" if layout == "split_podcast" else "single",
-            )
-            if seg_idx == 0:
-                detected_corner = seg_ft.get("detected_webcam_corner", "top_left")
-            for kf in (seg_ft.get("keyframes") or []):
-                n_kf = dict(kf)
-                n_kf["t"] = round(out_t_cursor + float(kf.get("t", 0.0)), 3)
-                stitched_kfs.append(n_kf)
-            step_cf = min(cf_track, seg_len * 0.25) if seg_idx < len(kept_segments_abs) - 1 else 0.0
-            out_t_cursor += seg_len - step_cf
-        face_track_data = {
-            "video_path": master_video_path,
-            "source_w": src_w,
-            "source_h": src_h,
-            "keyframes": stitched_kfs or [{"t": 0.0, "cx": 0.5, "cy": 0.4}],
-            "detected_webcam_corner": detected_corner,
-        }
-    else:
-        ft_s = kept_segments_abs[0][0]
-        ft_e = kept_segments_abs[0][1]
-        face_track_data = track_faces_in_clip(
-            video_path=master_video_path,
-            start_sec=ft_s,
-            end_sec=ft_e,
-            mode="dual" if layout == "split_podcast" else "single",
-            cache_dir=str(work_dir),
+    # Cold-Open Climax Teaser: extract 2.5s climax from second half (>= 8.0s clips) & stitch via fadewhite xfade
+    cold_open_active = False
+    cold_open_window: Optional[tuple[float, float]] = None
+    cold_open_teaser_len = 2.50
+    cold_open_xfade = 0.20
+    cold_open_net_offset = 0.0
+    if use_cold_open and main_duration >= 8.0:
+        cold_open_window = select_cold_open_climax_window(
+            master_video_path,
+            clip_start_time=source_start_anchor,
+            clip_duration=source_span,
+            words=render_words,
+            cold_open_quote=cold_open_quote,
+            window_sec=2.50,
         )
-        detected_corner = face_track_data.get("detected_webcam_corner", "top_left")
+        if cold_open_window is not None:
+            co_s, co_e = cold_open_window
+            cold_open_teaser_len = max(0.8, round(co_e - co_s, 3))
+            cold_open_xfade = min(0.20, round(cold_open_teaser_len * 0.25, 3))
+            cold_open_net_offset = round(cold_open_teaser_len - cold_open_xfade, 3)
+            cold_open_active = True
+            for pw in post_cut_words:
+                pw["start"] = round(float(pw.get("start", 0.0)) + cold_open_net_offset, 3)
+                pw["end"] = round(float(pw.get("end", 0.0)) + cold_open_net_offset, 3)
 
-    effective_corner = detected_corner if (not webcam_corner or webcam_corner == "auto") else webcam_corner
+    effective_duration = round(main_duration + cold_open_net_offset, 3)
 
+    # Single Source of Truth framing analysis (identical keyframes & crop math as preview_frame.py)
+    face_track_data, effective_corner, _ = prepare_clip_framing_data(
+        video_path=master_video_path,
+        kept_segments_abs=kept_segments_abs,
+        frame_layout=layout,
+        webcam_corner=webcam_corner,
+        source_webcam_region=source_webcam_region,
+        visual_map=visual_map,
+        framing_override=framing_override,
+        best_frames=best_frames,
+        merge_crossfade_sec=float(tl_plan.get("crossfade_sec", merge_crossfade_sec or 0.03)),
+    )
+
+    opts = dict(options or {})
+    speed_ramp = max(0.5, min(2.0, float(opts.get("speed_ramp", 1.0) or 1.0)))
+    has_speed = abs(speed_ramp - 1.0) > 0.01
+    cap_duration = round(max(0.2, effective_duration / speed_ramp), 3) if has_speed else effective_duration
     if progress_callback:
         progress_callback(28, "Generating transparent RGBA caption frames...")
 
@@ -477,11 +489,37 @@ def render_clip_ultra(
         post_cut_words = mask_words_profanity(post_cut_words)
 
     # Drop deleted (caption-hidden) words before generating Pillow caption frames
-    caption_words = [w for w in post_cut_words if not w.get("deleted", False)]
+    caption_words = []
+    for w in post_cut_words:
+        if w.get("deleted", False):
+            continue
+        nw = dict(w)
+        if has_speed:
+            nw["start"] = round(float(nw.get("start", 0.0)) / speed_ramp, 3)
+            nw["end"] = round(float(nw.get("end", 0.0)) / speed_ramp, 3)
+        caption_words.append(nw)
 
     clean_chapters = normalize_chapters(chapters, clip_duration=effective_duration) if (chapters_enabled and chapters) else []
+    if cold_open_active and clean_chapters:
+        for ch_it in clean_chapters:
+            ch_it["start"] = round(float(ch_it.get("start", 0.0)) + cold_open_net_offset, 3)
+            ch_it["end"] = round(min(effective_duration, float(ch_it.get("end", 0.0)) + cold_open_net_offset), 3)
+    if has_speed and clean_chapters:
+        for ch_it in clean_chapters:
+            ch_it["start"] = round(float(ch_it.get("start", 0.0)) / speed_ramp, 3)
+            ch_it["end"] = round(float(ch_it.get("end", 0.0)) / speed_ramp, 3)
+    eff_callout_cards = [dict(c) for c in (callout_cards or []) if isinstance(c, dict)]
+    if cold_open_active and eff_callout_cards:
+        for card_it in eff_callout_cards:
+            card_it["start"] = round(float(card_it.get("start", 0.0)) + cold_open_net_offset, 3)
+            card_it["end"] = round(min(effective_duration, float(card_it.get("end", 0.0)) + cold_open_net_offset), 3)
+    if has_speed and eff_callout_cards:
+        for card_it in eff_callout_cards:
+            card_it["start"] = round(float(card_it.get("start", 0.0)) / speed_ramp, 3)
+            card_it["end"] = round(float(card_it.get("end", 0.0)) / speed_ramp, 3)
+
     beat_data: Dict[str, Any] = {}
-    if (beat_sync_enabled or spectrum_enabled) and has_audio:
+    if (beat_sync_enabled or spectrum_enabled or camera_motion == "beat_punch") and has_audio:
         try:
             beat_data = detect_audio_beats(
                 master_video_path,
@@ -495,6 +533,7 @@ def render_clip_ultra(
 
     render_overlay = bool(
         burn_captions
+        or cold_open_active
         or retention_bar_enabled
         or outro_cta_enabled
         or speaker_lower_thirds
@@ -510,7 +549,7 @@ def render_clip_ultra(
             is_word_by_word = str(how_phrase_arrives or "All at once").lower().replace("-", " ") == "word by word"
             cap_temp_dir, _, _ = build_caption_ffconcat(
                 words=caption_words,
-                clip_duration=effective_duration,
+                clip_duration=cap_duration,
                 width=target_w,
                 height=target_h,
                 burn_captions=burn_captions,
@@ -520,6 +559,9 @@ def render_clip_ultra(
                 retention_bar_color=retention_bar_color,
                 outro_cta_enabled=outro_cta_enabled,
                 outro_cta_text=outro_cta_text,
+                outro_cta_headline=str(opts.get("outro_cta_headline", "") or ""),
+                outro_cta_handle=str(opts.get("outro_cta_handle", "") or ""),
+                outro_logo_path=opts.get("outro_logo_path"),
                 clip_start_time=0.0,
                 project_id=project_id,
                 timing_offset=timing_offset,
@@ -535,6 +577,10 @@ def render_clip_ultra(
                 position_grid=position_grid,
                 pos_x=position_x,
                 pos_y=position_y,
+                caption_x=opts.get("caption_x"),
+                caption_y=opts.get("caption_y"),
+                caption_rotation=float(opts.get("caption_rotation", 0.0) or 0.0),
+                caption_max_width=float(opts.get("caption_max_width", 0.82) or 0.82),
                 base_color=base_color,
                 highlight_color=active_color,
                 outline_color=outline_color,
@@ -550,7 +596,7 @@ def render_clip_ultra(
                 speaker_lower_thirds=speaker_lower_thirds,
                 face_safe_captions=face_safe_captions,
                 face_keyframes=face_track_data.get("keyframes") or [],
-                callout_cards=callout_cards,
+                callout_cards=eff_callout_cards,
                 auto_callouts=auto_callouts,
                 bilingual_enabled=bilingual_enabled,
                 secondary_language=secondary_language,
@@ -566,6 +612,12 @@ def render_clip_ultra(
                 handle_corner=handle_corner,
                 handle_opacity=handle_opacity,
                 handle_display_mode=handle_display_mode,
+                cold_open_active=cold_open_active,
+                cold_open_teaser_dur=round((cold_open_net_offset if cold_open_active else 2.3) / speed_ramp, 3),
+                caption_animation=caption_animation,
+                pill_color=opts.get("pill_color"),
+                pacing_density=opts.get("pacing_density", "3-4 Words Viral"),
+                text_case=opts.get("text_case", "ALL CAPS" if all_caps else "As Spoken"),
             )
             exec_dir = cap_temp_dir
         else:
@@ -593,6 +645,9 @@ def render_clip_ultra(
                 multi_input=use_multi_input,
             )
             fg_segments.append(tl_fg)
+        else:
+            fg_segments.append("[0:v]setpts=PTS-STARTPTS[v_pts]")
+            v_in_lbl = "v_pts"
 
         layout_vf = build_multi_aspect_filter(
             aspect_ratio=aspect_ratio,
@@ -611,16 +666,109 @@ def render_clip_ultra(
             is_video_render=True,
             target_size=(target_w, target_h),
             input_label=v_in_lbl,
+            camera_motion=camera_motion,
+            whip_pan_cuts=whip_pan_cuts,
+            clip_duration=main_duration,
+            fps=max(15.0, min(60.0, float(meta.get("fps") or 30.0))),
+            beat_timestamps=beat_data.get("beats"),
         )
         fg_segments.append(layout_vf)
 
+        # If Cold-Open Climax teaser is active, frame teaser independently and stitch via fadewhite xfade
+        co_in_idx: Optional[int] = None
+        if cold_open_active and cold_open_window is not None:
+            # Avoid duplicate `[v]` pad label in filter_complex by renaming main layout output
+            fg_segments[-1] = re.sub(r"\[v\](?=[^[]*$)", "[v_main_src]", fg_segments[-1])
+            src_fps_norm = max(15.0, min(60.0, float(meta.get("fps") or 30.0)))
+            co_in_idx = len(kept_segments_abs) if use_multi_input else 1
+            co_face_data, co_eff_corner, _ = prepare_clip_framing_data(
+                video_path=master_video_path,
+                kept_segments_abs=[cold_open_window],
+                frame_layout=layout,
+                webcam_corner=webcam_corner,
+                source_webcam_region=source_webcam_region,
+                visual_map=None,
+                framing_override=framing_override,
+                best_frames=None,
+                merge_crossfade_sec=0.0,
+            )
+            co_layout_vf = build_multi_aspect_filter(
+                aspect_ratio=aspect_ratio,
+                frame_layout=layout,
+                source_w=src_w,
+                source_h=src_h,
+                custom_w=target_w,
+                custom_h=target_h,
+                webcam_corner=co_eff_corner,
+                webcam_split_ratio=webcam_split_ratio,
+                pip_border_color=pip_border_color,
+                zoom=zoom,
+                pan_x_offset=pan_x_offset,
+                pan_x=pan_x,
+                face_track_data=co_face_data,
+                is_video_render=True,
+                target_size=(target_w, target_h),
+                input_label="__CO_IN__",
+                camera_motion="steady",
+                whip_pan_cuts=False,
+                clip_duration=cold_open_teaser_len,
+                fps=src_fps_norm,
+            )
+            # Scope internal filtergraph labels to `[co_*]` so main stream `[v_main_src]` never collides
+            co_layout_scoped = re.sub(
+                r"\[([a-zA-Z_][a-zA-Z0-9_]*)\]",
+                lambda m: f"[co_{m.group(1)}]",
+                co_layout_vf,
+            ).replace("[co___CO_IN__]", f"[{co_in_idx}:v]")
+            fg_segments.append(co_layout_scoped)
+            fg_segments.append(
+                f"[co_v]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS[co_v_norm]"
+            )
+            fg_segments.append(
+                f"[v_main_src]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS[main_v_norm]"
+            )
+            fg_segments.append(
+                f"[co_v_norm][main_v_norm]xfade=transition=fadewhite:duration={cold_open_xfade:.3f}:"
+                f"offset={cold_open_net_offset:.3f},setpts=PTS-STARTPTS[v]"
+            )
+            if has_audio and a_in_lbl:
+                fg_segments.append(
+                    f"[{co_in_idx}:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS[co_a_norm]"
+                )
+                fg_segments.append(
+                    f"[{a_in_lbl}]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
+                    f"asetpts=PTS-STARTPTS[main_a_norm]"
+                )
+                fg_segments.append(
+                    f"[co_a_norm][main_a_norm]acrossfade=d={cold_open_xfade:.3f}:c1=qsin:c2=qsin[a_co]"
+                )
+                a_in_lbl = "a_co"
+
+        staged_lut_rel: Optional[str] = None
+        if opts.get("lut_path"):
+            lut_abs = resolve_local_media_asset(str(opts.get("lut_path")))
+            if lut_abs and os.path.exists(lut_abs):
+                staged_lut_rel = stage_ascii_asset(lut_abs, exec_dir, target_stem="cinema_lut")
+
         color_vf = build_advanced_color_filter(
             preset=color_preset,
+            preset_intensity=float(opts.get("preset_intensity", 100.0) if opts.get("preset_intensity") is not None else 100.0),
             exposure=exposure,
             brightness=brightness,
             contrast=contrast,
             lift_mids=lift_mids,
+            highlights=float(opts.get("highlights", 0.0) or 0.0),
+            shadows=float(opts.get("shadows", 0.0) or 0.0),
             warmth=warmth,
+            color_temp=float(opts.get("color_temp", 0.0) or 0.0),
+            tint_shift=float(opts.get("tint_shift", 0.0) or 0.0),
+            vibrance=float(opts.get("vibrance", 0.0) or 0.0),
+            matte_fade=float(opts.get("matte_fade", 0.0) or 0.0),
+            halation_glow=float(opts.get("halation_glow", 0.0) or 0.0),
+            lut_path=staged_lut_rel,
+            chroma_split=float(opts.get("chroma_split", 0.0) or 0.0),
+            letterbox=str(opts.get("letterbox", "none") or "none"),
             saturation=saturation,
             black_and_white=black_and_white,
             vintage=vintage,
@@ -631,8 +779,11 @@ def render_clip_ultra(
             sharpness=sharpness,
             blur=blur,
             film_grain=film_grain,
-            vignette=vignette,
+            # Never darken PiP webcam corners with radial vignette
+            vignette=0.0 if layout == "gameplay_webcam_pip" else vignette,
             bottom_fade=bottom_fade,
+            target_w=target_w,
+            target_h=target_h,
         )
 
         punch_data: Dict[str, Any] = {"punch_timestamps": [], "punch_intervals": [], "peak_zoom": punch_zoom_intensity}
@@ -640,12 +791,29 @@ def render_clip_ultra(
             punch_data = detect_punch_zoom_peaks(
                 master_video_path,
                 start_sec=source_start_anchor,
-                end_sec=source_start_anchor + max(0.5, effective_duration),
+                end_sec=source_start_anchor + max(0.5, main_duration),
                 base_zoom=1.0,
                 punch_intensity=punch_zoom_intensity,
             )
+            if cold_open_active and punch_data.get("punch_intervals"):
+                punch_data["punch_timestamps"] = [
+                    round(float(t) + cold_open_net_offset, 3)
+                    for t in (punch_data.get("punch_timestamps") or [])
+                ]
+                punch_data["punch_intervals"] = [
+                    (
+                        round(float(t0) + cold_open_net_offset, 3),
+                        round(min(effective_duration, float(t1) + cold_open_net_offset), 3),
+                        pz,
+                    )
+                    for t0, t1, pz in punch_data["punch_intervals"]
+                ]
 
-        active_broll_segments = list(broll_segments or [])
+        active_broll_segments = [dict(b) for b in (broll_segments or []) if isinstance(b, dict)]
+        if cold_open_active and active_broll_segments:
+            for bs_item in active_broll_segments:
+                bs_item["start"] = round(float(bs_item.get("start", 0.0)) + cold_open_net_offset, 3)
+                bs_item["end"] = round(min(effective_duration, float(bs_item.get("end", 0.0)) + cold_open_net_offset), 3)
         if beat_sync_enabled and beat_data.get("beats"):
             snapped_punch, active_broll_segments = snap_punch_and_broll_to_beats(
                 punch_data if punch_data.get("punch_intervals") else None,
@@ -658,23 +826,23 @@ def render_clip_ultra(
 
         punch_zoom_vf = ""
         if dynamic_punch_zoom and punch_data.get("punch_intervals"):
-            src_fps = max(15.0, min(60.0, float(meta.get("fps") or 30.0)))
-            t_var = f"(on/{src_fps:.3f})"
+            fx, fy = compute_punch_focus_anchor(face_track_data, framing_override=framing_override)
             z_expr = "1.0"
             for t0, t1, pz in reversed(punch_data["punch_intervals"]):
+                span = max(0.08, float(t1) - float(t0))
+                ramp_in = span * 0.34
+                ramp_out = max(0.04, span - ramp_in)
                 dz = max(0.02, float(pz) - 1.0)
-                ramp_in = min(0.18, max(0.05, (t1 - t0) * 0.25))
-                ramp_out = min(0.22, max(0.05, (t1 - t0) * 0.25))
                 seg = (
-                    f"if(lt({t_var},{t0 + ramp_in:.3f}),"
-                    f"1.0+{dz:.3f}*(({t_var}-{t0:.3f})/{ramp_in:.3f}),"
-                    f"if(lt({t_var},{t1 - ramp_out:.3f}),{1.0 + dz:.3f},"
-                    f"{1.0 + dz:.3f}-{dz:.3f}*(({t_var}-{t1 - ramp_out:.3f})/{ramp_out:.3f})))"
+                    f"if(lt(t,{t0 + ramp_in:.3f}),"
+                    f"1.0+{dz:.3f}*((t-{t0:.3f})/{ramp_in:.3f}),"
+                    f"{1.0 + dz:.3f}-{dz:.3f}*((t-{t0 + ramp_in:.3f})/{ramp_out:.3f}))"
                 )
-                z_expr = f"if(between({t_var},{t0:.3f},{t1:.3f}),{seg},{z_expr})"
+                z_expr = f"if(between(t,{t0:.3f},{t1:.3f}),{seg},{z_expr})"
             punch_zoom_vf = (
-                f"zoompan=z='{z_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-                f"s={target_w}x{target_h}:fps={src_fps:.3f}"
+                f"scale=w='trunc({target_w}*({z_expr})/2)*2':"
+                f"h='trunc({target_h}*({z_expr})/2)*2':eval=frame:flags=lanczos,"
+                f"crop=w={target_w}:h={target_h}:x='(iw-ow)*{fx:.4f}':y='(ih-oh)*{fy:.4f}',setsar=1"
             )
 
         # Stage optional BGM & Micro-SFX assets into ASCII temp exec_dir
@@ -700,15 +868,22 @@ def render_clip_ultra(
                 "-i", os.path.abspath(master_video_path),
             ])
             next_in_idx = 1
+        if cold_open_active and cold_open_window is not None:
+            input_args.extend([
+                "-ss", f"{max(0.0, cold_open_window[0]):.3f}",
+                "-t", f"{max(0.2, cold_open_window[1] - cold_open_window[0]):.3f}",
+                "-i", os.path.abspath(master_video_path),
+            ])
+            next_in_idx += 1
         base_input_args = list(input_args)
-        pre_fg_chain = f"{tl_fg};{layout_vf}" if has_cuts else layout_vf
+        pre_fg_chain = ";".join(fg_segments)
         cap_in_idx: Optional[int] = None
         if render_overlay:
             cap_in_idx = next_in_idx
             input_args.extend(["-f", "concat", "-safe", "0", "-i", "captions.ffconcat"])
             next_in_idx += 1
 
-        broll_specs: List[tuple[int, float, float, bool]] = []
+        broll_specs: List[tuple[Any, ...]] = []
         for b_idx, bseg in enumerate(active_broll_segments):
             if not isinstance(bseg, dict) or not bseg.get("enabled", True):
                 continue
@@ -727,7 +902,8 @@ def render_clip_ultra(
                 input_args.extend(["-loop", "1", "-t", f"{(be - bs + 0.5):.3f}", "-i", staged_b])
             else:
                 input_args.extend(["-i", staged_b])
-            broll_specs.append((next_in_idx, bs, be, is_img))
+            seg_lay = str(bseg.get("layout") or broll_layout or "fullscreen")
+            broll_specs.append((next_in_idx, bs, be, is_img, seg_lay))
             next_in_idx += 1
 
         staged_bgm_name: Optional[str] = None
@@ -744,19 +920,21 @@ def render_clip_ultra(
         callout_sfx_times = (
             [
                 float(c.get("start", 0.0))
-                for c in (callout_cards or [])
+                for c in eff_callout_cards
                 if isinstance(c, dict) and c.get("enabled", True)
             ]
             if auto_callouts
             else []
         )
-        if auto_sfx or callout_sfx_times:
+        cold_open_sfx_times = [round(cold_open_net_offset - 0.05, 3)] if cold_open_active else []
+        if auto_sfx or callout_sfx_times or cold_open_sfx_times:
             sfx_events = plan_sfx_events(
                 effective_duration,
                 show_hook_banner=bool(auto_sfx and show_hook_banner and hook_headline),
                 hook_headline=hook_headline or "",
                 punch_timestamps=punch_data.get("punch_timestamps") if auto_sfx else [],
                 callout_timestamps=callout_sfx_times,
+                transition_times=cold_open_sfx_times,
             )
             staged_sfx = stage_sfx_inputs(sfx_events, exec_dir)
             for sfx_ev in staged_sfx:
@@ -791,9 +969,10 @@ def render_clip_ultra(
 
         # Stage AI foreground matte + static backdrop + tracked privacy blur trajectories
         eff_backdrop = canonicalize_backdrop_mode(backdrop_mode)
+        eff_depth_pop = max(0.0, min(1.0, float(depth_pop or 0.0)))
         matte_in_idx: Optional[int] = None
         bg_static_in_idx: Optional[int] = None
-        if eff_backdrop != "none":
+        if eff_backdrop != "none" or eff_depth_pop > 0.01:
             matte_name, bg_png_name = generate_clip_matte_video_and_backdrop(
                 exec_dir=exec_dir,
                 base_input_args=base_input_args,
@@ -805,6 +984,7 @@ def render_clip_ultra(
                 backdrop_mode=eff_backdrop,
                 blur_intensity=backdrop_blur_intensity,
                 backdrop_color=backdrop_color,
+                depth_pop=eff_depth_pop,
             )
             if matte_name and (exec_dir / matte_name).exists():
                 matte_in_idx = next_in_idx
@@ -848,12 +1028,20 @@ def render_clip_ultra(
                 target_h=target_h,
                 blur_intensity=backdrop_blur_intensity,
                 static_bg_input_idx=bg_static_in_idx,
+                depth_pop=eff_depth_pop,
                 out_label="v_backdrop",
             )
         if broll_specs:
             src_fps_b = max(15.0, min(60.0, float(meta.get("fps") or 30.0)))
             broll_fg, curr_v_lbl = build_broll_overlay_filter(
-                curr_v_lbl, broll_specs, target_w, target_h, fps=src_fps_b, out_label="v_broll"
+                curr_v_lbl,
+                broll_specs,
+                target_w,
+                target_h,
+                fps=src_fps_b,
+                out_label="v_broll",
+                default_layout=broll_layout,
+                reaction_corner=webcam_corner if webcam_corner and webcam_corner != "auto" else "top_right",
             )
             if broll_fg:
                 fg_segments.append(broll_fg)
@@ -868,6 +1056,10 @@ def render_clip_ultra(
                 out_label="v_pblur",
             )
             fg_segments.extend(blur_frags)
+
+        if has_speed:
+            fg_segments.append(f"[{curr_v_lbl}]setpts=(PTS-STARTPTS)/{speed_ramp:.4f}[v_spd]")
+            curr_v_lbl = "v_spd"
 
         if render_overlay and cap_in_idx is not None:
             next_in_idx, curr_v_lbl = apply_watermark_to_filtergraph(
@@ -907,10 +1099,15 @@ def render_clip_ultra(
             vocal_clarity=vocal_clarity,
             audio_volume=audio_volume,
             normalize_audio=normalize_audio,
+            voice_eq_preset=str(opts.get("voice_eq_preset", "Raw") or "Raw"),
+            de_esser=bool(opts.get("de_esser", False)),
+            loudness_target=str(opts.get("loudness_target", "-14 LUFS") or "-14 LUFS"),
+            speed_ramp=speed_ramp,
         )
 
         use_fc_audio = has_audio and (
             has_cuts
+            or cold_open_active
             or len(prof_intervals) > 0
             or (bgm_in_idx is not None)
             or len(sfx_input_specs) > 0
@@ -941,22 +1138,26 @@ def render_clip_ultra(
             curr_a = "a_voice"
             if rt_in_idx is not None:
                 rt_frag, curr_a = build_room_tone_bed_filter(
-                    curr_a, rt_in_idx, effective_duration, out_label="a_room"
+                    curr_a, rt_in_idx, cap_duration, out_label="a_room"
                 )
                 fg_segments.append(rt_frag)
             if dub_in_idx is not None:
                 dub_frag, curr_a = build_dubbed_audio_mix_filter(
-                    curr_a, dub_in_idx, effective_duration, bed_volume=dubbing_bed_volume, out_label="a_dub"
+                    curr_a, dub_in_idx, cap_duration, bed_volume=dubbing_bed_volume, out_label="a_dub"
                 )
                 fg_segments.append(dub_frag)
             if bgm_in_idx is not None:
                 bgm_frag, curr_a = build_ducked_bgm_filter(
-                    curr_a, bgm_in_idx, effective_duration, bgm_volume=bgm_volume, out_label="a_bgm"
+                    curr_a, bgm_in_idx, cap_duration, bgm_volume=bgm_volume, out_label="a_bgm"
                 )
                 fg_segments.append(bgm_frag)
             if sfx_input_specs:
+                sfx_scaled = [
+                    (idx, round(ts / speed_ramp, 3) if has_speed else ts, g)
+                    for idx, ts, g in sfx_input_specs
+                ]
                 sfx_frag, curr_a = build_sfx_mix_filter(
-                    curr_a, sfx_input_specs, effective_duration, out_label="a_sfx"
+                    curr_a, sfx_scaled, cap_duration, out_label="a_sfx"
                 )
                 fg_segments.append(sfx_frag)
             fg_segments.append(f"[{curr_a}]anull[a_out]")
@@ -1016,6 +1217,9 @@ def render_clip_ultra(
 
             return proc.returncode, (stderr_out or "")
 
+        export_fps_opt = str(opts.get("export_fps", "source") or "source").strip().lower()
+        fps_cli_args = ["-r", "60"] if export_fps_opt in ("60", "60fps", "60.0") else []
+
         def _build_cmd(video_enc_args: List[str]) -> List[str]:
             return [
                 ffmpeg,
@@ -1023,6 +1227,7 @@ def render_clip_ultra(
                 *input_args,
                 *fg_args,
                 "-map", "[v_out]",
+                *fps_cli_args,
                 *video_enc_args,
                 "-pix_fmt", "yuv420p",
                 *audio_cli_args,

@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   CheckCircle2, Clock, Terminal, ChevronDown, ChevronUp,
   AlertCircle, RefreshCw, XCircle, ArrowRight, Sparkles,
-  Cpu, HardDrive, FileVideo, Layers, ShieldCheck, Key, Eye, EyeOff
+  Cpu, HardDrive, FileVideo, Layers, ShieldCheck, Key, Eye, EyeOff,
+  Copy, Check
 } from 'lucide-react';
 import { JobProgress, BatchQueueItem } from '../types';
 import { api } from '../api/client';
@@ -27,6 +28,8 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
   const [autoOpenEditor, setAutoOpenEditor] = useState(true);
   const [autoOpenCountdown, setAutoOpenCountdown] = useState<number | null>(null);
   const [isLogsExpanded, setIsLogsExpanded] = useState(true);
+  const [autoScrollLogs, setAutoScrollLogs] = useState(true);
+  const [copiedLogs, setCopiedLogs] = useState(false);
 
   // Gemini API Key Recovery Card State
   const [apiKeyInput, setApiKeyInput] = useState('');
@@ -71,7 +74,7 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
       setElapsedSeconds(Math.max(0, progress.elapsed_seconds));
     } else if (progress?.started_at) {
       const startTime = new Date(progress.started_at).getTime();
-      const isComplete = progress.status === 'finished' || progress.status === 'analyzed' || progress.status === 'error' || progress.status === 'cancelled' || progress.status === 'awaiting_api_key';
+      const isComplete = progress.status === 'finished' || progress.status === 'analyzed' || progress.status === 'error' || progress.status === 'failed' || progress.status === 'cancelled' || progress.status === 'awaiting_api_key';
       const endTime = isComplete && progress.updated_at ? new Date(progress.updated_at).getTime() : Date.now();
       setElapsedSeconds(Math.max(0, Math.floor((endTime - startTime) / 1000)));
     } else {
@@ -89,12 +92,26 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
     };
   }, [progress?.elapsed_seconds, progress?.started_at, progress?.status, progress?.updated_at]);
 
-  // Auto-scroll logs
+  // Auto-scroll logs cleanly when Auto-Scroll is enabled
   useEffect(() => {
-    if (isLogsExpanded) {
-      logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (isLogsExpanded && autoScrollLogs) {
+      logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
-  }, [progress?.logs, isLogsExpanded]);
+  }, [progress?.logs, isLogsExpanded, autoScrollLogs]);
+
+  const handleCopyLogs = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const lines = (progress?.logs || []).map(
+      (l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.stage}] ${l.message}`
+    );
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'));
+      setCopiedLogs(true);
+      setTimeout(() => setCopiedLogs(false), 2000);
+    } catch {
+      // ignore clipboard restrictions
+    }
+  };
 
   // Reset auto-redirect countdown when project switches
   useEffect(() => {
@@ -187,16 +204,18 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
   };
 
   const isFinished = progress?.status === 'finished' || progress?.status === 'analyzed';
-  const isError = progress?.status === 'error';
+  const isError = progress?.status === 'error' || progress?.status === 'failed';
   const isCancelled = progress?.status === 'cancelled';
   const isAwaitingApiKey = progress?.status === 'awaiting_api_key';
 
+  const isOfflineMode = progress?.ai_mode === 'offline' || progress?.ai_provider === 'offline';
+
   return (
-    <div className="flex-1 h-full overflow-y-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] transition-colors p-6 md:p-10 select-none flex flex-col items-center justify-center">
-      <div className="w-full max-w-3xl mx-auto space-y-6 animate-fadeIn py-6">
+    <div className="flex-1 h-full overflow-y-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] transition-colors px-4 py-6 md:p-8 select-none flex flex-col items-center justify-start">
+      <div className="w-full max-w-4xl mx-auto my-auto space-y-6 animate-fadeIn pt-4 pb-6">
         
         {/* Main Central Studio Progress Card */}
-        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 md:p-8 shadow-2xl space-y-6 relative overflow-hidden">
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 md:p-8 shadow-2xl space-y-6 relative overflow-visible">
           
           {/* Top Metadata Bar */}
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-5 border-b border-[var(--border-subtle)]">
@@ -286,12 +305,24 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
           </div>
 
           {/* 5-Step Pipeline Stepper */}
-          <div className="grid grid-cols-5 gap-2 pt-2">
+          <div className="grid grid-cols-5 gap-2.5 pt-4 overflow-visible">
             {(progress?.stages || [
               { id: 'ingest', name: 'Media Prep', desc: 'Probing video stream', status: 'running', percent: 20 },
-              { id: 'audio', name: 'Audio Prep', desc: '16kHz WAV & 480p proxy', status: 'pending', percent: 0 },
+              {
+                id: 'audio',
+                name: progress?.needs_proxy ? '480p Proxy' : 'Fast Audio Extract',
+                desc: progress?.needs_proxy ? '16kHz WAV & 480p proxy' : '16kHz mono WAV',
+                status: 'pending',
+                percent: 0,
+              },
               { id: 'transcribe', name: 'Whisper VAD', desc: 'Voice recognition', status: 'pending', percent: 0 },
-              { id: 'gemini', name: 'Gemini AI', desc: 'Viral moment detection', status: 'pending', percent: 0 },
+              {
+                id: 'gemini',
+                name: isOfflineMode ? 'Offline Multimodal AI' : 'Gemini Multimodal AI',
+                desc: isOfflineMode ? 'Local emotion & arc engine' : 'Viral moment detection',
+                status: 'pending',
+                percent: 0,
+              },
               { id: 'ready', name: 'Sync & Ready', desc: 'Generating clips', status: 'pending', percent: 0 }
             ]).map((st, idx) => {
               const isDone = st.status === 'done';
@@ -302,7 +333,7 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
               return (
                 <div
                   key={st.id || idx}
-                  className={`p-3 rounded-2xl border text-center transition flex flex-col items-center justify-between gap-1.5 ${
+                  className={`p-3 rounded-2xl border text-center transition flex flex-col items-center justify-between gap-1.5 overflow-visible ${
                     isDone
                       ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
                       : isActionRequired
@@ -311,10 +342,10 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
                       ? 'bg-[var(--accent-primary)]/10 border-[var(--accent-primary)] text-[var(--text-primary)] ring-1 ring-[var(--accent-primary)]/30'
                       : isFailed
                       ? 'bg-red-500/10 border-red-500/30 text-red-400'
-                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] opacity-60'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] opacity-75'
                   }`}
                 >
-                  <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-black">
+                  <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-black shrink-0">
                     {isDone ? (
                       <CheckCircle2 className="w-5 h-5 text-emerald-400" />
                     ) : isActionRequired ? (
@@ -328,11 +359,11 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
                     )}
                   </div>
 
-                  <div className="w-full min-w-0 overflow-hidden text-center">
-                    <span className="block text-[11px] font-bold text-[var(--text-primary)] truncate">
+                  <div className="w-full min-w-0 text-center">
+                    <span className="block text-[11px] font-bold text-[var(--text-primary)] leading-snug">
                       {st.name}
                     </span>
-                    <span className="block text-[9px] text-[var(--text-secondary)] leading-tight line-clamp-2">
+                    <span className="block text-[9px] text-[var(--text-secondary)] leading-tight mt-0.5 line-clamp-2">
                       {isActionRequired ? 'Key Required' : st.desc}
                     </span>
                   </div>
@@ -558,29 +589,77 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
 
           {/* Live Console Logs Accordion */}
           <div className="border border-[var(--border-subtle)] rounded-2xl overflow-hidden bg-[var(--bg-card)]">
-            <button
-              type="button"
-              onClick={() => setIsLogsExpanded(!isLogsExpanded)}
-              className="w-full px-4 py-3 bg-[var(--bg-input)] flex items-center justify-between text-xs font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
-            >
-              <div className="flex items-center gap-2">
-                <Terminal className="w-4 h-4 text-[var(--accent-primary)]" />
-                <span>Live Studio Terminal Console</span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[var(--bg-card)] text-[var(--text-secondary)] tabular-nums">
+            <div className="px-4 py-2.5 bg-[var(--bg-input)] border-b border-[var(--border-subtle)]/60 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <button
+                type="button"
+                onClick={() => setIsLogsExpanded(!isLogsExpanded)}
+                className="flex flex-wrap items-center gap-2 font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
+              >
+                <Terminal className="w-4 h-4 text-[var(--accent-primary)] shrink-0" />
+                <span className="text-[var(--text-primary)]">Live Studio Terminal Console</span>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--text-secondary)] tabular-nums">
                   {progress?.logs?.length || 0} events
                 </span>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-500/10 border border-sky-500/30 text-sky-400 font-bold">
+                  {progress?.whisper_badge || 'GPU / CPU'}
+                </span>
+                <span
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded border font-bold ${
+                    isOfflineMode
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                      : 'bg-[var(--accent-subtle)] border-[var(--accent-primary)]/35 text-[var(--accent-primary)]'
+                  }`}
+                >
+                  Mode: {isOfflineMode ? 'Offline AI' : progress?.ai_provider === 'ollama' ? 'Ollama' : 'Gemini'}
+                </span>
+                {isLogsExpanded ? <ChevronUp className="w-3.5 h-3.5 ml-0.5" /> : <ChevronDown className="w-3.5 h-3.5 ml-0.5" />}
+              </button>
+
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setAutoScrollLogs((v) => !v)}
+                  className={`px-2 py-1 rounded-lg border text-[10px] font-bold transition ${
+                    autoScrollLogs
+                      ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-400'
+                      : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
+                  title="Toggle automatic scrolling to latest log line"
+                >
+                  Auto-Scroll: {autoScrollLogs ? 'ON' : 'OFF'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCopyLogs}
+                  className="px-2 py-1 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] text-[10px] font-bold flex items-center gap-1 transition"
+                  title="Copy full terminal output"
+                >
+                  {copiedLogs ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                  <span>{copiedLogs ? 'Copied' : 'Copy Logs'}</span>
+                </button>
+                {!isFinished && !isError && !isCancelled && (
+                  <button
+                    type="button"
+                    onClick={handleCancelJob}
+                    disabled={isCancelling}
+                    className="px-2 py-1 rounded-lg bg-red-500/15 border border-red-500/35 hover:bg-red-500/25 text-red-400 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50"
+                    title="Abort current pipeline job"
+                  >
+                    <XCircle className="w-3 h-3" />
+                    <span>{isCancelling ? 'Aborting...' : 'Cancel Job'}</span>
+                  </button>
+                )}
               </div>
-              {isLogsExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-            </button>
+            </div>
 
             {isLogsExpanded && (
-              <div className="p-4 font-mono text-[11px] max-h-48 overflow-y-auto space-y-1.5 bg-[var(--bg-input)] text-[var(--text-primary)]">
+              <div className="px-4 pt-3.5 pb-3 font-mono text-[11px] max-h-52 overflow-y-auto space-y-2 bg-[var(--bg-input)] text-[var(--text-primary)]">
                 {(progress?.logs || []).map((l, i) => (
                   <div key={i} className="flex items-start gap-2 leading-relaxed">
                     <span className="text-[var(--text-secondary)] flex-shrink-0 tabular-nums">
                       {new Date(l.timestamp).toLocaleTimeString()}
                     </span>
-                    <span className={`text-[9px] font-black uppercase px-1 rounded flex-shrink-0 ${
+                    <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded flex-shrink-0 ${
                       l.level === 'SUCCESS'
                         ? 'bg-emerald-500/20 text-emerald-400'
                         : l.level === 'ERROR'
@@ -591,7 +670,7 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
                     }`}>
                       {l.stage}
                     </span>
-                    <span className="text-[var(--text-primary)] break-all">{l.message}</span>
+                    <span className="text-[var(--text-primary)] break-words min-w-0">{l.message}</span>
                   </div>
                 ))}
                 <div ref={logsEndRef} />

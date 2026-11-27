@@ -74,10 +74,16 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
     { name: 'Brand Block', font: 'Montserrat', base: '#000000', active: '#000000', preview: 'AMBER BLOCK', block: true, bold: true }
   ];
 
-  const animationsOnce = [
-    'None', 'Fade in', 'Slide up', 'Slide across', 'Pop', 'Zoom', 'Soft bounce', 'Hard bounce', 'Elastic', 'Pulse'
+  const kineticPhysics = [
+    { id: 'Pop Bounce', label: 'Pop Bounce', desc: 'Elastic punch settle' },
+    { id: 'Slide Up', label: 'Slide Up', desc: 'Vertical ease-out rise' },
+    { id: 'Scale Slam', label: 'Scale Slam', desc: 'High-impact drop' },
+    { id: 'Blur Fade', label: 'Blur Fade', desc: 'Soft optical resolve' },
+    { id: 'Typewriter Reveal', label: 'Typewriter Reveal', desc: 'Sequential word reveal' },
+    { id: 'Instant Cut', label: 'Instant Cut', desc: 'Frame-locked hard cut' },
   ];
-  const animationsLine = ['Karaoke', 'Typewriter', 'Blur scroll', 'Shake'];
+  const animationsOnce = ['Fade in', 'Soft bounce', 'Elastic', 'Pulse'];
+  const animationsLine = ['Karaoke', 'Blur scroll'];
 
   const gridPositions = [
     { id: 'top_left', label: 'Top Left', x: 15, y: 18 },
@@ -451,11 +457,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
             <button
               type="button"
               onClick={() => onUpdateClip({ chapters_enabled: !(clip.chapters_enabled ?? false) })}
-              className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${
-                clip.chapters_enabled
-                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                  : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
-              }`}
+              className={`px-2 py-0.5 rounded border text-[10px] font-bold transition ${clip.chapters_enabled
+                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                }`}
             >
               {clip.chapters_enabled ? '✓ Pills ON' : 'Pills OFF'}
             </button>
@@ -816,11 +821,11 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
       {/* SUB-TAB 2: TYPOGRAPHY */}
       {subTab === 'typography' && (
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fadeIn">
-          {/* Font Family + Upload */}
+          {/* Font Family + Visual Font Library + Upload */}
           <div className="space-y-3">
             <div>
               <label className="text-[11px] font-bold text-[var(--text-secondary)] uppercase tracking-wide block mb-1.5">
-                Font Family
+                Font Library & Custom Upload
               </label>
               <div className="flex gap-2">
                 <select
@@ -847,33 +852,96 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                   />
                 </label>
               </div>
+              <div className="grid grid-cols-3 gap-1.5 mt-2 max-h-24 overflow-y-auto pr-0.5">
+                {availableFonts.slice(0, 9).map((f) => {
+                  const sel = (clip.caption_font || 'Montserrat') === f;
+                  return (
+                    <button
+                      key={f}
+                      type="button"
+                      onClick={() => onUpdateClip({ caption_font: f })}
+                      style={{ fontFamily: f }}
+                      className={`px-2 py-1 rounded-md border text-[11px] truncate transition ${sel
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)] font-bold'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      title={`Select ${f}`}
+                    >
+                      {f}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             <div className="tabular-nums">
               <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
-                <span>Font Size Scale</span>
+                <span>Font Size Scale (Safe Auto-Fit)</span>
                 <span className="font-mono font-bold text-[var(--accent-primary)]">
                   {clip.font_size_percent || 100}%
                 </span>
               </div>
               <input
                 type="range"
-                min={50}
-                max={160}
-                value={clip.font_size_percent || 100}
+                min={65}
+                max={155}
+                value={Math.max(65, Math.min(155, clip.font_size_percent || 100))}
                 onChange={(e) => onUpdateClip({ font_size_percent: parseInt(e.target.value, 10) })}
                 className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
               />
             </div>
+
+            <div>
+              <span className="text-[11px] font-bold text-[var(--text-secondary)] uppercase tracking-wide block mb-1.5">
+                Pacing Density
+              </span>
+              <div className="grid grid-cols-3 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+                {['1-2 Words Rapid', '3-4 Words Viral', 'Full Phrase'].map((dens) => {
+                  const active = (clip.pacing_density || '3-4 Words Viral') === dens;
+                  return (
+                    <button
+                      key={dens}
+                      type="button"
+                      onClick={() => onUpdateClip({ pacing_density: dens })}
+                      className={`py-1.5 px-1 rounded-md text-[10px] font-bold transition truncate ${active
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                    >
+                      {dens}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
           </div>
 
-          {/* Formatting & Alignment */}
+          {/* Formatting, Text Case & Alignment */}
           <div className="space-y-3">
             <div>
               <span className="text-[11px] font-bold text-[var(--text-secondary)] uppercase tracking-wide block mb-1.5">
-                Text Formatting
+                Text Case & Formatting
               </span>
-              <div className="grid grid-cols-3 gap-1.5 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+              <div className="grid grid-cols-3 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)] mb-2">
+                {['ALL CAPS', 'Title Case', 'As Spoken'].map((tc) => {
+                  const currTc = clip.text_case || (clip.all_caps ? 'ALL CAPS' : 'As Spoken');
+                  const active = currTc === tc;
+                  return (
+                    <button
+                      key={tc}
+                      type="button"
+                      onClick={() => onUpdateClip({ text_case: tc, all_caps: tc === 'ALL CAPS' })}
+                      className={`py-1.5 rounded-md text-[11px] font-bold transition ${active
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                    >
+                      {tc}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="grid grid-cols-2 gap-1.5 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
                 <button
                   type="button"
                   onClick={() => onUpdateClip({ bold: !clip.bold })}
@@ -893,16 +961,6 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     }`}
                 >
                   Italic
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onUpdateClip({ all_caps: !clip.all_caps })}
-                  className={`py-1.5 rounded-md font-mono font-bold text-xs transition ${clip.all_caps
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                >
-                  UPPERCASE
                 </button>
               </div>
             </div>
@@ -945,17 +1003,17 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fadeIn">
           {/* Left: Pickers + Highlight Style + Toggles */}
           <div className="space-y-3">
-            <div className="grid grid-cols-2 gap-2.5">
+            <div className="grid grid-cols-3 gap-2">
               <div>
                 <label className="text-[11px] text-[var(--text-secondary)] block mb-1">Base Color</label>
-                <div className="flex items-center gap-2 bg-[var(--bg-input)] p-1.5 rounded-lg border border-[var(--border-subtle)]">
+                <div className="flex items-center gap-1.5 bg-[var(--bg-input)] p-1.5 rounded-lg border border-[var(--border-subtle)]">
                   <input
                     type="color"
                     value={clip.base_color || '#FFFFFF'}
                     onChange={(e) => onUpdateClip({ base_color: e.target.value })}
-                    className="w-6 h-6 rounded cursor-pointer border-0 bg-transparent"
+                    className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent shrink-0"
                   />
-                  <span className="font-mono text-xs font-bold uppercase text-[var(--text-primary)]">
+                  <span className="font-mono text-[10px] font-bold uppercase text-[var(--text-primary)] truncate">
                     {clip.base_color || '#FFFFFF'}
                   </span>
                 </div>
@@ -963,40 +1021,60 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
 
               <div>
                 <label className="text-[11px] text-[var(--text-secondary)] block mb-1">Highlight Color</label>
-                <div className="flex items-center gap-2 bg-[var(--bg-input)] p-1.5 rounded-lg border border-[var(--border-subtle)]">
+                <div className="flex items-center gap-1.5 bg-[var(--bg-input)] p-1.5 rounded-lg border border-[var(--border-subtle)]">
                   <input
                     type="color"
                     value={clip.active_color || '#C6F32F'}
                     onChange={(e) => onUpdateClip({ active_color: e.target.value })}
-                    className="w-6 h-6 rounded cursor-pointer border-0 bg-transparent"
+                    className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent shrink-0"
                   />
-                  <span className="font-mono text-xs font-bold uppercase text-[var(--text-primary)]">
+                  <span className="font-mono text-[10px] font-bold uppercase text-[var(--text-primary)] truncate">
                     {clip.active_color || '#C6F32F'}
+                  </span>
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[11px] text-[var(--text-secondary)] block mb-1">Pill Color</label>
+                <div className="flex items-center gap-1.5 bg-[var(--bg-input)] p-1.5 rounded-lg border border-[var(--border-subtle)]">
+                  <input
+                    type="color"
+                    value={clip.pill_color || clip.active_color || '#F59E0B'}
+                    onChange={(e) => onUpdateClip({ pill_color: e.target.value })}
+                    className="w-5 h-5 rounded cursor-pointer border-0 bg-transparent shrink-0"
+                  />
+                  <span className="font-mono text-[10px] font-bold uppercase text-[var(--text-primary)] truncate">
+                    {clip.pill_color || clip.active_color || '#F59E0B'}
                   </span>
                 </div>
               </div>
             </div>
 
             <div>
-              <span className="text-[11px] text-[var(--text-secondary)] block mb-1">Highlight Style</span>
-              <div className="grid grid-cols-3 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
+              <span className="text-[11px] text-[var(--text-secondary)] block mb-1">Active-Word Highlight Style</span>
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-1 bg-[var(--bg-input)] p-1 rounded-lg border border-[var(--border-subtle)]">
                 {[
-                  { id: 'Colour only', label: 'Color' },
-                  { id: 'Filled box', label: 'Pill Box' },
-                  { id: 'Underline', label: 'Underline' }
-                ].map((shape) => (
-                  <button
-                    key={shape.id}
-                    type="button"
-                    onClick={() => onUpdateClip({ highlight_shape: shape.id as any })}
-                    className={`py-1 rounded-md text-[11px] font-bold transition ${clip.highlight_shape === shape.id
-                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                  >
-                    {shape.label}
-                  </button>
-                ))}
+                  { id: 'Color Pop', aliases: ['Colour only', 'Color Pop'], label: 'Color Pop' },
+                  { id: 'Rounded Pill Box', aliases: ['Filled box', 'Rounded Pill Box'], label: 'Rounded Pill Box' },
+                  { id: 'Neon Outer Glow', aliases: ['Neon Outer Glow'], label: 'Neon Outer Glow' },
+                  { id: 'Marker Underline', aliases: ['Underline', 'Marker Underline'], label: 'Marker Underline' },
+                  { id: '1.18x Kinetic Pop', aliases: ['1.18x Kinetic Pop'], label: '1.18x Kinetic Pop' },
+                ].map((shape) => {
+                  const active = shape.aliases.includes(clip.highlight_shape);
+                  return (
+                    <button
+                      key={shape.id}
+                      type="button"
+                      onClick={() => onUpdateClip({ highlight_shape: shape.id })}
+                      className={`py-1 px-1.5 rounded-md text-[10px] font-bold transition truncate ${active
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                    >
+                      {shape.label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -1082,9 +1160,9 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                 <input
                   type="range"
                   min={0}
-                  max={12}
+                  max={10}
                   step={0.5}
-                  value={clip.outline_width ?? 4}
+                  value={Math.min(10, clip.outline_width ?? 4)}
                   onChange={(e) => onUpdateClip({ outline_width: parseFloat(e.target.value) })}
                   className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
                 />
@@ -1092,9 +1170,9 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
 
               <div>
                 <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
-                  <span>Shadow</span>
+                  <span>Drop Shadow</span>
                   <span className="font-mono text-[var(--accent-primary)] font-bold">
-                    {clip.shadow_depth ?? 3}px
+                    {Math.round((clip.shadow_depth ?? 3) * 10)}%
                   </span>
                 </div>
                 <input
@@ -1102,7 +1180,7 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                   min={0}
                   max={10}
                   step={0.5}
-                  value={clip.shadow_depth ?? 3}
+                  value={Math.min(10, clip.shadow_depth ?? 3)}
                   onChange={(e) => onUpdateClip({ shadow_depth: parseFloat(e.target.value) })}
                   className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
                 />
@@ -1151,31 +1229,75 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
       {/* SUB-TAB 4: ANIMATION & POSITION */}
       {subTab === 'animation' && (
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fadeIn">
-          {/* Left: 3x3 Placement Grid + X/Y + Reset Center */}
+          {/* Left: 3x3 Placement Grid + Free-Form X/Y, Width & Tilt */}
           <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">
-                3×3 Placement Grid
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-bold uppercase tracking-wide text-[var(--text-secondary)] flex items-center gap-1.5">
+                <Move className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                Free-Form Canvas Position
               </span>
               <button
                 type="button"
                 onClick={() =>
-                  onUpdateClip({ position_grid: 'center', position_x: 50, position_y: 50 })
+                  onUpdateClip({
+                    position_grid: 'bottom_center',
+                    position_x: 50,
+                    position_y: 76,
+                    caption_x: 0.5,
+                    caption_y: 0.76,
+                    caption_rotation: 0,
+                    caption_max_width: 0.82,
+                  })
                 }
                 className="text-[10px] text-[var(--accent-primary)] hover:underline flex items-center gap-1 font-semibold"
               >
-                <RotateCcw className="w-3 h-3" /> Reset Center
+                <RotateCcw className="w-3 h-3" /> Reset Position
               </button>
             </div>
 
-            <div className="flex items-center gap-4">
-              <div className="w-28 h-36 bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-xl p-1.5 grid grid-cols-3 grid-rows-3 gap-1 shrink-0">
+            {/* Quick Canvas Presets */}
+            <div className="grid grid-cols-4 gap-1">
+              {[
+                { label: 'Center Bottom', grid: 'bottom_center', x: 0.5, y: 0.76, rot: 0, mw: 0.82 },
+                { label: 'Dead Center', grid: 'center', x: 0.5, y: 0.5, rot: 0, mw: 0.82 },
+                { label: 'Top Safe', grid: 'top_center', x: 0.5, y: 0.18, rot: 0, mw: 0.82 },
+                { label: 'Reset', grid: 'bottom_center', x: 0.5, y: 0.76, rot: 0, mw: 0.82 },
+              ].map((qp) => (
+                <button
+                  key={qp.label}
+                  type="button"
+                  onClick={() =>
+                    onUpdateClip({
+                      position_grid: qp.grid,
+                      position_x: Math.round(qp.x * 100),
+                      position_y: Math.round(qp.y * 100),
+                      caption_x: qp.x,
+                      caption_y: qp.y,
+                      caption_rotation: qp.rot,
+                      caption_max_width: qp.mw,
+                    })
+                  }
+                  className="py-1 px-1.5 rounded-md border border-[var(--border-subtle)] bg-[var(--bg-input)] hover:border-[var(--accent-primary)]/60 text-[10px] font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition whitespace-nowrap"
+                >
+                  {qp.label}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex items-start gap-4">
+              <div className="w-24 h-32 bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-xl p-1.5 grid grid-cols-3 grid-rows-3 gap-1 shrink-0">
                 {gridPositions.map((pos) => (
                   <button
                     key={pos.id}
                     type="button"
                     onClick={() =>
-                      onUpdateClip({ position_grid: pos.id, position_x: pos.x, position_y: pos.y })
+                      onUpdateClip({
+                        position_grid: pos.id,
+                        position_x: pos.x,
+                        position_y: pos.y,
+                        caption_x: Number((pos.x / 100).toFixed(2)),
+                        caption_y: Number((pos.y / 100).toFixed(2)),
+                      })
                     }
                     className={`rounded-md transition flex items-center justify-center ${clip.position_grid === pos.id
                       ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-sm'
@@ -1188,37 +1310,90 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                 ))}
               </div>
 
-              <div className="flex-1 space-y-3 tabular-nums">
+              <div className="flex-1 space-y-2.5 tabular-nums">
                 <div>
                   <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
-                    <span>Horizontal (X)</span>
+                    <span>Horizontal X</span>
                     <span className="font-mono font-bold text-[var(--accent-primary)]">
-                      {Math.round(clip.position_x ?? 50)}%
+                      {Math.round((clip.caption_x ?? (clip.position_x ?? 50) / 100) * 100)}%
                     </span>
                   </div>
                   <input
                     type="range"
-                    min={10}
-                    max={90}
-                    value={clip.position_x ?? 50}
-                    onChange={(e) => onUpdateClip({ position_x: parseFloat(e.target.value) })}
+                    min={5}
+                    max={95}
+                    value={Math.max(5, Math.min(95, Math.round((clip.caption_x ?? (clip.position_x ?? 50) / 100) * 100)))}
+                    onChange={(e) => {
+                      const pct = parseFloat(e.target.value);
+                      onUpdateClip({
+                        position_x: pct,
+                        caption_x: Number((pct / 100).toFixed(3)),
+                      });
+                    }}
                     className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
-                    <span>Vertical (Y)</span>
+                    <span>Vertical Y</span>
                     <span className="font-mono font-bold text-[var(--accent-primary)]">
-                      {Math.round(clip.position_y ?? 78)}%
+                      {Math.round((clip.caption_y ?? (clip.position_y ?? 76) / 100) * 100)}%
                     </span>
                   </div>
                   <input
                     type="range"
-                    min={10}
+                    min={8}
+                    max={92}
+                    value={Math.max(8, Math.min(92, Math.round((clip.caption_y ?? (clip.position_y ?? 76) / 100) * 100)))}
+                    onChange={(e) => {
+                      const pct = parseFloat(e.target.value);
+                      onUpdateClip({
+                        position_y: pct,
+                        caption_y: Number((pct / 100).toFixed(3)),
+                      });
+                    }}
+                    className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
+                    <span>Box Width</span>
+                    <span className="font-mono font-bold text-[var(--accent-primary)]">
+                      {Math.round((clip.caption_max_width ?? 0.82) * 100)}%
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={45}
                     max={90}
-                    value={clip.position_y ?? 78}
-                    onChange={(e) => onUpdateClip({ position_y: parseFloat(e.target.value) })}
+                    value={Math.max(45, Math.min(90, Math.round((clip.caption_max_width ?? 0.82) * 100)))}
+                    onChange={(e) =>
+                      onUpdateClip({
+                        caption_max_width: Number((parseFloat(e.target.value) / 100).toFixed(2)),
+                      })
+                    }
+                    className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
+                    <span>Tilt Angle</span>
+                    <span className="font-mono font-bold text-[var(--accent-primary)]">
+                      {(clip.caption_rotation ?? 0) > 0 ? `+${clip.caption_rotation}°` : `${clip.caption_rotation ?? 0}°`}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-15}
+                    max={15}
+                    step={0.5}
+                    value={Math.max(-15, Math.min(15, clip.caption_rotation ?? 0))}
+                    onChange={(e) =>
+                      onUpdateClip({ caption_rotation: parseFloat(e.target.value) })
+                    }
                     className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
                   />
                 </div>
@@ -1244,25 +1419,26 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
             </div>
           </div>
 
-          {/* Right: Entrance Animation & Full-Line Mode Pills */}
+          {/* Right: Kinetic Physics Animation Cards */}
           <div className="space-y-3">
             <div>
               <span className="text-[11px] font-bold uppercase tracking-wide text-[var(--text-secondary)] flex items-center gap-1.5 mb-1.5">
                 <Sparkles className="w-3 h-3 text-[var(--accent-primary)]" />
-                Entrance Animation
+                Kinetic Entry Physics
               </span>
-              <div className="flex flex-wrap gap-1.5">
-                {animationsOnce.map((anim) => (
+              <div className="grid grid-cols-2 gap-1.5">
+                {kineticPhysics.map((anim) => (
                   <button
-                    key={anim}
+                    key={anim.id}
                     type="button"
-                    onClick={() => onUpdateClip({ caption_animation: anim })}
-                    className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${clip.caption_animation === anim
+                    onClick={() => onUpdateClip({ caption_animation: anim.id })}
+                    className={`px-2.5 py-1.5 rounded-lg border text-left transition ${clip.caption_animation === anim.id
                       ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
                       : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                       }`}
                   >
-                    {anim}
+                    <div className="text-[11px] font-bold leading-tight">{anim.label}</div>
+                    <div className="text-[9px] opacity-80 leading-tight">{anim.desc}</div>
                   </button>
                 ))}
               </div>
@@ -1270,15 +1446,15 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
 
             <div className="pt-2 border-t border-[var(--border-subtle)]">
               <span className="text-[11px] font-bold uppercase tracking-wide text-[var(--text-secondary)] block mb-1.5">
-                Full-Line Mode
+                Classic & Line Modes
               </span>
               <div className="flex flex-wrap gap-1.5">
-                {animationsLine.map((anim) => (
+                {[...animationsOnce, ...animationsLine].map((anim) => (
                   <button
                     key={anim}
                     type="button"
                     onClick={() => onUpdateClip({ caption_animation: anim })}
-                    className={`px-2.5 py-1 rounded-lg border text-[11px] transition ${clip.caption_animation === anim
+                    className={`px-2 py-0.5 rounded-md border text-[10px] transition ${clip.caption_animation === anim
                       ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
                       : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                       }`}

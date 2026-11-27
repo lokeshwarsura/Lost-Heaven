@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  Cpu, Zap, ChevronDown, ChevronUp, Sparkles, Scissors, ZoomIn, MessageSquareQuote, RotateCcw, Loader2, Check, Layers
+  Cpu, Zap, ChevronDown, ChevronUp, Sparkles, Scissors, ZoomIn, MessageSquareQuote, RotateCcw, Loader2, Check, Layers, Camera, RefreshCw, AlertTriangle, CheckCircle2, Lock
 } from 'lucide-react';
-import { ViralClip, Project, HookVariant } from '../types';
+import { ViralClip, Project, HookVariant, SourceWebcamRegion, FramingMapResponse, BestFrameItem } from '../types';
 import { api } from '../api/client';
 
 interface Step1SetupProps {
@@ -10,13 +10,21 @@ interface Step1SetupProps {
   project: Project | null;
   onUpdateClip: (updates: Partial<ViralClip>) => void;
   onUpdateProject?: (updates: Partial<Project>) => void;
+  onOpenAnalysisWorkstation?: () => void;
+  onSeekToMasterTime?: (t: number) => void;
+  onCalibrateFrame?: (frame: BestFrameItem) => void;
+  onOpenThumbnailFrame?: (frame: BestFrameItem) => void;
 }
 
 export const Step1Setup: React.FC<Step1SetupProps> = ({
   clip,
   project,
   onUpdateClip,
-  onUpdateProject
+  onUpdateProject,
+  onOpenAnalysisWorkstation,
+  onSeekToMasterTime,
+  onCalibrateFrame,
+  onOpenThumbnailFrame
 }) => {
   const [hookVariants, setHookVariants] = useState<HookVariant[]>([]);
   const [isGeneratingHooks, setIsGeneratingHooks] = useState(false);
@@ -36,6 +44,107 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
     }
   };
   const [clipOptsOpen, setClipOptsOpen] = useState(true);
+  const [webcamRegion, setWebcamRegion] = useState<SourceWebcamRegion | null>(
+    clip?.source_webcam_region ?? null
+  );
+  const [isDetectingWebcam, setIsDetectingWebcam] = useState(false);
+  const [framingMap, setFramingMap] = useState<FramingMapResponse | null>(null);
+  const [bestFrames, setBestFrames] = useState<BestFrameItem[]>(clip?.best_frames || []);
+  const [isLoadingBestFrames, setIsLoadingBestFrames] = useState(false);
+
+  const isWebcamTemplate =
+    clip?.frame_layout === 'webcam_gameplay_split' ||
+    clip?.frame_layout === 'gameplay_webcam_pip' ||
+    clip?.frame_layout === 'webcam_gameplay_pip';
+
+  useEffect(() => {
+    setWebcamRegion(clip?.source_webcam_region ?? null);
+  }, [clip?.id, clip?.source_webcam_region]);
+
+  useEffect(() => {
+    if (!clip || !project) {
+      setBestFrames([]);
+      return;
+    }
+    if (Array.isArray(clip.best_frames) && clip.best_frames.length > 0) {
+      setBestFrames(clip.best_frames);
+      return;
+    }
+    let cancelled = false;
+    setIsLoadingBestFrames(true);
+    api
+      .getBestFrames(project.id, clip.id)
+      .then((res) => {
+        if (!cancelled && Array.isArray(res?.frames)) {
+          setBestFrames(res.frames);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setIsLoadingBestFrames(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [clip?.id, project?.id]);
+
+  useEffect(() => {
+    if (!clip || !project) {
+      setFramingMap(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getFramingMap(project.id, clip.id, false)
+      .then((res) => {
+        if (!cancelled) setFramingMap(res);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [clip?.id, project?.id]);
+
+  useEffect(() => {
+    if (!clip || !project || !isWebcamTemplate) return;
+    if (clip.source_webcam_region) {
+      setWebcamRegion(clip.source_webcam_region);
+      return;
+    }
+    let cancelled = false;
+    setIsDetectingWebcam(true);
+    api
+      .getWebcamRegion(project.id, clip.id, false)
+      .then((region) => {
+        if (cancelled) return;
+        setWebcamRegion(region);
+        onUpdateClip({ source_webcam_region: region });
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setIsDetectingWebcam(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [clip?.id, project?.id, isWebcamTemplate]);
+
+  const handleSetSourceWebcamZone = async (zoneId: string, refresh = false) => {
+    if (!clip || !project) return;
+    setIsDetectingWebcam(true);
+    try {
+      const region = await api.updateWebcamRegion(project.id, clip.id, {
+        source_zone: zoneId,
+        refresh
+      });
+      setWebcamRegion(region);
+      onUpdateClip({ source_webcam_region: region });
+    } catch (err) {
+      console.error('Failed to update source webcam zone:', err);
+    } finally {
+      setIsDetectingWebcam(false);
+    }
+  };
 
   if (!clip) {
     return (
@@ -438,18 +547,274 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
             })}
           </div>
 
-          {/* Webcam Corner Selector for Split / PiP templates */}
+          {/* Framing Telemetry Pill (always visible across all templates) */}
+          {(() => {
+            const ov = clip.framing_override;
+            const summary = framingMap?.visual_map?.summary || clip.visual_map_summary;
+            const zoneRaw = webcamRegion?.locked_zone && webcamRegion.locked_zone !== 'auto'
+              ? webcamRegion.locked_zone
+              : webcamRegion?.source_zone || 'top_left';
+            const zoneNice = zoneRaw.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+            const recName = framingMap?.recommended?.frame_layout;
+
+            if (ov?.lock_camera && ov.focus_anchor) {
+              return (
+                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-amber-500/12 border border-amber-500/35 text-[10px] text-amber-300 font-semibold">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Lock className="w-3 h-3" />
+                    Camera locked ({Math.round(ov.focus_anchor.x * 100)}%, {Math.round(ov.focus_anchor.y * 100)}%)
+                  </span>
+                  {project && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void api.updateFramingOverride(project.id, clip.id, { reset: true }).then((r) => {
+                          onUpdateClip({ framing_override: r.framing_override, source_webcam_region: r.source_webcam_region });
+                        });
+                      }}
+                      className="underline hover:text-white"
+                    >
+                      Unlock
+                    </button>
+                  )}
+                </div>
+              );
+            }
+            if (webcamRegion?.webcam_detected) {
+              const locked = Boolean(webcamRegion.locked_zone && webcamRegion.locked_zone !== 'auto');
+              return (
+                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/12 border border-emerald-500/35 text-[10px] text-emerald-400 font-semibold">
+                  <span className="inline-flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3 h-3" />
+                    {locked ? `Webcam locked (${zoneNice})` : `Webcam detected (${zoneNice})`}
+                  </span>
+                  {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
+                </div>
+              );
+            }
+            if (summary?.dominant_scene_type === 'zero_face_action' || (summary && (summary.face_presence_ratio ?? 1) < 0.1)) {
+              return (
+                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-sky-500/12 border border-sky-500/35 text-[10px] text-sky-300 font-semibold">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Zap className="w-3 h-3" />
+                    ⚡ Action Saliency Active (No Face)
+                  </span>
+                  {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
+                </div>
+              );
+            }
+            if (summary?.dominant_scene_type === 'dual_speaker') {
+              return (
+                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/12 border border-emerald-500/35 text-[10px] text-emerald-400 font-semibold">
+                  <span className="inline-flex items-center gap-1.5">
+                    <CheckCircle2 className="w-3 h-3" />
+                    Dual-Speaker Tracking Active
+                  </span>
+                  {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
+                </div>
+              );
+            }
+            return (
+              <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[10px] text-[var(--text-secondary)] font-semibold">
+                <span className="inline-flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3 h-3 text-[var(--accent-primary)]" />
+                  Active Speaker &amp; Shot-Boundary Framing
+                </span>
+                {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
+              </div>
+            );
+          })()}
+
+          {/* Compact Best Frames Strip */}
+          {(bestFrames.length > 0 || isLoadingBestFrames) && (
+            <div className="pt-2 border-t border-[var(--border-subtle)] space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold text-[var(--text-primary)] flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  <span>Best Frames Strip ({bestFrames.length})</span>
+                </span>
+                {onOpenAnalysisWorkstation && (
+                  <button
+                    type="button"
+                    onClick={onOpenAnalysisWorkstation}
+                    className="text-[10px] font-bold text-[var(--accent-primary)] hover:underline"
+                  >
+                    Open Workstation →
+                  </button>
+                )}
+              </div>
+
+              {isLoadingBestFrames && bestFrames.length === 0 ? (
+                <div className="flex items-center gap-1.5 text-[10px] text-[var(--text-secondary)] py-1">
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                  <span>Extracting sharp keyframes...</span>
+                </div>
+              ) : (
+                <div className="grid grid-cols-3 gap-1.5">
+                  {bestFrames.slice(0, 6).map((bf) => (
+                    <div
+                      key={bf.index}
+                      className="rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] overflow-hidden flex flex-col"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => onSeekToMasterTime?.(bf.t)}
+                        className="relative aspect-video bg-black w-full text-left group"
+                        title={`Jump to ${bf.role.replace(/_/g, ' ')} at ${bf.t.toFixed(2)}s`}
+                      >
+                        {bf.image_url && (
+                          <img
+                            src={bf.image_url}
+                            alt={bf.role}
+                            className="w-full h-full object-cover group-hover:scale-105 transition"
+                          />
+                        )}
+                        <span className="absolute bottom-0.5 right-0.5 px-1 rounded bg-black/75 text-[9px] font-mono text-white">
+                          {bf.t.toFixed(1)}s
+                        </span>
+                      </button>
+                      <div className="p-1.5 space-y-1">
+                        <div className="text-[9px] font-bold text-[var(--text-primary)] truncate">
+                          {bf.role.replace(/_/g, ' ')} · {Math.round(bf.sharpness_score)}%
+                        </div>
+                        <div className="flex items-center gap-1">
+                          {onOpenThumbnailFrame && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenThumbnailFrame(bf)}
+                              className="flex-1 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[9px] font-semibold text-[var(--text-primary)] hover:border-[var(--accent-primary)]/50"
+                            >
+                              Cover
+                            </button>
+                          )}
+                          {onCalibrateFrame && (
+                            <button
+                              type="button"
+                              onClick={() => onCalibrateFrame(bf)}
+                              className="flex-1 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[9px] font-semibold text-[var(--accent-primary)] hover:border-[var(--accent-primary)]/50"
+                            >
+                              Calibrate
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Webcam Detection, Source Zone & Output Placement for Split / PiP templates */}
           {(clip.frame_layout === 'webcam_gameplay_split' ||
             clip.frame_layout === 'gameplay_webcam_pip' ||
             clip.frame_layout === 'webcam_gameplay_pip') && (
-            <div className="pt-2 border-t border-[var(--border-subtle)] space-y-1.5">
-              <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)]">
-                <span>Webcam Corner</span>
-                <span className="font-mono text-[10px] text-[var(--accent-primary)]">
-                  {clip.webcam_corner || 'top_left'}
-                </span>
+            <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2.5">
+              {/* Auto-Detection Status Pill + Re-scan */}
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                {isDetectingWebcam ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-[var(--accent-subtle)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Scanning 16 frames for webcam...
+                  </span>
+                ) : webcamRegion?.webcam_detected ? (
+                  <span
+                    data-testid="webcam-status-pill"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/40"
+                  >
+                    <CheckCircle2 className="w-3 h-3" />
+                    Webcam auto-detected (
+                    {(webcamRegion.source_zone || 'top_left')
+                      .replace(/_/g, ' ')
+                      .replace(/\b\w/g, (c) => c.toUpperCase())}
+                    {webcamRegion.aspect_ratio
+                      ? ` • ${
+                          webcamRegion.aspect_ratio >= 1.55
+                            ? '16:9'
+                            : webcamRegion.aspect_ratio <= 1.15
+                            ? '1:1'
+                            : '4:3'
+                        }`
+                      : ''}
+                    )
+                  </span>
+                ) : (
+                  <span
+                    data-testid="webcam-status-pill"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/40"
+                  >
+                    <AlertTriangle className="w-3 h-3" />
+                    No facecam detected — using Action Framing
+                  </span>
+                )}
+                <button
+                  type="button"
+                  disabled={isDetectingWebcam}
+                  onClick={() => handleSetSourceWebcamZone('auto', true)}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] disabled:opacity-50"
+                  title="Re-scan 16 frames across the clip to locate the streamer webcam"
+                >
+                  <RefreshCw className="w-2.5 h-2.5" />
+                  Re-scan
+                </button>
               </div>
-              <div className="grid grid-cols-4 gap-1.5">
+
+              {/* Source Camera Position (where the webcam sits in the original 16:9 video) */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)]">
+                  <span className="inline-flex items-center gap-1">
+                    <Camera className="w-3 h-3 text-[var(--accent-primary)]" />
+                    Source Camera Position
+                  </span>
+                  <span className="font-mono text-[10px] text-[var(--accent-primary)]">
+                    {webcamRegion?.locked_zone || 'auto'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: 'auto', label: 'Auto' },
+                      { id: 'top_left', label: 'Top Left' },
+                      { id: 'top_right', label: 'Top Right' },
+                      { id: 'bottom_left', label: 'Bottom Left' },
+                      { id: 'bottom_right', label: 'Bottom Right' },
+                      { id: 'center', label: 'Center' }
+                    ] as const
+                  ).map((zone) => {
+                    const currentZone = webcamRegion?.locked_zone || 'auto';
+                    const isSelected = currentZone === zone.id;
+                    return (
+                      <button
+                        key={zone.id}
+                        type="button"
+                        disabled={isDetectingWebcam}
+                        onClick={() => handleSetSourceWebcamZone(zone.id, zone.id === 'auto')}
+                        className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold border transition ${
+                          isSelected
+                            ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                            : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {zone.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Output PiP Placement (where the rounded PiP sits in the 9:16 export) */}
+              <div className="space-y-1">
+                <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)]">
+                  <span>
+                    {clip.frame_layout === 'gameplay_webcam_pip'
+                      ? 'Output PiP Placement'
+                      : 'Webcam Corner'}
+                  </span>
+                  <span className="font-mono text-[10px] text-[var(--accent-primary)]">
+                    {clip.webcam_corner || 'top_left'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-4 gap-1.5">
                 {(
                   [
                     { id: 'top_left', label: 'Top Left' },
@@ -474,9 +839,62 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                     </button>
                   );
                 })}
+                </div>
               </div>
             </div>
           )}
+
+          {/* Virtual Camera Motion & Whip-Pan Cuts */}
+          <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
+                Camera Motion
+              </span>
+              <span className="font-mono text-[10px] text-[var(--accent-primary)]">
+                {clip.camera_motion || 'steady'}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+              {(
+                [
+                  { id: 'steady', label: 'Steady' },
+                  { id: 'dolly_in', label: 'Slow Dolly In' },
+                  { id: 'dolly_out', label: 'Dolly Out' },
+                  { id: 'beat_punch', label: 'Beat Punch' }
+                ] as const
+              ).map((m) => {
+                const selected = (clip.camera_motion || 'steady') === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => onUpdateClip({ camera_motion: m.id })}
+                    className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold border transition ${
+                      selected
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              onClick={() => onUpdateClip({ whip_pan_cuts: !clip.whip_pan_cuts })}
+              className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition ${
+                clip.whip_pan_cuts
+                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              <span>Whip-Pan Scene Cuts</span>
+              <span className="font-mono text-[10px] text-[var(--accent-primary)]">
+                {clip.whip_pan_cuts ? 'ON (0.20s blur)' : 'OFF'}
+              </span>
+            </button>
+          </div>
 
           {/* Zoom & Pan Sliders */}
           <div className="grid grid-cols-2 gap-3 pt-2 border-t border-[var(--border-subtle)] tabular-nums">

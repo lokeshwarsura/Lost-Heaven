@@ -67,12 +67,27 @@ def init_db():
                     "handle_corner": "ALTER TABLE viral_clips ADD COLUMN handle_corner TEXT DEFAULT 'bottom_right'",
                     "handle_opacity": "ALTER TABLE viral_clips ADD COLUMN handle_opacity FLOAT DEFAULT 0.65",
                     "handle_display_mode": "ALTER TABLE viral_clips ADD COLUMN handle_display_mode TEXT DEFAULT 'always'",
+                    "source_webcam_region_json": "ALTER TABLE viral_clips ADD COLUMN source_webcam_region_json TEXT DEFAULT ''",
+                    "visual_map_json": "ALTER TABLE viral_clips ADD COLUMN visual_map_json TEXT DEFAULT ''",
+                    "framing_override_json": "ALTER TABLE viral_clips ADD COLUMN framing_override_json TEXT DEFAULT ''",
+                    "camera_motion": "ALTER TABLE viral_clips ADD COLUMN camera_motion TEXT DEFAULT 'steady'",
+                    "whip_pan_cuts": "ALTER TABLE viral_clips ADD COLUMN whip_pan_cuts BOOLEAN DEFAULT 0",
+                    "broll_layout": "ALTER TABLE viral_clips ADD COLUMN broll_layout TEXT DEFAULT 'fullscreen'",
+                    "depth_pop": "ALTER TABLE viral_clips ADD COLUMN depth_pop FLOAT DEFAULT 0.0",
+                    "best_frames_json": "ALTER TABLE viral_clips ADD COLUMN best_frames_json TEXT DEFAULT '[]'",
+                    "options_json": "ALTER TABLE viral_clips ADD COLUMN options_json TEXT DEFAULT '{}'",
                 }
                 added = False
                 for col, sql in migrations.items():
                     if col not in col_names:
                         session.exec(text(sql))
                         added = True
+                # Also migrate projects table columns if missing
+                p_res = session.exec(text("PRAGMA table_info(projects)")).fetchall()
+                p_cols = [r[1] for r in p_res] if p_res else []
+                if p_cols and "multimodal_analysis_json" not in p_cols:
+                    session.exec(text("ALTER TABLE projects ADD COLUMN multimodal_analysis_json TEXT DEFAULT ''"))
+                    added = True
                 if added:
                     session.commit()
     except Exception as e:

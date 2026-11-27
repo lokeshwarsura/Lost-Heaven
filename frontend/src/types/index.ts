@@ -70,7 +70,7 @@ export interface CaptionStylePreset {
   active_color: string;
   outline_color?: string;
   hold_back_alpha: number;
-  highlight_shape: 'Colour only' | 'Filled box' | 'Underline';
+  highlight_shape: string;
   animation_type: string;
   position_grid: string;
   position_x: number;
@@ -158,6 +158,97 @@ export interface PreviewFrameResponse {
   timestamp: number;
 }
 
+export interface PresetPreviewItem {
+  id: string;
+  name: string;
+  description: string;
+  thumbnail_url?: string | null;
+  values: Record<string, number>;
+}
+
+export interface PresetPreviewsResponse {
+  project_id: number;
+  clip_id: number;
+  ref_timestamp: number;
+  presets: PresetPreviewItem[];
+  lut_preview?: {
+    id: string;
+    name: string;
+    description: string;
+    thumbnail_url?: string | null;
+    lut_path?: string | null;
+  } | null;
+  cache_key?: string;
+}
+
+export interface SourceWebcamRegion {
+  detected: boolean;
+  webcam_detected: boolean;
+  source_zone: string;
+  locked_zone?: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  aspect?: number;
+  aspect_ratio?: number;
+  face_cx?: number;
+  face_cy?: number;
+}
+
+export interface FramingOverride {
+  webcam_box?: { x: number; y: number; w: number; h: number } | null;
+  focus_anchor?: { x: number; y: number } | null;
+  lock_camera?: boolean;
+}
+
+export interface FramingMapResponse {
+  clip_id: number;
+  project_id: number;
+  visual_map: {
+    version?: number;
+    duration?: number;
+    source_w?: number;
+    source_h?: number;
+    cut_timestamps?: number[];
+    shots?: Array<{
+      shot_id: number;
+      start_t: number;
+      end_t: number;
+      speaker_mode: 'two_speaker' | 'single_speaker' | 'zero_face' | string;
+      face_count_median: number;
+      active_speaker_idx: number;
+      cx: number;
+      cy: number;
+      action_cx: number;
+      action_cy: number;
+    }>;
+    keyframes?: Array<{
+      t: number;
+      cx: number;
+      cy: number;
+      action_cx?: number;
+      action_cy?: number;
+    }>;
+    webcam?: SourceWebcamRegion;
+    summary?: {
+      has_corner_webcam?: boolean;
+      face_presence_ratio?: number;
+      dual_speaker_ratio?: number;
+      dominant_scene_type?: string;
+    };
+  };
+  framing_override?: FramingOverride | null;
+  source_webcam_region?: SourceWebcamRegion | null;
+  recommended?: {
+    frame_layout: string;
+    webcam_corner: string;
+    scene_type: string;
+    reason: string;
+    confidence: number;
+  };
+}
+
 export interface PreflightCheck {
   id: string;
   title: string;
@@ -221,6 +312,14 @@ export interface ViralClip {
   frame_layout: 'auto_track' | 'webcam_gameplay_split' | 'webcam_gameplay_pip' | 'gameplay_webcam_pip' | 'split_podcast' | 'fit_blur';
   webcam_corner: 'auto' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right';
   webcam_split_ratio: number;
+  source_webcam_region?: SourceWebcamRegion | null;
+  framing_override?: FramingOverride | null;
+  visual_map_summary?: {
+    has_corner_webcam?: boolean;
+    face_presence_ratio?: number;
+    dual_speaker_ratio?: number;
+    dominant_scene_type?: string;
+  } | null;
   pip_border_color: string;
   zoom: number;
   pan_x_offset: number;
@@ -235,6 +334,9 @@ export interface ViralClip {
   base_color: string;
   active_color: string;
   outline_color: string;
+  pill_color?: string;
+  pacing_density?: string;
+  text_case?: string;
   font_size: number;
   font_size_percent: number;
   y_offset?: number;
@@ -246,8 +348,13 @@ export interface ViralClip {
   position_grid: string;
   position_x: number;
   position_y: number;
+  caption_x?: number;
+  caption_y?: number;
+  caption_rotation?: number;
+  caption_max_width?: number;
   hold_back_alpha: number;
-  highlight_shape: 'Colour only' | 'Filled box' | 'Underline';
+  highlight_shape: string;
+  options?: Record<string, any>;
   emoji_enabled: boolean;
   highlight_power_words?: boolean;
   how_phrase_arrives: 'All at once' | 'Word by word';
@@ -262,11 +369,15 @@ export interface ViralClip {
 
   // Step 3: Color grading & filters
   clip_size: 'Auto' | '1080p' | '720p' | '540p' | '480p';
+  export_fps?: 'source' | '60' | string;
   color_preset: string;
+  preset_intensity?: number;
   exposure: number;
   brightness: number;
   contrast: number;
   lift_mids: number;
+  highlights?: number;
+  shadows?: number;
   warmth: number;
   saturation: number;
   black_and_white: number;
@@ -280,6 +391,18 @@ export interface ViralClip {
   film_grain: number;
   vignette: number | boolean;
   bottom_fade: number;
+  color_temp?: number;
+  tint_shift?: number;
+  vibrance?: number;
+  matte_fade?: number;
+  halation_glow?: number;
+  lut_path?: string;
+  chroma_split?: number;
+  letterbox?: string;
+  speed_ramp?: number;
+  voice_eq_preset?: string;
+  de_esser?: boolean;
+  loudness_target?: string;
 
   // Step 4: Branding, Outro & Audio
   watermark_path?: string;
@@ -298,6 +421,9 @@ export interface ViralClip {
   retention_bar_color?: string;
   outro_cta_enabled?: boolean;
   outro_cta_text?: string;
+  outro_cta_headline?: string;
+  outro_cta_handle?: string;
+  outro_logo_path?: string;
   broll_json?: string;
   broll_segments?: BrollSegment[];
   speakers?: Record<string, SpeakerProfile>;
@@ -315,6 +441,10 @@ export interface ViralClip {
   backdrop_mode?: string;
   backdrop_blur_intensity?: number;
   backdrop_color?: string;
+  camera_motion?: 'steady' | 'dolly_in' | 'dolly_out' | 'beat_punch' | string;
+  whip_pan_cuts?: boolean;
+  broll_layout?: 'fullscreen' | 'reaction_pip' | string;
+  depth_pop?: number;
   privacy_blur_boxes?: PrivacyBlurBox[];
   beat_sync_enabled?: boolean;
   spectrum_enabled?: boolean;
@@ -328,6 +458,16 @@ export interface ViralClip {
   handle_corner?: 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right' | string;
   handle_opacity?: number;
   handle_display_mode?: 'always' | 'pulse_12s' | string;
+  best_frames?: BestFrameItem[];
+  multimodal_summary?: MultimodalSummary;
+  narrative_arc?: string;
+  arc_label?: string;
+  dominant_emotion?: string;
+  vocal_emotion?: string;
+  emotion_arousal?: number;
+  emotion_valence?: number;
+  acoustic_events?: string[];
+  analysis_source?: string;
   hardware_mode: 'gpu' | 'cpu';
 
   // Transcript & publishing
@@ -474,6 +614,127 @@ export interface BrollSegment {
   asset_path: string;
   source: 'local' | 'pexels' | 'unassigned';
   enabled: boolean;
+  layout?: 'fullscreen' | 'reaction_pip';
+}
+
+export interface BestFrameItem {
+  index: number;
+  role: 'peak_emotion' | 'peak_action' | 'clean_anchor' | 'clean_opener' | 'highlight_moment' | string;
+  t: number;
+  rel_t: number;
+  composite_score: number;
+  sharpness_score: number;
+  exposure_score: number;
+  action_score: number;
+  composition_score: number;
+  emotion_intensity: number;
+  eyes_open_confidence: number;
+  gaze_score?: number;
+  audio_excitement: number;
+  face_count: number;
+  image_path?: string;
+  image_url: string;
+}
+
+export interface EmotionShiftItem {
+  t: number;
+  from_emotion: string;
+  to_emotion: string;
+  delta: number;
+  arousal: number;
+  vocal_emotion?: string;
+  source?: string;
+}
+
+export interface AcousticEventItem {
+  t: number;
+  end: number;
+  event_type: 'laughter_burst' | 'crowd_cheering' | 'bass_music_drop' | 'dramatic_pause' | string;
+  confidence: number;
+  label: string;
+}
+
+export interface ClipEmotionBreakdown {
+  dominant_facial_emotion: string;
+  dominant_vocal_emotion: string;
+  avg_arousal: number;
+  peak_arousal: number;
+  avg_valence: number;
+  emotion_delta_peak: number;
+  narrative_arc?: string | null;
+  arc_label?: string | null;
+  facial_distribution: Record<string, number>;
+  vocal_distribution: Record<string, number>;
+}
+
+export interface MultimodalTimelinePoint {
+  t: number;
+  combined_engagement_score: number;
+  semantic_score: number;
+  audio_prosody_score: number;
+  visual_emotion_action_score: number;
+  rms: number;
+  lufs_m: number;
+  wpm: number;
+  sharpness_score: number;
+  exposure_score: number;
+  emotion_intensity: number;
+  action_score: number;
+  face_count: number;
+  eyes_open_confidence: number;
+  dominant_emotion?: string;
+  vocal_emotion?: string;
+  facial_arousal?: number;
+  vocal_arousal?: number;
+  fused_arousal?: number;
+  fused_valence?: number;
+  emotion_delta?: number;
+  micro_expression_spike?: boolean;
+  shot_scale?: string;
+  acoustic_event?: string | null;
+  is_cut?: boolean;
+}
+
+export interface MultimodalSummary {
+  duration: number;
+  step_sec?: number;
+  overall_engagement_score: number;
+  integrated_lufs: number;
+  lra: number;
+  true_peak_db: number;
+  avg_wpm: number;
+  avg_sharpness: number;
+  avg_exposure: number;
+  avg_action: number;
+  face_presence_ratio: number;
+  scene_cut_count: number;
+  black_interval_count: number;
+  dominant_facial_emotion?: string;
+  dominant_vocal_emotion?: string;
+  avg_arousal?: number;
+  peak_arousal?: number;
+  avg_valence?: number;
+  speaker_switch_rate?: number;
+  acoustic_event_counts?: Record<string, number>;
+}
+
+export interface BestFramesResponse {
+  status?: string;
+  clip_id: number;
+  project_id: number;
+  start_time: number;
+  end_time: number;
+  suggested_start_time?: number | null;
+  frames: BestFrameItem[];
+  multimodal_summary: MultimodalSummary;
+  emotion_summary?: Record<string, any>;
+  emotion_shifts?: EmotionShiftItem[];
+  acoustic_events?: AcousticEventItem[];
+  clip_emotion_breakdown?: ClipEmotionBreakdown;
+  multimodal_timeline: MultimodalTimelinePoint[];
+  scene_cuts: Array<{ t: number; score: number }>;
+  black_intervals?: Array<{ start: number; end: number; duration: number }>;
+  peak_moments?: Array<{ t: number; combined_score: number; reason: string }>;
 }
 
 export interface StudioProfile {
@@ -508,6 +769,10 @@ export interface StudioSettings {
   gemini_analysis_mode?: 'transcript' | 'multimodal';
   auto_fallback_offline?: boolean;
   ai_provider?: 'gemini' | 'ollama' | 'offline';
+  ai_mode?: 'gemini' | 'offline' | null;
+  effective_ai_mode?: 'gemini' | 'offline' | 'needs_api_key_or_offline_choice';
+  needs_api_key_or_offline_choice?: boolean;
+  whisper_badge?: string;
   ollama_endpoint?: string;
   ollama_model?: string;
   model_cascade?: string[];
@@ -555,7 +820,7 @@ export interface PipelineLog {
 export interface JobProgress {
   project_id: number;
   title: string;
-  status: 'created' | 'processing' | 'finished' | 'analyzed' | 'error' | 'cancelled' | 'not_found' | 'awaiting_api_key';
+  status: 'created' | 'processing' | 'finished' | 'analyzed' | 'error' | 'failed' | 'cancelled' | 'not_found' | 'awaiting_api_key';
   api_key_reason?: 'missing' | 'invalid';
   api_key_message?: string;
   current_stage: string;
@@ -572,6 +837,11 @@ export interface JobProgress {
   file_size_bytes?: number;
   file_size_formatted?: string;
   hardware_badge?: string;
+  whisper_badge?: string;
+  ai_mode?: 'gemini' | 'offline' | 'needs_api_key_or_offline_choice' | string;
+  ai_provider?: string;
+  needs_api_key_or_offline_choice?: boolean;
+  needs_proxy?: boolean;
   duration_preset?: string;
   aspect_ratio?: string;
   clip_count?: number;

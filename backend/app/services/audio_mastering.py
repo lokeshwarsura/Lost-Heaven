@@ -3,7 +3,7 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from app.config import settings
 from app.services.proxy import get_ffmpeg_cmd
@@ -37,13 +37,13 @@ def resolve_local_media_asset(asset_ref: Optional[str]) -> Optional[str]:
     return None
 
 
-def stage_ascii_asset(src_path: str, work_dir: Path, target_stem: str = "bgm") -> Optional[str]:
+def stage_ascii_asset(src_path: str, work_dir: Any, target_stem: str = "bgm") -> Optional[str]:
     """Copy a local asset file into ASCII `work_dir` so FFmpeg filtergraphs stay safe on Windows Unicode paths."""
     if not src_path or not os.path.exists(src_path):
         return None
     ext = Path(src_path).suffix.lower() or ".wav"
     dst_name = f"{target_stem}{ext}"
-    dst_path = work_dir / dst_name
+    dst_path = Path(work_dir) / dst_name
     shutil.copy2(src_path, dst_path)
     return dst_name
 
@@ -74,18 +74,47 @@ def build_voice_filter_chain(
     vocal_clarity: bool = False,
     audio_volume: float = 1.0,
     normalize_audio: bool = True,
+    voice_eq_preset: str = "Raw",
+    de_esser: bool = False,
+    loudness_target: str = "-14 LUFS",
+    speed_ramp: float = 1.0,
 ) -> str:
     """
     Build the broadcast-grade voice filter chain:
-    - Dead air silenceremove (when not already cut via timeline_editor)
-    - 1-Click Studio Voice Isolation (90Hz HPF, 12kHz LPF, afftdn NR, 3:1 compressor, +2.5dB vocal presence)
-    - Light Vocal Denoise fallback (80Hz HPF, afftdn)
-    - Gain scaling + EBU R128 / -14 LUFS loudness normalization
+    - Voice EQ Presets (`Podcast Warmth`, `Crisp Broadcast`, `Gaming Clarity`, `Raw`)
+    - 1-Click Studio Voice Isolation / Light Vocal Denoise
+    - Broadcast De-Esser (6.5 kHz sibilance attenuation)
+    - Gain scaling + EBU R128 LUFS loudness normalization (-14 / -16 / -11 LUFS)
+    - Pitch-preserving speed ramp (`atempo`)
     """
     filters: List[str] = []
 
-    if auto_trim_dead_air and not tighten_pacing:
-        filters.append("silenceremove=stop_periods=-1:stop_duration=0.45:stop_threshold=-35dB")
+    # Dead-air removal trims synced video+audio segments in timeline_editor.py (never audio-only silenceremove)
+    if tighten_pacing:
+        pass
+
+    eq_norm = str(voice_eq_preset or "Raw").strip().lower()
+    if eq_norm == "podcast warmth":
+        filters.extend([
+            "highpass=f=75",
+            "equalizer=f=135:t=q:w=1.2:g=3.2",
+            "equalizer=f=320:t=q:w=1.4:g=-1.8",
+            "equalizer=f=4500:t=q:w=1.0:g=2.2",
+        ])
+    elif eq_norm == "crisp broadcast":
+        filters.extend([
+            "highpass=f=90",
+            "equalizer=f=220:t=q:w=1.3:g=-2.5",
+            "equalizer=f=3200:t=q:w=1.1:g=3.5",
+            "equalizer=f=9000:t=q:w=0.9:g=2.0",
+        ])
+    elif eq_norm == "gaming clarity":
+        filters.extend([
+            "highpass=f=100",
+            "equalizer=f=280:t=q:w=1.2:g=-3.0",
+            "equalizer=f=2600:t=q:w=1.0:g=3.8",
+            "equalizer=f=7500:t=q:w=1.0:g=2.4",
+        ])
 
     if voice_isolation:
         filters.extend([
@@ -98,12 +127,24 @@ def build_voice_filter_chain(
     elif vocal_clarity:
         filters.extend(["highpass=f=80", "afftdn=nf=-25"])
 
+    if de_esser:
+        filters.extend([
+            "equalizer=f=6500:t=q:w=2.4:g=-6.0",
+            "equalizer=f=7800:t=q:w=2.0:g=-3.5",
+        ])
+
+    spd = max(0.5, min(2.0, float(speed_ramp or 1.0)))
+    if abs(spd - 1.0) > 0.005:
+        filters.append(f"atempo={spd:.4f}")
+
     if abs(float(audio_volume or 1.0) - 1.0) > 0.01:
         vol = max(0.0, min(3.0, float(audio_volume)))
         filters.append(f"volume={vol:.2f}")
 
     if normalize_audio:
-        filters.append("loudnorm=I=-14:TP=-1.5:LRA=11")
+        lt_str = str(loudness_target or "-14 LUFS")
+        lufs = -16 if "-16" in lt_str else (-11 if "-11" in lt_str else -14)
+        filters.append(f"loudnorm=I={lufs}:TP=-1.5:LRA=11")
 
     filters.extend(["aresample=48000", "aformat=sample_rates=48000:channel_layouts=stereo"])
     return ",".join(filters)

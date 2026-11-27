@@ -514,11 +514,46 @@ def build_gemini_prompt(
     clip_count: int = 5,
     topic_focus: Optional[str] = None,
     formula_weights: Optional[Dict[str, Any]] = None,
+    multimodal_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     min_dur, max_dur = get_duration_range(duration_preset)
     focus_clause = f"\nCREATIVE TOPIC FOCUS: Prioritize moments focusing on: '{topic_focus}'." if topic_focus else ""
     guidance = (formula_weights or {}).get("prompt_guidance") or ""
     formula_clause = f"\n{guidance}" if (formula_weights and formula_weights.get("has_data") and guidance) else ""
+
+    mm_clause = ""
+    if isinstance(multimodal_context, dict):
+        peaks = (multimodal_context.get("peak_moments") or [])[:8]
+        cuts = [round(float(c.get("t", 0.0)), 1) for c in (multimodal_context.get("scene_cuts") or [])[:15]]
+        summ = multimodal_context.get("summary") or {}
+        emo_summ = multimodal_context.get("emotion_summary") or {}
+        shifts = (multimodal_context.get("emotion_shifts") or [])[:8]
+        ac_evs = (multimodal_context.get("acoustic_events") or [])[:10]
+        if peaks or cuts or emo_summ or ac_evs:
+            peak_str = ", ".join(
+                f"{p.get('t', 0)}s (score {p.get('combined_score', 0)}, {p.get('reason', 'peak')})"
+                for p in peaks
+            )
+            shift_str = ", ".join(
+                f"{s.get('t', 0)}s ({s.get('from_emotion', '?')}->{s.get('to_emotion', '?')}, arousal {s.get('arousal', 0)})"
+                for s in shifts
+            )
+            ev_str = ", ".join(
+                f"{e.get('t', 0)}s {e.get('event_type', '')}"
+                for e in ac_evs
+            )
+            mm_clause = (
+                f"\nMULTIMODAL AUDIO, AFFECTIVE & VISUAL TELEMETRY (use these real energy spikes, emotional shifts & shot cuts):"
+                f"\n- Integrated LUFS: {summ.get('integrated_lufs', -24)} dB | Avg WPM: {summ.get('avg_wpm', 0)} | Avg Sharpness: {summ.get('avg_sharpness', 0)}/100"
+                + (
+                    f"\n- Affective Profile: Facial={emo_summ.get('dominant_facial_emotion', 'neutral')} | Vocal={emo_summ.get('dominant_vocal_emotion', 'calm_storytelling')} | Peak Arousal={emo_summ.get('peak_arousal', 0)}/100 | Avg Valence={emo_summ.get('avg_valence', 0)}"
+                    if emo_summ else ""
+                )
+                + (f"\n- Top Peak Moments: {peak_str}" if peak_str else "")
+                + (f"\n- Micro-Expression & Emotion Shifts: {shift_str}" if shift_str else "")
+                + (f"\n- Non-Verbal Acoustic Events: {ev_str}" if ev_str else "")
+                + (f"\n- Hard Scene Cuts (s): {cuts}" if cuts else "")
+            )
 
     return f"""
 You are an elite YouTube Shorts & multi-format virality director and video systems architect.
@@ -526,7 +561,7 @@ Analyze this video content and extract the top {clip_count} most compelling, hig
 
 CRITICAL REQUIREMENTS:
 1. Target Count: Return exactly {clip_count} distinct, high-impact clip moments from the actual content.
-2. Duration: Each clip MUST be strictly between {int(min_dur)} and {int(max_dur)} seconds in length.{focus_clause}{formula_clause}
+2. Duration: Each clip MUST be strictly between {int(min_dur)} and {int(max_dur)} seconds in length.{focus_clause}{formula_clause}{mm_clause}
 3. Complete Sentences: Clip start and end timestamps MUST align with natural pauses and full sentences. NEVER cut off speech mid-word or mid-thought.
 4. Virality Criteria:
    - Strong hook in opening 3 seconds (curiosity gap, controversial statement, surprising insight, or energetic action).
@@ -585,6 +620,7 @@ def extract_viral_clips(
     preferred_model: Optional[str] = None,
     on_log: Optional[Any] = None,
     formula_weights: Optional[Dict[str, Any]] = None,
+    multimodal_context: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Extract viral clips using official Google GenAI SDK.
@@ -613,7 +649,13 @@ def extract_viral_clips(
 
     # Enforce strict 60-second HTTP timeout per request
     client = genai.Client(api_key=api_key, http_options={"timeout": 60000})
-    prompt = build_gemini_prompt(duration_preset, clip_count, topic_focus, formula_weights=formula_weights)
+    prompt = build_gemini_prompt(
+        duration_preset,
+        clip_count,
+        topic_focus,
+        formula_weights=formula_weights,
+        multimodal_context=multimodal_context,
+    )
     min_dur, max_dur = get_duration_range(duration_preset)
 
     cascade = get_model_cascade(preferred_model or settings.GEMINI_MODEL, api_key=api_key)
@@ -775,6 +817,32 @@ def extract_viral_clips(
             start = max(0.0, total_duration - dur)
             end = total_duration
 
+        # Attach local multimodal affect & narrative arc metadata when multimodal_context is supplied
+        mm_emo: Dict[str, Any] = {}
+        if multimodal_context:
+            try:
+                from app.services.multimodal_fusion import score_window_from_fusion
+                from app.services.offline_clipper import classify_narrative_arc
+                mm_win = score_window_from_fusion(multimodal_context, start, end)
+                if mm_win:
+                    arc_info = classify_narrative_arc(
+                        mm_win,
+                        item.get("hook_headline", ""),
+                        float((multimodal_context.get("summary") or {}).get("speaker_switch_rate", 0.0)),
+                        float(mm_win.get("wpm_avg", 0.0)),
+                    )
+                    mm_emo = {
+                        "narrative_arc": arc_info["narrative_arc"],
+                        "arc_label": arc_info["arc_label"],
+                        "dominant_emotion": arc_info["dominant_emotion"],
+                        "vocal_emotion": arc_info["vocal_emotion"],
+                        "emotion_arousal": arc_info["emotion_arousal"],
+                        "emotion_valence": arc_info["emotion_valence"],
+                        "acoustic_events": arc_info["acoustic_events"],
+                    }
+            except Exception:
+                mm_emo = {}
+
         results.append({
             "start_time": round(start, 2),
             "end_time": round(end, 2),
@@ -790,7 +858,8 @@ def extract_viral_clips(
             "youtube_titles": item.get("youtube_titles", ["Viral Moment #Shorts"]),
             "youtube_description": item.get("youtube_description", "Extracted with Lost Heaven Studio! #Shorts"),
             "pinned_comment": item.get("pinned_comment", "What do you think about this? Drop your thoughts below!"),
-            "analysis_source": f"gemini:{successful_model}"
+            "analysis_source": f"gemini:{successful_model}",
+            **mm_emo,
         })
 
     results.sort(key=lambda x: x["virality_score"], reverse=True)
