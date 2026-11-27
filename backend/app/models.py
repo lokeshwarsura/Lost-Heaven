@@ -729,11 +729,16 @@ class YouTubeImportRequest(BaseModel):
     url: str
     aspect_ratio: Optional[str] = "9:16"
     duration_preset: Optional[str] = "Auto"
+    clip_duration: Optional[str] = None
     clip_count: Optional[int] = 5
+    num_clips: Optional[int] = None
     topic_focus: Optional[str] = None
+    guidance: Optional[str] = None
     caption_language: Optional[str] = "As spoken"
+    language: Optional[str] = None
     hardware_mode: Optional[str] = "gpu"
     default_framing: Optional[str] = "smart_auto"
+    framing_template: Optional[str] = None
     ai_mode: Optional[str] = None
     batch_queue: Optional[bool] = False
 

@@ -1,6 +1,7 @@
 import re
 import os
 import sys
+import threading
 import subprocess
 import logging
 import traceback
@@ -17,6 +18,9 @@ FILLER_WORDS = {
 }
 
 _whisper_model_instance = None
+_WHISPER_LOAD_LOCK = threading.Lock()
+_WHISPER_INFER_LOCK = threading.Semaphore(1)
+_CUDA_RUNTIME_FAILED = False
 _CUDA_DLLS_REGISTERED = False
 _whisper_runtime_info: Dict[str, Any] = {
     "device": "cpu",
@@ -161,13 +165,17 @@ def resolve_whisper_device_and_compute() -> tuple[str, str, str]:
 def get_whisper_runtime_info() -> Dict[str, Any]:
     """Return active/projected Whisper device, precision, model name, batch size, and badge."""
     dev, compute, model_name = resolve_whisper_device_and_compute()
+    if _CUDA_RUNTIME_FAILED and dev == "cuda":
+        dev = "cpu"
+        compute = "int8"
     active_dev = _whisper_runtime_info.get("device") if _whisper_model_instance is not None else dev
     active_comp = _whisper_runtime_info.get("compute_type") if _whisper_model_instance is not None else compute
     active_model = _whisper_runtime_info.get("model_name") if _whisper_model_instance is not None else model_name
     configured_bs = int(getattr(settings, "WHISPER_BATCH_SIZE", 0) or 0)
-    bs = configured_bs if configured_bs > 0 else (16 if active_dev == "cuda" else 4)
-    if active_dev == "cuda" and configured_bs <= 4:
-        bs = 16
+    if active_dev == "cuda":
+        bs = configured_bs if configured_bs > 4 else 16
+    else:
+        bs = min(4, max(1, configured_bs)) if configured_bs > 0 else 4
     badge = f"GPU: CUDA {active_comp}" if active_dev == "cuda" else f"CPU {active_comp}"
     return {
         "device": active_dev,
@@ -180,86 +188,94 @@ def get_whisper_runtime_info() -> Dict[str, Any]:
 
 def get_whisper_model(force_device: Optional[str] = None):
     """
-    Robust singleton getter for faster-whisper model with dynamic VRAM scaling.
+    Thread-safe singleton getter for faster-whisper model with dynamic VRAM scaling.
     """
-    global _whisper_model_instance, _whisper_runtime_info
+    global _whisper_model_instance, _whisper_runtime_info, _CUDA_RUNTIME_FAILED
     if _whisper_model_instance is not None and not force_device:
         return _whisper_model_instance
 
-    register_cuda_dll_directories()
+    with _WHISPER_LOAD_LOCK:
+        if _whisper_model_instance is not None and not force_device:
+            return _whisper_model_instance
 
-    from faster_whisper import WhisperModel
+        register_cuda_dll_directories()
 
-    dev, compute, model_name = resolve_whisper_device_and_compute()
-    if force_device:
-        dev = force_device
-        compute = "int8" if force_device == "cpu" else compute
+        from faster_whisper import WhisperModel
 
-    models_dir = str(Path(settings.STORAGE_DIR) / "models")
-    Path(models_dir).mkdir(parents=True, exist_ok=True)
+        dev, compute, model_name = resolve_whisper_device_and_compute()
+        if _CUDA_RUNTIME_FAILED and not force_device:
+            dev = "cpu"
+            compute = "int8"
+        if force_device:
+            dev = force_device
+            compute = "int8" if force_device == "cpu" else compute
 
-    # If models_dir already contains model.bin, use it directly (100% offline & fast)
-    model_target = models_dir if os.path.exists(os.path.join(models_dir, "model.bin")) else model_name
+        models_dir = str(Path(settings.STORAGE_DIR) / "models")
+        Path(models_dir).mkdir(parents=True, exist_ok=True)
 
-    # 1. Try CUDA if selected and runtime CUDA device confirmed
-    if dev == "cuda" and _is_cuda_runtime_available():
+        # If models_dir already contains model.bin, use it directly (100% offline & fast)
+        model_target = models_dir if os.path.exists(os.path.join(models_dir, "model.bin")) else model_name
+
+        # 1. Try CUDA if selected and runtime CUDA device confirmed
+        if dev == "cuda" and not _CUDA_RUNTIME_FAILED and _is_cuda_runtime_available():
+            try:
+                logger.info(f"Loading faster-whisper '{model_name}' from '{model_target}' on CUDA ({compute}, batch_size=16)...")
+                model = WhisperModel(
+                    model_target,
+                    device="cuda",
+                    compute_type=compute,
+                    download_root=models_dir
+                )
+                # Warm-up check: verify CUDA / cuBLAS DLL execution doesn't crash
+                import numpy as np
+                dummy_pcm = np.zeros(16000, dtype=np.float32)
+                list(model.transcribe(dummy_pcm, beam_size=1)[0])
+                logger.info(f"faster-whisper CUDA ({compute}) initialization verified successfully!")
+                _whisper_model_instance = model
+                _whisper_runtime_info = {
+                    "device": "cuda",
+                    "compute_type": compute,
+                    "model_name": model_name,
+                    "batch_size": 16,
+                    "badge": f"GPU: CUDA {compute}",
+                }
+                return _whisper_model_instance
+            except Exception as cuda_err:
+                _CUDA_RUNTIME_FAILED = True
+                logger.warning(
+                    f"CUDA faster-whisper initialization/warmup failed ({cuda_err}). "
+                    f"Cleanly falling back to CPU (int8)..."
+                )
+                try:
+                    import torch  # type: ignore
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+        # 2. CPU fallback with int8
         try:
-            logger.info(f"Loading faster-whisper '{model_name}' from '{model_target}' on CUDA ({compute}, batch_size=16)...")
+            logger.info(f"Loading faster-whisper '{model_name}' from '{model_target}' on CPU (int8, batch_size=4)...")
             model = WhisperModel(
                 model_target,
-                device="cuda",
-                compute_type=compute,
-                download_root=models_dir
+                device="cpu",
+                compute_type="int8",
+                download_root=models_dir,
+                cpu_threads=min(8, os.cpu_count() or 4)
             )
-            # Warm-up check: verify CUDA / cuBLAS DLL execution doesn't crash
-            import numpy as np
-            dummy_pcm = np.zeros(16000, dtype=np.float32)
-            list(model.transcribe(dummy_pcm, beam_size=1)[0])
-            logger.info(f"faster-whisper CUDA ({compute}) initialization verified successfully!")
+            logger.info("faster-whisper CPU initialization verified successfully!")
             _whisper_model_instance = model
             _whisper_runtime_info = {
-                "device": "cuda",
-                "compute_type": compute,
+                "device": "cpu",
+                "compute_type": "int8",
                 "model_name": model_name,
-                "batch_size": 16,
-                "badge": f"GPU: CUDA {compute}",
+                "batch_size": 4,
+                "badge": "CPU int8",
             }
             return _whisper_model_instance
-        except Exception as cuda_err:
-            logger.warning(
-                f"CUDA faster-whisper initialization/warmup failed ({cuda_err}). "
-                f"Cleanly falling back to CPU (int8)..."
-            )
-            try:
-                import torch  # type: ignore
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-    # 2. CPU fallback with int8
-    try:
-        logger.info(f"Loading faster-whisper '{model_name}' from '{model_target}' on CPU (int8, batch_size=4)...")
-        model = WhisperModel(
-            model_target,
-            device="cpu",
-            compute_type="int8",
-            download_root=models_dir,
-            cpu_threads=min(8, os.cpu_count() or 4)
-        )
-        logger.info("faster-whisper CPU initialization verified successfully!")
-        _whisper_model_instance = model
-        _whisper_runtime_info = {
-            "device": "cpu",
-            "compute_type": "int8",
-            "model_name": model_name,
-            "batch_size": 4,
-            "badge": "CPU int8",
-        }
-        return _whisper_model_instance
-    except Exception as cpu_err:
-        logger.error(f"Failed to load faster-whisper on CPU: {cpu_err}\n{traceback.format_exc()}")
-        raise RuntimeError(f"Failed to initialize faster-whisper model '{model_name}': {cpu_err}")
+        except Exception as cpu_err:
+            logger.error(f"Failed to load faster-whisper on CPU: {cpu_err}\n{traceback.format_exc()}")
+            raise RuntimeError(f"Failed to initialize faster-whisper model '{model_name}': {cpu_err}")
 
 def extract_audio_segment(video_path: str, start_time: float, duration: float, output_wav_path: str) -> str:
     """Extract a 16kHz mono WAV audio segment for whisper voice recognition."""
@@ -527,53 +543,54 @@ def transcribe_audio_full(
                 on_progress(100, msg_done)
 
     try:
-        try:
-            segments, info = _run_batched_or_standard_transcribe(
-                model,
-                audio_path,
-                language=whisper_lang,
-                initial_prompt=initial_prompt,
-                word_timestamps=True,
-                vad_filter=True,
-                batch_size=batch_size,
-                beam_size=beam_size,
-            )
-            total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
-            _consume_segments(segments, total_duration)
-        except Exception as cuda_err:
-            logger.warning(f"CUDA/Batched faster-whisper transcription error: {cuda_err}. Falling back to CPU (int8, batch_size=4, beam_size=1)...")
-            model = get_whisper_model(force_device="cpu")
-            rt = get_whisper_runtime_info()
-            batch_size = int(rt.get("batch_size", 4))
-            words_list = []
-            segments, info = _run_batched_or_standard_transcribe(
-                model,
-                audio_path,
-                language=whisper_lang,
-                initial_prompt=initial_prompt,
-                word_timestamps=True,
-                vad_filter=True,
-                batch_size=batch_size,
-                beam_size=1,
-            )
-            total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
-            _consume_segments(segments, total_duration)
+        with _WHISPER_INFER_LOCK:
+            try:
+                segments, info = _run_batched_or_standard_transcribe(
+                    model,
+                    audio_path,
+                    language=whisper_lang,
+                    initial_prompt=initial_prompt,
+                    word_timestamps=True,
+                    vad_filter=True,
+                    batch_size=batch_size,
+                    beam_size=beam_size,
+                )
+                total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
+                _consume_segments(segments, total_duration)
+            except Exception as cuda_err:
+                logger.warning(f"CUDA/Batched faster-whisper transcription error: {cuda_err}. Falling back to CPU (int8, batch_size=4, beam_size=1)...")
+                model = get_whisper_model(force_device="cpu")
+                rt = get_whisper_runtime_info()
+                batch_size = min(4, int(rt.get("batch_size", 4)))
+                words_list = []
+                segments, info = _run_batched_or_standard_transcribe(
+                    model,
+                    audio_path,
+                    language=whisper_lang,
+                    initial_prompt=initial_prompt,
+                    word_timestamps=True,
+                    vad_filter=True,
+                    batch_size=batch_size,
+                    beam_size=1,
+                )
+                total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
+                _consume_segments(segments, total_duration)
 
-        # If VAD filtered everything, retry without VAD
-        if not words_list:
-            logger.info("VAD returned 0 words. Retrying full audio without VAD filter...")
-            segments, info = _run_batched_or_standard_transcribe(
-                model,
-                audio_path,
-                language=whisper_lang,
-                initial_prompt=initial_prompt,
-                word_timestamps=True,
-                vad_filter=False,
-                batch_size=batch_size,
-                beam_size=beam_size,
-            )
-            total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
-            _consume_segments(segments, total_duration)
+            # If VAD filtered everything, retry without VAD
+            if not words_list:
+                logger.info("VAD returned 0 words. Retrying full audio without VAD filter...")
+                segments, info = _run_batched_or_standard_transcribe(
+                    model,
+                    audio_path,
+                    language=whisper_lang,
+                    initial_prompt=initial_prompt,
+                    word_timestamps=True,
+                    vad_filter=False,
+                    batch_size=batch_size,
+                    beam_size=beam_size,
+                )
+                total_duration = float(getattr(info, "duration", 0.0) or 0.0) or probed_dur
+                _consume_segments(segments, total_duration)
 
     except Exception as e:
         logger.error(f"Full audio transcription error: {e}\n{traceback.format_exc()}")

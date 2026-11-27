@@ -209,16 +209,19 @@ def render_exact_preview_frame(
         if "eff_segs" in locals() and eff_segs:
             framing_segs = [(float(s), float(e)) for s, e in eff_segs]
         else:
-            s_anchor = max(0.0, float(clip_start_time or 0.0))
             if clip_duration and clip_duration > 0.2:
+                s_anchor = max(0.0, float(clip_start_time or 0.0))
                 e_anchor = s_anchor + float(clip_duration)
-            elif total_vid_dur > 0.2:
-                e_anchor = total_vid_dur
+                if clip_start_time <= 0.0:
+                    clip_rel_ts = seek_ts
             else:
-                e_anchor = max(seek_ts + 2.0, s_anchor + 4.0)
+                # Single-frame ad-hoc preview without explicit clip bounds: analyze local window around seek_ts
+                s_anchor = max(0.0, float(seek_ts) - 2.0)
+                e_anchor = float(seek_ts) + 3.0
+                if total_vid_dur > 0.2:
+                    e_anchor = min(total_vid_dur, max(s_anchor + 1.0, e_anchor))
+                clip_rel_ts = max(0.0, float(seek_ts) - s_anchor)
             framing_segs = [(s_anchor, e_anchor)]
-            if clip_start_time <= 0.0 and not (clip_duration and clip_duration > 0.2):
-                clip_rel_ts = seek_ts
 
         # Cold-Open Climax Teaser parity (`>= 8.0s` clips): map preview timestamp across teaser + main clip
         main_framing_segs = list(framing_segs)

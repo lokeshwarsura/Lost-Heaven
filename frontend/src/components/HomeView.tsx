@@ -26,7 +26,8 @@ import { api } from '../api/client';
 import { Project, StudioSettings, YouTubeMetadataInfo } from '../types';
 
 interface HomeViewProps {
-  onStartJob: (projectId: number) => void;
+  onStartJob: (projectId: number, jobId?: number) => void;
+  onJobStarted?: (projectId: number, jobId?: number) => void;
   onOpenProject: (projectId: number) => void;
   onViewProgress: (projectId: number) => void;
   onViewLibrary: () => void;
@@ -107,12 +108,52 @@ function estimateProcessingWindow(durationSec: number, hardwareMode: string): st
   return `~${Math.max(1, Math.round(low / 60))}-${Math.max(2, Math.round(high / 60))} min`;
 }
 
+function normalizeYouTubeUrl(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  const withProto = /^https?:\/\//i.test(trimmed)
+    ? trimmed
+    : /^(www\.)?(youtube\.com|youtu\.be)\//i.test(trimmed)
+      ? `https://${trimmed}`
+      : trimmed;
+
+  try {
+    const parsed = new URL(withProto);
+    const host = parsed.hostname.toLowerCase();
+    let vidId = '';
+    if (host === 'youtu.be' || host.endsWith('.youtu.be')) {
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      if (parts.length > 0) vidId = parts[0];
+    } else if (host.includes('youtube.com') || host.includes('youtube-nocookie.com')) {
+      const vParam = parsed.searchParams.get('v');
+      if (vParam) {
+        vidId = vParam;
+      } else {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        for (const pfx of ['shorts', 'live', 'embed', 'v']) {
+          const idx = parts.indexOf(pfx);
+          if (idx !== -1 && idx + 1 < parts.length) {
+            vidId = parts[idx + 1];
+            break;
+          }
+        }
+      }
+    }
+    if (vidId) {
+      return `https://www.youtube.com/watch?v=${vidId}`;
+    }
+    return parsed.toString();
+  } catch {
+    return withProto;
+  }
+}
+
 function isValidYouTubeUrl(raw: string): boolean {
-  const s = raw.trim().toLowerCase();
-  if (!s) return false;
+  const norm = normalizeYouTubeUrl(raw).toLowerCase();
+  if (!norm) return false;
   return (
-    (s.startsWith('http://') || s.startsWith('https://')) &&
-    (s.includes('youtube.com/') || s.includes('youtu.be/'))
+    (norm.startsWith('http://') || norm.startsWith('https://')) &&
+    (norm.includes('youtube.com/') || norm.includes('youtu.be/'))
   );
 }
 
@@ -192,12 +233,17 @@ async function extractLocalVideoPreview(file: File): Promise<LocalVideoPreviewMe
 
 export const HomeView: React.FC<HomeViewProps> = ({
   onStartJob,
+  onJobStarted,
   onOpenProject,
   onViewProgress,
   onViewLibrary,
   isOfflineMultimodal = false,
   studioSettings = null,
 }) => {
+  const notifyJobStarted = (projectId: number, jobId?: number) => {
+    onJobStarted?.(projectId, jobId);
+    onStartJob(projectId, jobId);
+  };
   // Media source states
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [localMeta, setLocalMeta] = useState<LocalVideoPreviewMeta | null>(null);
@@ -211,6 +257,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const [batchFiles, setBatchFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const submitLockRef = useRef<boolean>(false);
 
   // Pipeline Configuration states
   const [aspectRatio, setAspectRatio] = useState('9:16');
@@ -242,6 +289,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const [recentProjects, setRecentProjects] = useState<Project[]>([]);
   const [totalProjectsCount, setTotalProjectsCount] = useState(0);
   const [loadingProjects, setLoadingProjects] = useState(true);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [showEngineChoiceDialog, setShowEngineChoiceDialog] = useState(false);
@@ -265,12 +313,17 @@ export const HomeView: React.FC<HomeViewProps> = ({
   }, [studioSettings]);
 
   const loadRecentProjects = async () => {
+    setLoadingProjects(true);
+    setProjectsError(null);
     try {
       const res = await api.getProjectsList();
       setRecentProjects((res.projects || []).slice(0, 4));
       setTotalProjectsCount(res.projects_count ?? res.projects?.length ?? 0);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to load recent projects:', err);
+      setRecentProjects([]);
+      setTotalProjectsCount(0);
+      setProjectsError(err?.message || 'Unable to load recent projects.');
     } finally {
       setLoadingProjects(false);
     }
@@ -404,18 +457,22 @@ export const HomeView: React.FC<HomeViewProps> = ({
   };
 
   const handleFetchYouTubeInfo = async (explicitUrl?: string) => {
-    const target = (explicitUrl ?? ytUrl).trim();
-    if (!target) return;
+    const raw = (explicitUrl ?? ytUrl).trim();
+    if (!raw) return;
+    const normalized = normalizeYouTubeUrl(raw);
     setFetchingYtInfo(true);
     setYtError(null);
     setSubmitError(null);
     try {
-      const info = await api.getYouTubeInfo(target);
+      const info = await api.getYouTubeInfo(normalized);
       setYtInfo(info);
+      setYtUrl(info.webpage_url || normalized);
       setSelectedFile(null);
       setLocalMeta(null);
     } catch (err: any) {
-      setYtError(err?.message || 'Unable to fetch video metadata for that URL.');
+      const msg = err?.message || 'Unable to fetch video metadata for that URL.';
+      setYtError(msg);
+      setSubmitError(msg);
       setYtInfo(null);
     } finally {
       setFetchingYtInfo(false);
@@ -427,13 +484,16 @@ export const HomeView: React.FC<HomeViewProps> = ({
   );
 
   const executeIngestion = async (chosenAiMode: 'gemini' | 'offline') => {
+    if (submitLockRef.current) return;
+    submitLockRef.current = true;
     setIsSubmitting(true);
     setSubmitError(null);
+    setYtError(null);
     try {
-      // Multi-file batch queue mode
       const allBatchFiles = selectedFile && batchFiles.length > 0 ? [selectedFile, ...batchFiles] : batchFiles;
       if (allBatchFiles.length > 0 && !ytInfo && !isValidYouTubeUrl(ytUrl)) {
         let firstPid = 0;
+        let firstJobId: number | undefined;
         for (let i = 0; i < allBatchFiles.length; i++) {
           const res = await api.uploadVideo(
             allBatchFiles[i],
@@ -447,10 +507,13 @@ export const HomeView: React.FC<HomeViewProps> = ({
             defaultFraming,
             allBatchFiles.length > 1
           );
-          if (i === 0) firstPid = res.project_id;
+          if (i === 0) {
+            firstPid = res.project_id;
+            firstJobId = res.job_id ?? res.project_id;
+          }
         }
         if (firstPid) {
-          onStartJob(firstPid);
+          notifyJobStarted(firstPid, firstJobId);
           return;
         }
       }
@@ -468,14 +531,14 @@ export const HomeView: React.FC<HomeViewProps> = ({
           defaultFraming,
           false
         );
-        onStartJob(res.project_id);
+        notifyJobStarted(res.project_id, res.job_id ?? res.project_id);
         return;
       }
 
-      const trimmedUrl = ytUrl.trim();
-      if (trimmedUrl) {
+      const targetYt = normalizeYouTubeUrl(ytInfo?.webpage_url || ytUrl);
+      if (targetYt && isValidYouTubeUrl(targetYt)) {
         const res = await api.importYouTube(
-          trimmedUrl,
+          targetYt,
           aspectRatio,
           durationPreset,
           clipCount,
@@ -486,17 +549,24 @@ export const HomeView: React.FC<HomeViewProps> = ({
           defaultFraming,
           false
         );
-        onStartJob(res.project_id);
+        notifyJobStarted(res.project_id, res.job_id ?? res.project_id);
+        return;
       }
+
+      setSubmitError('Please select a local video file or paste a valid YouTube link.');
     } catch (err: any) {
-      setSubmitError(err?.message || 'Failed to launch extraction job.');
+      const msg = err?.message || 'Failed to launch extraction job.';
+      setSubmitError(msg);
+      console.error('Analyze & Generate Clips failed:', err);
     } finally {
+      submitLockRef.current = false;
       setIsSubmitting(false);
     }
   };
 
   const handlePrimaryAnalyzeClick = async () => {
-    if (!hasValidMediaSource || isSubmitting) return;
+    if (!hasValidMediaSource || isSubmitting || submitLockRef.current) return;
+    setSubmitError(null);
     // If Gemini mode is chosen but no API key is saved yet, prompt cleanly instead of silently failing
     if (aiModeChoice === 'gemini' && !geminiConfigured) {
       setDialogApiKey('');
@@ -504,8 +574,13 @@ export const HomeView: React.FC<HomeViewProps> = ({
       setShowEngineChoiceDialog(true);
       return;
     }
-    await api.updateSystemSettings({ ai_mode: aiModeChoice }).catch(() => {});
-    await executeIngestion(aiModeChoice);
+    try {
+      await api.updateSystemSettings({ ai_mode: aiModeChoice }).catch(() => {});
+      await executeIngestion(aiModeChoice);
+    } catch (err: any) {
+      setSubmitError(err?.message || 'Failed to start ingestion job.');
+      setIsSubmitting(false);
+    }
   };
 
   const handleDialogStartGemini = async () => {
@@ -582,16 +657,16 @@ export const HomeView: React.FC<HomeViewProps> = ({
             </h1>
           </div>
 
-          <div className="flex items-center gap-2.5">
-            <div className="px-3 py-1.5 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] flex items-center gap-2 text-xs">
-              <Cpu className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-              <span className="font-semibold text-[var(--text-secondary)]">
-                {hardwareMode === 'gpu' ? 'GPU Hardware Accel' : 'CPU Safe Mode'}
+          <div className="flex items-center gap-2.5 shrink-0">
+            <div className="px-3.5 py-1.5 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] flex items-center gap-2.5 text-xs whitespace-nowrap">
+              <Cpu className="w-3.5 h-3.5 text-[var(--accent-primary)] shrink-0" />
+              <span className="font-semibold text-[var(--text-secondary)] whitespace-nowrap">
+                {hardwareMode === 'gpu' ? 'GPU Hardware Acceleration' : 'CPU Safe Mode'}
               </span>
               <button
                 type="button"
                 onClick={() => setHardwareMode((m) => (m === 'gpu' ? 'cpu' : 'gpu'))}
-                className="px-1.5 py-0.5 rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[10px] font-bold text-[var(--text-primary)] uppercase transition-colors"
+                className="px-2 py-0.5 rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[10px] font-bold text-[var(--text-primary)] uppercase transition-colors shrink-0"
                 title="Toggle GPU / CPU acceleration"
               >
                 Switch
@@ -870,9 +945,12 @@ export const HomeView: React.FC<HomeViewProps> = ({
             {/* Bottom Gated Primary CTA */}
             <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2">
               {submitError && (
-                <div className="px-3 py-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
-                  <span>{submitError}</span>
+                <div
+                  role="alert"
+                  className="px-3.5 py-2.5 rounded-xl bg-red-950/85 border border-red-500 text-xs font-semibold text-red-100 flex items-center gap-2 shadow-sm"
+                >
+                  <AlertCircle className="w-4 h-4 shrink-0 text-red-400" />
+                  <span className="break-words">{submitError}</span>
                 </div>
               )}
 
@@ -1233,8 +1311,22 @@ export const HomeView: React.FC<HomeViewProps> = ({
               ))}
             </div>
           ) : recentProjects.length === 0 ? (
-            <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-6 text-center text-xs text-[var(--text-muted)]">
-              No projects processed yet — load your first video above to populate your quick-resume deck.
+            <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-6 text-center text-xs text-[var(--text-muted)] space-y-2">
+              <p>
+                {projectsError
+                  ? `${projectsError} — upload a video above or refresh once the backend is ready.`
+                  : 'No projects yet — upload a video above to get started'}
+              </p>
+              {projectsError && (
+                <button
+                  type="button"
+                  onClick={loadRecentProjects}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--accent-primary)] hover:bg-[var(--bg-hover)]"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Retry Loading Projects
+                </button>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">

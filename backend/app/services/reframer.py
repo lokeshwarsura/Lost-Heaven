@@ -304,7 +304,7 @@ def prepare_clip_framing_data(
         if layout == "fit_blur" and not framing_override:
             # fit_blur renders full uncropped width without face crop coordinates; avoid unneeded decode
             resolved_vm = visual_map
-        if resolved_vm is None:
+        else:
             resolved_vm = analyze_clip_visuals(
                 video_path=video_path,
                 start_time=s0,

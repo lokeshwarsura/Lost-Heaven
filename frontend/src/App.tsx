@@ -939,9 +939,16 @@ export const App: React.FC = () => {
         {/* VIEW 0: HOME INGESTION VIEW */}
         {activeView === 'home' && (
           <HomeView
-            onStartJob={(id) => {
-              setActiveProjectId(id);
-              setProgressTargetId(id);
+            onStartJob={(id, jobId) => {
+              const targetId = jobId ?? id;
+              setActiveProjectId(targetId);
+              setProgressTargetId(targetId);
+              setActiveView('progress');
+            }}
+            onJobStarted={(id, jobId) => {
+              const targetId = jobId ?? id;
+              setActiveProjectId(targetId);
+              setProgressTargetId(targetId);
               setActiveView('progress');
             }}
             onOpenProject={(id) => {

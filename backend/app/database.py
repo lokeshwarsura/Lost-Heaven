@@ -94,6 +94,20 @@ def init_db():
                 if p_cols and "ai_mode" not in p_cols:
                     session.exec(text("ALTER TABLE projects ADD COLUMN ai_mode TEXT"))
                     added = True
+                # Migrate caption_style_presets table columns if missing on older DBs
+                cs_res = session.exec(text("PRAGMA table_info(caption_style_presets)")).fetchall()
+                cs_cols = [r[1] for r in cs_res] if cs_res else []
+                if cs_cols:
+                    cs_migrations = {
+                        "outline_color": "ALTER TABLE caption_style_presets ADD COLUMN outline_color TEXT DEFAULT '#000000'",
+                        "border_style": "ALTER TABLE caption_style_presets ADD COLUMN border_style INTEGER DEFAULT 1",
+                        "highlight_power_words": "ALTER TABLE caption_style_presets ADD COLUMN highlight_power_words BOOLEAN DEFAULT 0",
+                        "how_phrase_arrives": "ALTER TABLE caption_style_presets ADD COLUMN how_phrase_arrives TEXT DEFAULT 'All at once'",
+                    }
+                    for cs_col, cs_sql in cs_migrations.items():
+                        if cs_col not in cs_cols:
+                            session.exec(text(cs_sql))
+                            added = True
                 if added:
                     session.commit()
     except Exception as e:

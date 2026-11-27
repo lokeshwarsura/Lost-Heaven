@@ -96,15 +96,33 @@ def _freeze_timer(job: Dict[str, Any]):
     job["active_started_at"] = None
     job["elapsed_seconds"] = max(0, int(round(acc)))
 
+_SETTINGS_FILE_LOCK = threading.RLock()
+
+
 def _atomic_write_json(target_path: Path, data: Dict[str, Any]) -> None:
-    """Write JSON atomically via a temp file + os.replace to prevent torn/corrupt settings files."""
+    """Write JSON atomically via a temp file + os.replace with Windows lock retry."""
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_name(f".{target_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, target_path)
+    with _SETTINGS_FILE_LOCK:
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(6):
+                try:
+                    os.replace(tmp_path, target_path)
+                    return
+                except PermissionError:
+                    if attempt == 5:
+                        raise
+                    time.sleep(0.04 * (attempt + 1))
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
 
 def _legacy_clipship_settings_path() -> Optional[Path]:
@@ -172,20 +190,21 @@ def save_persisted_settings(data: Dict[str, Any]):
     """Atomically save settings to STORAGE_DIR/settings.json (and default mirror when not isolated)."""
     from app.config import DEFAULT_STORAGE_DIR
 
-    current = get_persisted_settings()
-    current.update(data)
-    primary_path = Path(settings.STORAGE_DIR) / "settings.json"
-    paths = [primary_path]
-    if Path(settings.STORAGE_DIR).resolve() == Path(DEFAULT_STORAGE_DIR).resolve():
-        for extra in (Path("storage/settings.json"), Path("backend/storage/settings.json")):
-            if extra.resolve() != primary_path.resolve():
-                paths.append(extra)
+    with _SETTINGS_FILE_LOCK:
+        current = get_persisted_settings()
+        current.update(data)
+        primary_path = Path(settings.STORAGE_DIR) / "settings.json"
+        paths = [primary_path]
+        if Path(settings.STORAGE_DIR).resolve() == Path(DEFAULT_STORAGE_DIR).resolve():
+            for extra in (Path("storage/settings.json"), Path("backend/storage/settings.json")):
+                if extra.resolve() != primary_path.resolve():
+                    paths.append(extra)
 
-    for p in paths:
-        try:
-            _atomic_write_json(p, current)
-        except Exception as e:
-            logger.warning(f"Failed to save settings to {p}: {e}")
+        for p in paths:
+            try:
+                _atomic_write_json(p, current)
+            except Exception as e:
+                logger.warning(f"Failed to save settings to {p}: {e}")
 
 def resolve_ai_mode(
     persisted: Dict[str, Any],
@@ -397,6 +416,7 @@ class JobManager:
         hardware_mode: str = "gpu",
         ai_mode: Optional[str] = None,
         default_framing: str = "smart_auto",
+        source_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             cancel_event = threading.Event()
@@ -472,6 +492,7 @@ class JobManager:
                 "updated_at": now_iso,
                 "eta_seconds": 45,
                 "source_path": source_path,
+                "source_url": source_url,
                 "source_filename": source_filename or os.path.basename(source_path),
                 "file_size_bytes": file_size,
                 "file_size_formatted": format_size(file_size),
@@ -1289,8 +1310,88 @@ class JobManager:
             # Stage 1: Media Prep & Probing (0-15%)
             # -------------------------------------------------------------
             if self.is_cancelled(project_id): return
+
+            # If YouTube source wasn't pre-downloaded yet, download cleanly inside Stage 1
+            src_url = str(job.get("source_url") or "").strip()
+            if (
+                project.source_type == "youtube"
+                and src_url
+                and (not project.source_path or not os.path.exists(project.source_path))
+            ):
+                import yt_dlp
+
+                masters_dir = Path(settings.STORAGE_DIR) / "masters"
+                masters_dir.mkdir(parents=True, exist_ok=True)
+                self.update_progress(
+                    project_id, 6, "ingest", "Downloading YouTube source stream...",
+                    message=f"Fetching YouTube stream via yt-dlp: {src_url}",
+                    eta_seconds=60
+                )
+
+                last_dl_milestone = {"pct": -10}
+
+                def _ydl_hook(d: Dict[str, Any]):
+                    if self.is_cancelled(project_id):
+                        raise RuntimeError("Job cancelled during YouTube download")
+                    if d.get("status") == "downloading":
+                        total_b = float(d.get("total_bytes") or d.get("total_bytes_estimate") or 0)
+                        dl_b = float(d.get("downloaded_bytes") or 0)
+                        if total_b > 0:
+                            frac = min(1.0, dl_b / total_b)
+                            dl_pct = int(frac * 100)
+                            if dl_pct - last_dl_milestone["pct"] >= 20 or dl_pct >= 99:
+                                last_dl_milestone["pct"] = dl_pct
+                                mapped = 6 + int(round(frac * 6))
+                                self.update_progress(
+                                    project_id,
+                                    mapped,
+                                    "ingest",
+                                    f"Downloading YouTube stream ({dl_pct}%)...",
+                                    message=f"YouTube download {dl_pct}% ({dl_b / (1024**2):.1f} / {total_b / (1024**2):.1f} MB)...",
+                                    eta_seconds=50,
+                                )
+
+                ydl_opts = {
+                    "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                    "outtmpl": str(masters_dir / "%(id)s.%(ext)s"),
+                    "quiet": True,
+                    "no_warnings": True,
+                    "progress_hooks": [_ydl_hook],
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    dl_info = ydl.extract_info(src_url, download=True)
+                    actual_path = ydl.prepare_filename(dl_info)
+                    dl_title = dl_info.get("title") or project.title
+
+                if not os.path.exists(actual_path):
+                    raise FileNotFoundError(f"Downloaded YouTube video not found at {actual_path}")
+
+                dl_size = os.path.getsize(actual_path)
+                active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                with Session(active_db_engine) as ysession:
+                    yp = ysession.get(Project, project_id)
+                    if yp:
+                        yp.source_path = str(actual_path)
+                        yp.source_filename = os.path.basename(actual_path)
+                        yp.title = dl_title
+                        ysession.add(yp)
+                        ysession.commit()
+                        ysession.refresh(yp)
+                        project = yp
+
+                with self._lock:
+                    lj = self._jobs.get(project_id)
+                    if lj:
+                        lj["title"] = project.title
+                        lj["source_path"] = project.source_path
+                        lj["source_filename"] = project.source_filename
+                        lj["file_size_bytes"] = dl_size
+                        lj["file_size_formatted"] = f"{dl_size / (1024**2):.1f} MB" if dl_size >= 1024**2 else f"{dl_size / 1024:.1f} KB"
+                        _normalize_job_payload(lj)
+
+            if self.is_cancelled(project_id): return
             self.update_progress(
-                project_id, 8, "ingest", "Probing video stream & metadata...",
+                project_id, 12 if src_url else 8, "ingest", "Probing video stream & metadata...",
                 message=f"Running FFprobe on source: {os.path.basename(project.source_path)}",
                 eta_seconds=45
             )

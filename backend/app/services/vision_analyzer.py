@@ -239,25 +239,85 @@ def analyze_clip_visuals(
         src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
         src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
         video_dur = total_frames / fps if total_frames > 0 else 30.0
-
-        eff_end = float(end_time) if (end_time is not None and end_time > eff_start) else min(video_dur, eff_start + 15.0)
-        eff_end = min(video_dur, max(eff_start + 0.2, eff_end)) if total_frames > 0 else max(eff_start + 0.2, eff_end)
-        dur = max(0.2, eff_end - eff_start)
-
-        eff_fps = max(2.0, float(sample_fps or 5.0))
-        target_count = max(6, min(150, int(round(dur * eff_fps))))
-        # If total_frames available and tiny clip, cap at actual frame count
-        sample_times = np.linspace(eff_start, max(eff_start + 0.04, eff_end - 0.04), target_count)
-
-        decoded_frames: List[Tuple[float, np.ndarray]] = []
-        for abs_t in sample_times:
-            cap.set(cv2.CAP_PROP_POS_MSEC, float(abs_t) * 1000.0)
-            ok, fr = cap.read()
-            if ok and fr is not None:
-                rel_t = round(max(0.0, float(abs_t) - eff_start), 3)
-                decoded_frames.append((rel_t, fr))
     finally:
         cap.release()
+
+    eff_end = float(end_time) if (end_time is not None and end_time > eff_start) else min(video_dur, eff_start + 15.0)
+    eff_end = min(video_dur, max(eff_start + 0.2, eff_end)) if total_frames > 0 else max(eff_start + 0.2, eff_end)
+    dur = max(0.2, eff_end - eff_start)
+
+    eff_fps = max(2.0, float(sample_fps or 5.0))
+    target_count = max(6, min(150, int(round(dur * eff_fps))))
+    stream_fps = max(0.5, min(eff_fps, float(target_count) / max(0.2, dur)))
+
+    decoded_frames: List[Tuple[float, np.ndarray]] = []
+    # Fast sequential FFmpeg rawvideo stream when duration is compact (<=45s); keyframe-skip or seek on huge spans
+    try:
+        import subprocess
+        from app.services.proxy import get_ffmpeg_cmd
+
+        ffmpeg_bin = get_ffmpeg_cmd()
+        dw = min(1280, max(320, src_w))
+        if dw % 2 != 0:
+            dw += 1
+        dh = max(90, int(round(dw * (src_h / max(1, src_w)))))
+        if dh % 2 != 0:
+            dh += 1
+        frame_bytes = dw * dh * 3
+
+        ff_cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel", "error",
+            "-hwaccel", "auto",
+            *(["-skip_frame", "nokey"] if dur > 45.0 else []),
+            "-ss", f"{eff_start:.3f}",
+            "-t", f"{dur:.3f}",
+            "-i", abs_path,
+            "-vf", f"fps={stream_fps:.4f},scale={dw}:{dh}",
+            "-an", "-sn",
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-",
+        ]
+        proc = subprocess.Popen(
+            ff_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=frame_bytes * 4,
+        )
+        idx = 0
+        try:
+            while len(decoded_frames) < target_count:
+                raw = proc.stdout.read(frame_bytes) if proc.stdout else b""
+                if not raw or len(raw) < frame_bytes:
+                    break
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape((dh, dw, 3)).copy()
+                rel_t = round(min(dur, idx / stream_fps), 3)
+                decoded_frames.append((rel_t, arr))
+                idx += 1
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+    except Exception:
+        decoded_frames = []
+
+    # Fallback to OpenCV seek only if sequential FFmpeg stream produced no frames
+    if not decoded_frames:
+        cap_fb = cv2.VideoCapture(abs_path)
+        try:
+            sample_times = np.linspace(eff_start, max(eff_start + 0.04, eff_end - 0.04), min(30, target_count))
+            for abs_t in sample_times:
+                cap_fb.set(cv2.CAP_PROP_POS_MSEC, float(abs_t) * 1000.0)
+                ok, fr = cap_fb.read()
+                if ok and fr is not None:
+                    rel_t = round(max(0.0, float(abs_t) - eff_start), 3)
+                    decoded_frames.append((rel_t, fr))
+        finally:
+            cap_fb.release()
 
     if not decoded_frames:
         empty_cam = detect_webcam_in_frames([], src_w, src_h, locked_zone=locked_zone)

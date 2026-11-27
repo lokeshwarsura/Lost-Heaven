@@ -1618,11 +1618,61 @@ def provide_key_endpoint(
         "resumed_stage": job.get("current_stage")
     }
 
+def normalize_youtube_url(raw_url: str) -> str:
+    """
+    Normalize youtu.be/<id>?si=..., youtube.com/shorts/<id>, live/<id>, embed/<id>,
+    or youtube.com/watch?v=<id>&... cleanly into https://www.youtube.com/watch?v=<id>
+    so tracking parameters never break yt-dlp inspection or downloading.
+    """
+    from urllib.parse import parse_qs, urlparse
+
+    s = (raw_url or "").strip()
+    if not s:
+        return ""
+    low = s.lower()
+    if not low.startswith(("http://", "https://")) and (
+        low.startswith("youtube.com") or low.startswith("www.youtube.com") or low.startswith("youtu.be")
+    ):
+        s = f"https://{s}"
+
+    try:
+        parsed = urlparse(s)
+    except Exception:
+        return s
+
+    host = (parsed.hostname or "").lower()
+    path = parsed.path or ""
+    vid_id = ""
+
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        seg = [p for p in path.split("/") if p]
+        if seg:
+            vid_id = seg[0]
+    elif "youtube.com" in host or "youtube-nocookie.com" in host:
+        qs = parse_qs(parsed.query)
+        if qs.get("v"):
+            vid_id = qs["v"][0]
+        else:
+            parts = [p for p in path.split("/") if p]
+            for prefix in ("shorts", "live", "embed", "v"):
+                if prefix in parts:
+                    idx = parts.index(prefix)
+                    if idx + 1 < len(parts):
+                        vid_id = parts[idx + 1]
+                        break
+
+    if vid_id:
+        clean_id = vid_id.split("?")[0].split("&")[0].strip()
+        if clean_id:
+            return f"https://www.youtube.com/watch?v={clean_id}"
+    return s
+
+
 @app.get("/api/ingest/youtube-info")
 @app.get("/api/projects/youtube-info")
 def get_youtube_info_endpoint(url: str):
     """Inspect a YouTube video URL instantly without downloading via yt-dlp --dump-json semantics."""
-    clean_url = (url or "").strip()
+    clean_url = normalize_youtube_url(url)
     if not clean_url or not (
         "youtube.com" in clean_url.lower()
         or "youtu.be" in clean_url.lower()
@@ -1636,6 +1686,7 @@ def get_youtube_info_endpoint(url: str):
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
+            "socket_timeout": 12,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(clean_url, download=False)
@@ -1668,7 +1719,7 @@ def get_youtube_info_endpoint(url: str):
         "height": height or 1080,
         "resolution": resolution,
         "uploader": info.get("uploader") or info.get("channel") or "",
-        "webpage_url": info.get("webpage_url") or clean_url,
+        "webpage_url": clean_url,
         "filesize_approx": int(info.get("filesize_approx") or info.get("filesize") or 0),
     }
 
@@ -1679,11 +1730,16 @@ async def upload_video(
     file: UploadFile = File(...),
     aspect_ratio: Optional[str] = Form("9:16"),
     duration_preset: Optional[str] = Form("Auto"),
+    clip_duration: Optional[str] = Form(None),
     clip_count: Optional[int] = Form(5),
+    num_clips: Optional[int] = Form(None),
     topic_focus: Optional[str] = Form(None),
+    guidance: Optional[str] = Form(None),
     caption_language: Optional[str] = Form("As spoken"),
+    language: Optional[str] = Form(None),
     hardware_mode: Optional[str] = Form("gpu"),
     default_framing: Optional[str] = Form("smart_auto"),
+    framing_template: Optional[str] = Form(None),
     ai_mode: Optional[str] = Form(None),
     batch_queue: Optional[bool] = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -1700,11 +1756,37 @@ async def upload_video(
         while chunk := await file.read(1024 * 1024 * 4):
             buffer.write(chunk)
 
+    def _uf(val: Any, fallback: Any = None) -> Any:
+        if val is not None and not isinstance(val, (str, int, float, bool)) and hasattr(val, "default"):
+            d = getattr(val, "default", None)
+            return d if (d is None or isinstance(d, (str, int, float, bool))) else fallback
+        return val
+
+    aspect_ratio = _uf(aspect_ratio, "9:16")
+    duration_preset = _uf(duration_preset, "Auto")
+    clip_duration = _uf(clip_duration, None)
+    clip_count = _uf(clip_count, 5)
+    num_clips = _uf(num_clips, None)
+    topic_focus = _uf(topic_focus, None)
+    guidance = _uf(guidance, None)
+    caption_language = _uf(caption_language, "As spoken")
+    language = _uf(language, None)
+    hardware_mode = _uf(hardware_mode, "gpu") or "gpu"
+    default_framing = _uf(default_framing, "smart_auto")
+    framing_template = _uf(framing_template, None)
+    ai_mode = _uf(ai_mode, None)
+    batch_queue = bool(_uf(batch_queue, False))
+
     from app.services.job_manager import resolve_ai_mode
     clean_ai_mode = ai_mode if ai_mode in ("gemini", "offline") else None
     resolved_mode = resolve_ai_mode(get_persisted_settings(), explicit_ai_mode=clean_ai_mode)
     stored_ai_mode = resolved_mode if resolved_mode in ("gemini", "offline") else clean_ai_mode
-    framing_choice = default_framing or "smart_auto"
+
+    eff_duration = clip_duration or duration_preset or "Auto"
+    eff_count = int(num_clips) if num_clips is not None else int(clip_count or 5)
+    eff_lang = language or caption_language or "As spoken"
+    eff_topic = guidance if guidance is not None else topic_focus
+    framing_choice = framing_template or default_framing or "smart_auto"
 
     title = Path(file.filename).stem.replace("_", " ").title()
     project = Project(
@@ -1714,13 +1796,13 @@ async def upload_video(
         source_path=str(dest_path),
         status="created",
         default_aspect_ratio=aspect_ratio or "9:16",
-        duration_preset=duration_preset or "Auto",
-        clip_count=clip_count or 5,
-        caption_language=caption_language or "As spoken",
+        duration_preset=eff_duration,
+        clip_count=eff_count,
+        caption_language=eff_lang,
         hardware_mode=hardware_mode or "gpu",
         default_framing=framing_choice,
         ai_mode=stored_ai_mode,
-        topic_focus=topic_focus
+        topic_focus=eff_topic
     )
     session.add(project)
     session.commit()
@@ -1732,11 +1814,11 @@ async def upload_video(
         title=project.title,
         source_path=str(dest_path),
         source_filename=file.filename,
-        duration_preset=duration_preset or "Auto",
+        duration_preset=eff_duration,
         aspect_ratio=aspect_ratio or "9:16",
-        clip_count=clip_count or 5,
-        caption_language=caption_language or "As spoken",
-        topic_focus=topic_focus,
+        clip_count=eff_count,
+        caption_language=eff_lang,
+        topic_focus=eff_topic,
         hardware_mode=hardware_mode or "gpu",
         ai_mode=clean_ai_mode,
         default_framing=framing_choice,
@@ -1746,6 +1828,7 @@ async def upload_video(
         enqueue_batch_project(project.id, project.title, source="upload", auto_start=True)
         return {
             "project_id": project.id,
+            "job_id": project.id,
             "title": project.title,
             "status": "queued",
             "ai_mode": stored_ai_mode,
@@ -1756,6 +1839,7 @@ async def upload_video(
 
     return {
         "project_id": project.id,
+        "job_id": project.id,
         "title": project.title,
         "status": "processing",
         "ai_mode": stored_ai_mode,
@@ -1769,7 +1853,18 @@ async def import_youtube(
     background_tasks: BackgroundTasks = BackgroundTasks(),
     session: Session = Depends(get_session)
 ):
-    """Import video from YouTube with Step 1 setup parameters and launch background pipeline."""
+    """
+    Validate & normalize YouTube URL quickly without blocking the HTTP response,
+    create Project + Job immediately, and run video download + 5-stage analysis in background.
+    """
+    clean_url = normalize_youtube_url(req.url)
+    if not clean_url or not (
+        "youtube.com" in clean_url.lower()
+        or "youtu.be" in clean_url.lower()
+        or clean_url.lower().startswith("http")
+    ):
+        raise HTTPException(status_code=400, detail="Please enter a valid YouTube or video URL.")
+
     masters_dir = Path(settings.STORAGE_DIR) / "masters"
     masters_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1779,21 +1874,28 @@ async def import_youtube(
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "outtmpl": str(masters_dir / "%(id)s.%(ext)s"),
             "quiet": True,
-            "no_warnings": True
+            "no_warnings": True,
+            "skip_download": True,
+            "socket_timeout": 12,
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(req.url, download=True)
-            video_filename = ydl.prepare_filename(info)
-            video_title = info.get("title", "YouTube Video")
+            info = ydl.extract_info(clean_url, download=False)
+            video_filename = ydl.prepare_filename(info) if isinstance(info, dict) else str(masters_dir / "youtube_source.mp4")
+            video_title = (info.get("title") if isinstance(info, dict) else None) or "YouTube Video"
     except Exception as e:
-        logger.error(f"yt-dlp download failed: {e}")
+        logger.error(f"yt-dlp metadata/import failed for '{clean_url}': {e}")
         raise HTTPException(status_code=400, detail=f"Failed to import YouTube video: {str(e)}")
 
     from app.services.job_manager import resolve_ai_mode
     clean_ai_mode = req.ai_mode if req.ai_mode in ("gemini", "offline") else None
     resolved_mode = resolve_ai_mode(get_persisted_settings(), explicit_ai_mode=clean_ai_mode)
     stored_ai_mode = resolved_mode if resolved_mode in ("gemini", "offline") else clean_ai_mode
-    framing_choice = req.default_framing or "smart_auto"
+
+    eff_duration = req.clip_duration or req.duration_preset or "Auto"
+    eff_count = int(req.num_clips) if req.num_clips is not None else int(req.clip_count or 5)
+    eff_lang = req.language or req.caption_language or "As spoken"
+    eff_topic = req.guidance if req.guidance is not None else req.topic_focus
+    framing_choice = req.framing_template or req.default_framing or "smart_auto"
 
     project = Project(
         title=video_title,
@@ -1802,52 +1904,57 @@ async def import_youtube(
         source_path=str(video_filename),
         status="created",
         default_aspect_ratio=req.aspect_ratio or "9:16",
-        duration_preset=req.duration_preset or "Auto",
-        clip_count=req.clip_count or 5,
-        caption_language=req.caption_language or "As spoken",
+        duration_preset=eff_duration,
+        clip_count=eff_count,
+        caption_language=eff_lang,
         hardware_mode=req.hardware_mode or "gpu",
         default_framing=framing_choice,
         ai_mode=stored_ai_mode,
-        topic_focus=req.topic_focus
+        topic_focus=eff_topic
     )
     session.add(project)
     session.commit()
     session.refresh(project)
 
-    # Initialize Job in JobManager & persist initial project.json
+    # Initialize Job in JobManager & persist initial project.json immediately
     job_manager.create_job(
         project_id=project.id,
         title=project.title,
         source_path=str(video_filename),
         source_filename=os.path.basename(video_filename),
-        duration_preset=req.duration_preset or "Auto",
+        duration_preset=eff_duration,
         aspect_ratio=req.aspect_ratio or "9:16",
-        clip_count=req.clip_count or 5,
-        caption_language=req.caption_language or "As spoken",
-        topic_focus=req.topic_focus,
+        clip_count=eff_count,
+        caption_language=eff_lang,
+        topic_focus=eff_topic,
         hardware_mode=req.hardware_mode or "gpu",
         ai_mode=clean_ai_mode,
         default_framing=framing_choice,
+        source_url=clean_url,
     )
 
     if req.batch_queue:
         enqueue_batch_project(project.id, project.title, source="youtube", auto_start=True)
         return {
             "project_id": project.id,
+            "job_id": project.id,
             "title": project.title,
             "status": "queued",
             "ai_mode": stored_ai_mode,
             "default_framing": framing_choice,
+            "normalized_url": clean_url,
         }
 
     background_tasks.add_task(job_manager.run_pipeline, project.id)
 
     return {
         "project_id": project.id,
+        "job_id": project.id,
         "title": project.title,
         "status": "processing",
         "ai_mode": stored_ai_mode,
         "default_framing": framing_choice,
+        "normalized_url": clean_url,
     }
 
 # -------------------------------------------------------------

@@ -203,22 +203,32 @@ export const api = {
 
   // --- Projects & Disk Space Management ---
   async getProjectsList(): Promise<ProjectsListResponse> {
-    const res = await fetch(`${API_BASE}/projects`);
-    const data = await res.json();
-    if (Array.isArray(data)) {
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timeoutId = controller ? window.setTimeout(() => controller.abort(), 8000) : null;
+    try {
+      const res = await fetch(`${API_BASE}/projects`, controller ? { signal: controller.signal } : undefined);
+      if (!res.ok) {
+        const err = await res.json().catch(() => null);
+        throw new Error(err?.detail || `Failed to load projects (${res.status})`);
+      }
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        return {
+          projects: data,
+          total_disk_bytes: 0,
+          total_disk_formatted: '0 MB',
+          projects_count: data.length
+        };
+      }
       return {
-        projects: data,
-        total_disk_bytes: 0,
-        total_disk_formatted: '0 MB',
-        projects_count: data.length
+        projects: data.projects || [],
+        total_disk_bytes: data.total_disk_bytes || 0,
+        total_disk_formatted: data.total_disk_formatted || '0 MB',
+        projects_count: data.total_projects || (data.projects?.length ?? 0)
       };
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
     }
-    return {
-      projects: data.projects || [],
-      total_disk_bytes: data.total_disk_bytes || 0,
-      total_disk_formatted: data.total_disk_formatted || '0 MB',
-      projects_count: data.total_projects || (data.projects?.length ?? 0)
-    };
   },
 
   async getProjects(): Promise<Project[]> {
@@ -331,28 +341,36 @@ export const api = {
     aiMode?: 'gemini' | 'offline',
     defaultFraming: string = 'smart_auto',
     batchQueue: boolean = false
-  ): Promise<{ project_id: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
+  ): Promise<{ project_id: number; job_id?: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('aspect_ratio', aspectRatio);
     formData.append('duration_preset', durationPreset);
+    formData.append('clip_duration', durationPreset);
     formData.append('clip_count', clipCount.toString());
+    formData.append('num_clips', clipCount.toString());
     formData.append('caption_language', captionLanguage);
+    formData.append('language', captionLanguage);
     formData.append('hardware_mode', hardwareMode);
     formData.append('default_framing', defaultFraming || 'smart_auto');
+    formData.append('framing_template', defaultFraming || 'smart_auto');
     formData.append('batch_queue', batchQueue ? 'true' : 'false');
     if (aiMode) {
       formData.append('ai_mode', aiMode);
     }
     if (topicFocus) {
       formData.append('topic_focus', topicFocus);
+      formData.append('guidance', topicFocus);
     }
 
     const res = await fetch(`${API_BASE}/ingest/upload`, {
       method: 'POST',
       body: formData,
     });
-    if (!res.ok) throw new Error('Video upload failed');
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || err?.message || `Video upload failed (${res.status})`);
+    }
     return res.json();
   },
 
@@ -367,7 +385,7 @@ export const api = {
     aiMode?: 'gemini' | 'offline',
     defaultFraming: string = 'smart_auto',
     batchQueue: boolean = false
-  ): Promise<{ project_id: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
+  ): Promise<{ project_id: number; job_id?: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
     const res = await fetch(`${API_BASE}/ingest/youtube`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -375,18 +393,23 @@ export const api = {
         url,
         aspect_ratio: aspectRatio,
         duration_preset: durationPreset,
+        clip_duration: durationPreset,
         clip_count: clipCount,
+        num_clips: clipCount,
         topic_focus: topicFocus,
+        guidance: topicFocus,
         caption_language: captionLanguage,
+        language: captionLanguage,
         hardware_mode: hardwareMode,
         ai_mode: aiMode,
         default_framing: defaultFraming || 'smart_auto',
+        framing_template: defaultFraming || 'smart_auto',
         batch_queue: batchQueue
       }),
     });
     if (!res.ok) {
-      const err = await res.json();
-      throw new Error(err.detail || 'YouTube import failed');
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || err?.message || `YouTube import failed (${res.status})`);
     }
     return res.json();
   },
