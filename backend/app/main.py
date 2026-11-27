@@ -27,7 +27,8 @@ from app.models import (
     FramingOverrideRequest,
     SettingsUpdateRequest, PreviewFrameRequest, PreviewFrameResponse,
     CreateBrandPresetRequest, CreateCaptionStyleRequest,
-    ProvideKeyRequest, RetryProjectRequest, TestGeminiRequest
+    ProvideKeyRequest, RetryProjectRequest, TestGeminiRequest,
+    InstallPrerequisitesRequest, CompleteOnboardingRequest
 )
 from app.services.proxy import probe_video, create_gemini_proxy, get_ffmpeg_cmd
 from app.services.gemini_clipper import (
@@ -37,7 +38,13 @@ from app.services.gemini_clipper import (
     list_available_gemini_models,
     DEFAULT_MODEL_CASCADE
 )
-from app.services.transcriber import transcribe_clip, filter_filler_words
+from app.services.transcriber import transcribe_clip, filter_filler_words, reset_whisper_model_cache
+from app.services.system_profiler import (
+    profile_system_specs,
+    build_first_run_recommendations,
+    start_prerequisite_install,
+    get_install_status,
+)
 from app.services.renderer import render_clip_ultra, RenderSupersededError
 from app.services.preview_frame import render_exact_preview_frame
 from app.services.timeline_editor import extract_waveform_bins
@@ -151,6 +158,24 @@ def _hydrate_settings_from_disk() -> None:
     if persisted.get("whisper_model"):
         settings.WHISPER_MODEL = str(persisted["whisper_model"])
         RUNTIME_SETTINGS["whisper_model"] = settings.WHISPER_MODEL
+    if persisted.get("whisper_device"):
+        settings.WHISPER_DEVICE = str(persisted["whisper_device"])
+    if persisted.get("whisper_compute_type"):
+        settings.WHISPER_COMPUTE_TYPE = str(persisted["whisper_compute_type"])
+    if persisted.get("whisper_batch_size"):
+        try:
+            settings.WHISPER_BATCH_SIZE = int(persisted["whisper_batch_size"])
+        except Exception:
+            pass
+    if persisted.get("video_encoder"):
+        settings.VIDEO_ENCODER = str(persisted["video_encoder"])
+    if persisted.get("default_resolution"):
+        settings.DEFAULT_RESOLUTION = str(persisted["default_resolution"])
+    if persisted.get("vision_scan_fps"):
+        try:
+            settings.VISION_SCAN_FPS = float(persisted["vision_scan_fps"])
+        except Exception:
+            pass
     if persisted.get("hardware_acceleration"):
         settings.HARDWARE_ACCELERATION = str(persisted["hardware_acceleration"])
         RUNTIME_SETTINGS["hardware_acceleration"] = settings.HARDWARE_ACCELERATION
@@ -216,6 +241,118 @@ def legacy_system_info():
 def update_ytdlp_endpoint():
     """Update yt-dlp package in the active Python environment."""
     return update_ytdlp_package()
+
+
+@app.get("/api/system/onboarding")
+def get_system_onboarding_endpoint():
+    """
+    Detect machine specs, assign tiered hardware profile, audit downloaded prerequisites,
+    and indicate whether the first-run setup wizard should open automatically.
+    """
+    persisted = get_persisted_settings()
+    first_run_completed = bool(persisted.get("first_run_completed", False))
+    specs = profile_system_specs()
+    rec = build_first_run_recommendations(specs, persisted)
+    return {
+        "first_run_completed": first_run_completed,
+        "specs": specs,
+        "tier": rec["tier"],
+        "tier_label": rec["tier_label"],
+        "downloads_needed": rec["downloads_needed"],
+        "recommended_settings": rec["recommended_settings"],
+        "summary_reason": rec["summary_reason"],
+    }
+
+
+@app.post("/api/system/install-prerequisites")
+def install_prerequisites_endpoint(req: InstallPrerequisitesRequest):
+    """Launch background installer for missing static FFmpeg binaries and recommended Whisper weights."""
+    return start_prerequisite_install(
+        install_ffmpeg=bool(req.install_ffmpeg),
+        whisper_model=req.whisper_model,
+    )
+
+
+@app.get("/api/system/install-status")
+def get_install_status_endpoint():
+    """Return real-time progress and logs from background prerequisite installation."""
+    return get_install_status()
+
+
+@app.post("/api/system/complete-onboarding")
+def complete_onboarding_endpoint(req: CompleteOnboardingRequest):
+    """Persist tailored hardware/AI settings into settings.json and mark first_run_completed=True."""
+    persisted = get_persisted_settings()
+
+    clean_model = str(req.whisper_model or "base").strip()
+    clean_dev = str(req.whisper_device or "auto").strip()
+    clean_comp = str(req.whisper_compute_type or "auto").strip()
+    clean_batch = int(req.whisper_batch_size or (16 if clean_dev == "cuda" else 4))
+    clean_enc = str(req.video_encoder or "libx264").strip()
+    clean_res = str(req.default_resolution or "1080p").strip()
+    clean_fps = float(req.vision_scan_fps or 1.2)
+    clean_hw = str(req.hardware_acceleration or ("gpu" if clean_dev == "cuda" or "libx264" not in clean_enc else "cpu")).strip()
+
+    settings.WHISPER_MODEL = clean_model
+    settings.WHISPER_DEVICE = clean_dev
+    settings.WHISPER_COMPUTE_TYPE = clean_comp
+    settings.WHISPER_BATCH_SIZE = clean_batch
+    settings.VIDEO_ENCODER = clean_enc
+    settings.DEFAULT_RESOLUTION = clean_res
+    settings.VISION_SCAN_FPS = clean_fps
+    settings.HARDWARE_ACCELERATION = clean_hw
+
+    RUNTIME_SETTINGS["whisper_model"] = clean_model
+    RUNTIME_SETTINGS["hardware_acceleration"] = clean_hw
+
+    persisted["first_run_completed"] = True
+    persisted["whisper_model"] = clean_model
+    persisted["whisper_device"] = clean_dev
+    persisted["whisper_compute_type"] = clean_comp
+    persisted["whisper_batch_size"] = clean_batch
+    persisted["video_encoder"] = clean_enc
+    persisted["default_resolution"] = clean_res
+    persisted["vision_scan_fps"] = clean_fps
+    persisted["hardware_acceleration"] = clean_hw
+
+    raw_ai_mode = str(req.ai_mode or "").strip().lower()
+    if raw_ai_mode in ("gemini", "offline"):
+        persisted["ai_mode"] = raw_ai_mode
+        RUNTIME_SETTINGS["ai_mode"] = raw_ai_mode
+        if raw_ai_mode == "offline":
+            settings.AI_PROVIDER = "offline"
+            persisted["ai_provider"] = "offline"
+            persisted["gemini_enabled"] = False
+            persisted["gemini_boost_enabled"] = False
+            RUNTIME_SETTINGS["gemini_enabled"] = False
+            RUNTIME_SETTINGS["gemini_boost_enabled"] = False
+        else:
+            settings.AI_PROVIDER = "gemini"
+            persisted["ai_provider"] = "gemini"
+            persisted["gemini_enabled"] = True
+            persisted["gemini_boost_enabled"] = True
+            RUNTIME_SETTINGS["gemini_enabled"] = True
+            RUNTIME_SETTINGS["gemini_boost_enabled"] = True
+
+    if req.gemini_api_key and req.gemini_api_key.strip():
+        clean_key = req.gemini_api_key.strip()
+        settings.GEMINI_API_KEY = clean_key
+        os.environ["GEMINI_API_KEY"] = clean_key
+        persisted["gemini_api_key"] = clean_key
+
+    if req.active_theme and req.active_theme.strip():
+        theme = req.active_theme.strip()
+        persisted["active_theme"] = theme
+        RUNTIME_SETTINGS["active_theme"] = theme
+
+    save_persisted_settings(persisted)
+    reset_whisper_model_cache()
+
+    return {
+        "status": "completed",
+        "first_run_completed": True,
+        "settings": get_system_settings(),
+    }
 
 CURATED_DEFAULT_GEMINI_MODELS = [
     {"id": "gemini-3.5-flash-lite", "display_name": "gemini-3.5-flash-lite (Fastest / Recommended)", "description": "Fastest high-throughput 1M context default"},
@@ -328,6 +465,13 @@ def get_system_settings():
     RUNTIME_SETTINGS["pexels_api_key"] = persisted.get("pexels_api_key", "")
     RUNTIME_SETTINGS["watch_folder_path"] = persisted.get("watch_folder_path", "")
     RUNTIME_SETTINGS["watch_folder_enabled"] = bool(persisted.get("watch_folder_enabled", False))
+    RUNTIME_SETTINGS["first_run_completed"] = bool(persisted.get("first_run_completed", False))
+    RUNTIME_SETTINGS["whisper_device"] = settings.WHISPER_DEVICE
+    RUNTIME_SETTINGS["whisper_compute_type"] = settings.WHISPER_COMPUTE_TYPE
+    RUNTIME_SETTINGS["whisper_batch_size"] = settings.WHISPER_BATCH_SIZE
+    RUNTIME_SETTINGS["video_encoder"] = persisted.get("video_encoder", settings.VIDEO_ENCODER)
+    RUNTIME_SETTINGS["default_resolution"] = persisted.get("default_resolution", settings.DEFAULT_RESOLUTION)
+    RUNTIME_SETTINGS["vision_scan_fps"] = persisted.get("vision_scan_fps", settings.VISION_SCAN_FPS)
     RUNTIME_SETTINGS["model_cascade"] = DEFAULT_MODEL_CASCADE
     return RUNTIME_SETTINGS
 
@@ -4289,6 +4433,11 @@ def get_studio_settings():
         "ollama_model": persisted.get("ollama_model", settings.OLLAMA_MODEL),
         "whisper_model": settings.WHISPER_MODEL,
         "whisper_device": settings.WHISPER_DEVICE,
+        "whisper_compute_type": settings.WHISPER_COMPUTE_TYPE,
+        "whisper_batch_size": settings.WHISPER_BATCH_SIZE,
+        "video_encoder": persisted.get("video_encoder", settings.VIDEO_ENCODER),
+        "default_resolution": persisted.get("default_resolution", settings.DEFAULT_RESOLUTION),
+        "first_run_completed": bool(persisted.get("first_run_completed", False)),
         "youtube_authenticated": has_youtube,
         "hardware_acceleration": settings.HARDWARE_ACCELERATION,
         "ffmpeg_path": get_ffmpeg_cmd(),

@@ -9,22 +9,24 @@ from typing import Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 def get_ffmpeg_cmd() -> str:
-    """Return available ffmpeg executable, checking PATH and workspace bin."""
-    from app.config import PROJECT_ROOT
-    ws_ffmpeg = PROJECT_ROOT / "bin" / "ffmpeg.exe"
-    if ws_ffmpeg.exists():
-        return str(ws_ffmpeg)
+    """Return available ffmpeg executable, checking backend/bin, workspace/bin, and system PATH."""
+    from app.config import BACKEND_BIN, PROJECT_ROOT
+    for base in (BACKEND_BIN, PROJECT_ROOT / "bin"):
+        for cand in (base / "ffmpeg.exe", base / "ffmpeg"):
+            if cand.exists():
+                return str(cand)
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
         return system_ffmpeg
     return "ffmpeg"
 
 def get_ffprobe_cmd() -> str:
-    """Return available ffprobe executable, checking PATH and workspace bin."""
-    from app.config import PROJECT_ROOT
-    ws_ffprobe = PROJECT_ROOT / "bin" / "ffprobe.exe"
-    if ws_ffprobe.exists():
-        return str(ws_ffprobe)
+    """Return available ffprobe executable, checking backend/bin, workspace/bin, and system PATH."""
+    from app.config import BACKEND_BIN, PROJECT_ROOT
+    for base in (BACKEND_BIN, PROJECT_ROOT / "bin"):
+        for cand in (base / "ffprobe.exe", base / "ffprobe"):
+            if cand.exists():
+                return str(cand)
     system_ffprobe = shutil.which("ffprobe")
     if system_ffprobe:
         return system_ffprobe

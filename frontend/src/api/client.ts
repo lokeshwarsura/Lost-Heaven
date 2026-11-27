@@ -18,7 +18,9 @@ import {
   FramingMapResponse,
   JobProgress,
   JobsListResponse,
-  YouTubeMetadataInfo
+  YouTubeMetadataInfo,
+  SystemOnboardingReport,
+  PrerequisiteInstallStatus
 } from '../types';
 
 declare global {
@@ -65,6 +67,63 @@ export const api = {
 
   async updateYtDlp(): Promise<{ status: string; output: string }> {
     const res = await fetch(`${API_BASE}/system/update-ytdlp`, { method: 'POST' });
+    return res.json();
+  },
+
+  async getSystemOnboarding(): Promise<SystemOnboardingReport> {
+    const res = await fetch(`${API_BASE}/system/onboarding`);
+    if (!res.ok) {
+      throw new Error(`Failed to load hardware onboarding specs (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async installPrerequisites(payload: {
+    install_ffmpeg: boolean;
+    whisper_model?: string;
+  }): Promise<PrerequisiteInstallStatus> {
+    const res = await fetch(`${API_BASE}/system/install-prerequisites`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to launch installer' }));
+      throw new Error(err.detail || 'Failed to launch prerequisite installer');
+    }
+    return res.json();
+  },
+
+  async getInstallStatus(): Promise<PrerequisiteInstallStatus> {
+    const res = await fetch(`${API_BASE}/system/install-status`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch installer status (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async completeOnboarding(payload: {
+    whisper_model: string;
+    whisper_device: string;
+    whisper_compute_type: string;
+    whisper_batch_size?: number;
+    video_encoder?: string;
+    default_resolution?: string;
+    vision_scan_fps?: number;
+    ai_mode?: 'gemini' | 'offline';
+    gemini_api_key?: string;
+    hardware_acceleration?: string;
+    active_theme?: string;
+  }): Promise<{ status: string; first_run_completed: boolean; settings: StudioSettings }> {
+    const res = await fetch(`${API_BASE}/system/complete-onboarding`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to save onboarding settings' }));
+      throw new Error(err.detail || 'Failed to save onboarding settings');
+    }
     return res.json();
   },
 

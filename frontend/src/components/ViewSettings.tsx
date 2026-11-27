@@ -391,7 +391,7 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
               className="flex items-center gap-1.5 px-3.5 py-2 bg-[var(--bg-card)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] transition shadow-sm"
             >
               <Sparkles className="w-4 h-4 text-[var(--accent-primary)]" />
-              <span>Setup Wizard</span>
+              <span>Re-Scan PC Specs &amp; Setup Wizard</span>
             </button>
           )}
           <button

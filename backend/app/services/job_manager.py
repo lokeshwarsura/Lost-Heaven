@@ -200,17 +200,24 @@ def resolve_ai_mode(
     """
     if force_offline:
         return "offline"
-    raw_mode = (explicit_ai_mode or persisted.get("ai_mode") or "").strip().lower()
+    clean_explicit = (explicit_ai_mode or "").strip().lower()
+    if clean_explicit == "offline":
+        return "offline"
+
+    raw_mode = clean_explicit or str(persisted.get("ai_mode") or "").strip().lower()
     if raw_mode == "offline":
         return "offline"
+
     ai_provider = str(persisted.get("ai_provider") or settings.AI_PROVIDER or "gemini").strip().lower()
-    if ai_provider == "offline":
-        return "offline"
-    gem_enabled = persisted.get("gemini_enabled", persisted.get("gemini_boost_enabled", True))
-    if gem_enabled is False:
-        return "offline"
+    if clean_explicit != "gemini":
+        if ai_provider == "offline":
+            return "offline"
+        gem_enabled = persisted.get("gemini_enabled", persisted.get("gemini_boost_enabled", True))
+        if gem_enabled is False:
+            return "offline"
+
     key = persisted.get("gemini_api_key") or settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", "")
-    if ai_provider == "ollama":
+    if ai_provider == "ollama" and clean_explicit != "gemini":
         return "gemini"  # Uses Stage 4 local LLM branch cleanly
     if _is_valid_api_key(key):
         return "gemini"

@@ -781,6 +781,12 @@ export interface StudioSettings {
   model_cascade?: string[];
   whisper_model: string;
   whisper_device: string;
+  whisper_compute_type?: string;
+  whisper_batch_size?: number;
+  video_encoder?: string;
+  default_resolution?: string;
+  vision_scan_fps?: number;
+  first_run_completed?: boolean;
   youtube_authenticated: boolean;
   hardware_acceleration: string;
   ffmpeg_path: string;
@@ -886,6 +892,79 @@ export interface JobProgress {
   logs: PipelineLog[];
   error_detail?: string;
   clips_count?: number;
+}
+
+export interface PrerequisiteInstallStatus {
+  status: 'idle' | 'running' | 'completed' | 'error';
+  progress_pct: number;
+  current_step: string;
+  message: string;
+  error?: string | null;
+  logs: Array<{ timestamp: string; message: string }>;
+  ffmpeg_installed: boolean;
+  whisper_model_installed?: string | null;
+}
+
+export interface OnboardingDownloadItem {
+  id: string;
+  name: string;
+  description: string;
+  size_mb: number;
+  required: boolean;
+  installed: boolean;
+  model_id?: string;
+}
+
+export interface OnboardingRecommendedSettings {
+  whisper_model: string;
+  whisper_device: string;
+  whisper_compute_type: string;
+  whisper_batch_size: number;
+  video_encoder: string;
+  encoder_preset?: string;
+  default_resolution: string;
+  vision_scan_fps: number;
+  hardware_acceleration: string;
+  ai_mode: 'gemini' | 'offline';
+}
+
+export interface SystemOnboardingReport {
+  first_run_completed: boolean;
+  specs: {
+    os: { name: string; release: string; arch: string };
+    cpu: { model: string; physical_cores: number; logical_threads: number };
+    ram: { total_gb: number; available_gb: number };
+    gpu: {
+      name: string;
+      has_cuda: boolean;
+      has_nvidia?: boolean;
+      cuda_device_count?: number;
+      vram_mb: number;
+      vram_gb: number;
+      is_apple_silicon?: boolean;
+    };
+    encoders: { available: string[]; preferred: string };
+    storage: { path: string; total_gb: number; free_gb: number };
+    tools: { ffmpeg: boolean; ffprobe: boolean; yt_dlp: boolean };
+    packages: { faster_whisper: boolean; mediapipe: boolean; cv2: boolean; scipy: boolean };
+    cached_whisper_models: string[];
+    os_name?: string;
+    arch?: string;
+    cpu_model?: string;
+    cpu_cores_physical?: number;
+    cpu_cores_logical?: number;
+    ram_total_gb?: number;
+    ram_available_gb?: number;
+    gpu_name?: string;
+    gpu_vram_gb?: number;
+    preferred_encoder?: string;
+    disk_free_gb?: number;
+  };
+  tier: 'ultra_gpu' | 'mid_gpu' | 'standard_cpu' | 'lightweight_cpu' | string;
+  tier_label: string;
+  downloads_needed: OnboardingDownloadItem[];
+  recommended_settings: OnboardingRecommendedSettings;
+  summary_reason: string;
 }
 
 export interface JobsListResponse {

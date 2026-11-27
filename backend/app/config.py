@@ -15,9 +15,11 @@ _env_data_dir = (
 )
 DEFAULT_STORAGE_DIR = str(Path(_env_data_dir)) if _env_data_dir else str(BASE_DIR / "storage")
 
-# Automatically ensure workspace/env bin (FFmpeg) is prioritized on PATH
-if WORKSPACE_BIN.exists():
-    os.environ["PATH"] = f"{WORKSPACE_BIN};{os.environ.get('PATH', '')}"
+# Automatically ensure backend/bin and workspace/env bin (FFmpeg) are prioritized on PATH
+BACKEND_BIN = BASE_DIR / "bin"
+for _bin_dir in (BACKEND_BIN, WORKSPACE_BIN):
+    if _bin_dir.exists() and str(_bin_dir) not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{_bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -38,6 +40,10 @@ class Settings(BaseSettings):
     WHISPER_MODEL: str = "base"
     WHISPER_DEVICE: str = "auto"
     WHISPER_COMPUTE_TYPE: str = "auto"
+    WHISPER_BATCH_SIZE: int = 4
+    VIDEO_ENCODER: str = "auto"
+    DEFAULT_RESOLUTION: str = "1080p"
+    VISION_SCAN_FPS: float = 1.2
 
     BACKEND_HOST: str = "0.0.0.0"
     BACKEND_PORT: int = 8000

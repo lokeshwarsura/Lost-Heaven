@@ -113,6 +113,12 @@ def _is_cuda_runtime_available() -> bool:
     return False
 
 
+def reset_whisper_model_cache() -> None:
+    """Reset loaded faster-whisper singleton when user changes model/device settings."""
+    global _whisper_model_instance
+    _whisper_model_instance = None
+
+
 def resolve_whisper_device_and_compute() -> tuple[str, str, str]:
     """
     Dynamically select Whisper device, compute type, and model size based on CTranslate2 + hardware detection:
@@ -126,8 +132,13 @@ def resolve_whisper_device_and_compute() -> tuple[str, str, str]:
     vram_mb = int(hw.get("vram_mb", 0) or 0)
     has_cuda = bool(hw.get("has_cuda", False))
 
-    if not has_cuda or settings.WHISPER_DEVICE == "cpu":
-        return "cpu", "int8", settings.WHISPER_MODEL or "base"
+    explicit_dev = str(getattr(settings, "WHISPER_DEVICE", "auto") or "auto").strip().lower()
+    explicit_comp = str(getattr(settings, "WHISPER_COMPUTE_TYPE", "auto") or "auto").strip().lower()
+    explicit_model = (settings.WHISPER_MODEL or "").strip()
+
+    if not has_cuda or explicit_dev == "cpu":
+        comp = explicit_comp if explicit_comp not in ("auto", "") and explicit_dev == "cpu" else "int8"
+        return "cpu", comp, explicit_model or "base"
 
     # Also verify CTranslate2 CUDA count when CUDA hardware is detected (CPU-only builds fall back cleanly in get_whisper_model)
     try:
@@ -137,11 +148,14 @@ def resolve_whisper_device_and_compute() -> tuple[str, str, str]:
     except Exception:
         pass
 
+    if explicit_dev == "cuda" and explicit_comp not in ("auto", "") and explicit_model:
+        return "cuda", explicit_comp, explicit_model
+
     if vram_mb >= 8000:
         return "cuda", "float16", "large-v3-turbo"
     if 0 < vram_mb < 8000:
-        return "cuda", "int8_float16", settings.WHISPER_MODEL or "base"
-    return "cuda", "float16", settings.WHISPER_MODEL or "base"
+        return "cuda", "int8_float16", explicit_model or "base"
+    return "cuda", "float16", explicit_model or "base"
 
 
 def get_whisper_runtime_info() -> Dict[str, Any]:
@@ -150,7 +164,10 @@ def get_whisper_runtime_info() -> Dict[str, Any]:
     active_dev = _whisper_runtime_info.get("device") if _whisper_model_instance is not None else dev
     active_comp = _whisper_runtime_info.get("compute_type") if _whisper_model_instance is not None else compute
     active_model = _whisper_runtime_info.get("model_name") if _whisper_model_instance is not None else model_name
-    bs = 16 if active_dev == "cuda" else 4
+    configured_bs = int(getattr(settings, "WHISPER_BATCH_SIZE", 0) or 0)
+    bs = configured_bs if configured_bs > 0 else (16 if active_dev == "cuda" else 4)
+    if active_dev == "cuda" and configured_bs <= 4:
+        bs = 16
     badge = f"GPU: CUDA {active_comp}" if active_dev == "cuda" else f"CPU {active_comp}"
     return {
         "device": active_dev,

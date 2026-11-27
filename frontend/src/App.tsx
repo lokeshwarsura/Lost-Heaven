@@ -11,7 +11,7 @@ import { ViewSettings } from './components/ViewSettings';
 import { HomeView } from './components/HomeView';
 import { ProgressView } from './components/ProgressView';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { FirstTimeSetupWizard } from './components/FirstTimeSetupWizard';
+import { FirstRunSetupModal } from './components/FirstRunSetupModal';
 import { AnalysisInspectorModal } from './components/AnalysisInspectorModal';
 import { AIEngineModal } from './components/AIEngineModal';
 import {
@@ -148,13 +148,14 @@ export const App: React.FC = () => {
 
   const loadInitialData = async () => {
     try {
-      const [sys, sysSet, styles, fonts, projsData, profsData] = await Promise.all([
+      const [sys, sysSet, styles, fonts, projsData, profsData, onboarding] = await Promise.all([
         api.getSystemInfo().catch(() => null),
         api.getSystemSettings().catch(() => null),
         api.getCaptionStyles().catch(() => []),
         api.getFonts().catch(() => ['Montserrat', 'Impact', 'Anton', 'Poppins', 'Playfair Display']),
         api.getProjectsList().catch(() => ({ projects: [] })),
-        api.getProfiles().catch(() => [])
+        api.getProfiles().catch(() => []),
+        api.getSystemOnboarding().catch(() => null)
       ]);
 
       if (sys) setSystemInfo(sys);
@@ -167,10 +168,9 @@ export const App: React.FC = () => {
       if (projs.length > 0) {
         setProjects(projs);
         selectProject(projs[0].id);
-      } else if (
-        !localStorage.getItem('lost_heaven_onboarded') &&
-        !localStorage.getItem('clipship_onboarded')
-      ) {
+      }
+
+      if (onboarding && onboarding.first_run_completed === false) {
         setIsWizardOpen(true);
       }
     } catch (err) {
@@ -1144,11 +1144,15 @@ export const App: React.FC = () => {
         )}
       </div>
 
-      {/* First-Time Setup Wizard */}
-      <FirstTimeSetupWizard
+      {/* First-Run Hardware Spec Detector & Setup Wizard */}
+      <FirstRunSetupModal
         isOpen={isWizardOpen}
         onClose={() => setIsWizardOpen(false)}
         systemInfo={systemInfo}
+        onCompleted={(newSettings) => {
+          setStudioSettings(newSettings);
+          api.getSystemInfo().then(setSystemInfo).catch(() => {});
+        }}
       />
 
       {/* Multimodal AI Video & Audio Analysis + Best-Frame Workstation */}

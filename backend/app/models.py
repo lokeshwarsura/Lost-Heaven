@@ -1113,6 +1113,25 @@ class RetryProjectRequest(BaseModel):
     force_offline: Optional[bool] = False
 
 
+class InstallPrerequisitesRequest(BaseModel):
+    install_ffmpeg: bool = False
+    whisper_model: Optional[str] = None
+
+
+class CompleteOnboardingRequest(BaseModel):
+    whisper_model: str = "base"
+    whisper_device: str = "auto"
+    whisper_compute_type: str = "auto"
+    whisper_batch_size: Optional[int] = 4
+    video_encoder: Optional[str] = "libx264"
+    default_resolution: Optional[str] = "1080p"
+    vision_scan_fps: Optional[float] = 1.2
+    ai_mode: Optional[str] = "offline"
+    gemini_api_key: Optional[str] = None
+    hardware_acceleration: Optional[str] = "auto"
+    active_theme: Optional[str] = None
+
+
 class ImportAnalyticsCsvRequest(BaseModel):
     csv_text: str
 

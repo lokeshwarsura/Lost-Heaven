@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { X, Sparkles, Check, Key, Cpu, HardDrive } from 'lucide-react';
+import { X, Sparkles, Check, Key, Cpu, HardDrive, RefreshCw } from 'lucide-react';
 import { YoutubeIcon } from './Icons';
 import { StudioSettings } from '../types';
 import { api } from '../api/client';
@@ -7,9 +7,10 @@ import { api } from '../api/client';
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
+  onOpenSetupWizard?: () => void;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
+export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onOpenSetupWizard }) => {
   const [settings, setSettings] = useState<StudioSettings | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('gemini-3.8-flash');
@@ -146,6 +147,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose })
                 FFmpeg Active
               </span>
             </div>
+            {onOpenSetupWizard && (
+              <div className="pt-2 border-t border-[var(--border-subtle)]">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenSetupWizard();
+                  }}
+                  className="w-full py-2 px-3 rounded-lg bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--text-primary)] flex items-center justify-center gap-1.5 transition-colors"
+                >
+                  <RefreshCw className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  <span>Re-Scan PC Specs &amp; Setup Wizard</span>
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Submit */}
