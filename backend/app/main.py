@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import shutil
 import asyncio
 import logging
 import threading
@@ -28,6 +29,7 @@ from app.models import (
     SettingsUpdateRequest, PreviewFrameRequest, PreviewFrameResponse,
     CreateBrandPresetRequest, CreateCaptionStyleRequest,
     ProvideKeyRequest, RetryProjectRequest, TestGeminiRequest,
+    BulkDeleteProjectsRequest, ProjectCleanupRequest,
     InstallPrerequisitesRequest, CompleteOnboardingRequest
 )
 from app.services.proxy import probe_video, create_gemini_proxy, get_ffmpeg_cmd
@@ -59,7 +61,7 @@ from app.services.callout_engine import extract_callout_cards
 from app.services.translator import translate_clip_transcript
 from app.services.dubbing_engine import dub_clip_audio
 from app.services.trailer_compiler import compile_project_trailer
-from app.services.thumbnail_studio import generate_depth_thumbnail
+from app.services.thumbnail_studio import generate_depth_thumbnail, extract_source_video_thumbnail
 from app.services.clip_merger import build_merged_clip_model
 from app.services.profile_manager import list_profiles, create_profile, delete_profile
 from app.services.batch_queue import list_batch_queue, enqueue_batch_project, scan_watch_folder
@@ -1209,62 +1211,237 @@ def process_video_pipeline(project_id: int):
             session.commit()
 
 # -------------------------------------------------------------
-# Projects API (My Clips Manager)
+# Projects API (Studio Project Vault Manager)
 # -------------------------------------------------------------
+
+def _storage_root() -> Path:
+    return Path(settings.STORAGE_DIR)
+
+
+def _norm_real_path(p: Optional[str]) -> Optional[str]:
+    if not p:
+        return None
+    try:
+        return os.path.normcase(os.path.realpath(p))
+    except Exception:
+        return os.path.normcase(os.path.abspath(p))
+
+
+def _is_test_or_empty_project(
+    project: Project,
+    clips_count: int,
+    source_bytes: int,
+) -> bool:
+    status_lower = str(getattr(project, "status", "") or "").lower()
+    if status_lower in ("processing", "analyzing", "proxy_ready", "queued"):
+        return False
+    fname = str(getattr(project, "source_filename", "") or "").strip()
+    if not fname and getattr(project, "source_path", None):
+        fname = Path(project.source_path).name
+    source_missing = source_bytes <= 0
+    if clips_count == 0 and source_missing:
+        return True
+    if clips_count == 0 and fname in ("source.mp4", "dummy.mp4", "test.mp4") and (
+        source_bytes < 4096 or float(getattr(project, "duration", 0.0) or 0.0) <= 0.0
+    ):
+        return True
+    if status_lower in ("analyzed", "finished", "ready") and clips_count == 0 and source_missing:
+        return True
+    return False
+
+
+def _delete_single_project_and_files(project_id: int, session: Session) -> int:
+    """Delete a project's DB rows and all source, proxy, render, thumbnail, and cache files on disk."""
+    project = session.get(Project, project_id)
+    if not project:
+        return 0
+
+    root = _storage_root()
+    reclaimed_bytes = 0
+    seen_real: set[str] = set()
+
+    def _unlink_file(path_str: Optional[str]) -> None:
+        nonlocal reclaimed_bytes
+        if not path_str:
+            return
+        rk = _norm_real_path(path_str)
+        if not rk or rk in seen_real:
+            return
+        seen_real.add(rk)
+        if os.path.isfile(path_str):
+            try:
+                reclaimed_bytes += os.path.getsize(path_str)
+                os.remove(path_str)
+            except Exception:
+                pass
+
+    # Protect source file only if another remaining project shares the exact same path
+    other_projects_same_source = False
+    if project.source_path:
+        src_real = _norm_real_path(project.source_path)
+        for other in session.exec(select(Project).where(Project.id != project_id)).all():
+            if other.source_path and _norm_real_path(other.source_path) == src_real:
+                other_projects_same_source = True
+                break
+    if not other_projects_same_source:
+        _unlink_file(project.source_path)
+
+    _unlink_file(project.proxy_path)
+
+    clips = session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
+    for c in clips:
+        _unlink_file(c.rendered_video_path)
+        _unlink_file(getattr(c, "rendered_path", None))
+        _unlink_file(getattr(c, "dubbed_audio_path", None))
+        session.delete(c)
+
+    for folder in (
+        root / "projects" / str(project_id),
+        root / "assets" / "best_frames" / str(project_id),
+    ):
+        if folder.exists():
+            for walk_root, _, files in os.walk(folder):
+                for fname in files:
+                    _unlink_file(os.path.join(walk_root, fname))
+            shutil.rmtree(folder, ignore_errors=True)
+
+    thumbs_dir = root / "thumbnails"
+    if thumbs_dir.exists():
+        for tf in thumbs_dir.glob(f"thumb_{project_id}_*"):
+            if tf.is_file():
+                _unlink_file(str(tf))
+
+    previews_dir = root / "previews"
+    if previews_dir.exists():
+        for pf in previews_dir.glob(f"*_{project_id}_*"):
+            if pf.is_file():
+                _unlink_file(str(pf))
+
+    # Drop cached in-memory job entry if present
+    with job_manager._lock:
+        job_manager._jobs.pop(project_id, None)
+        job_manager._cancel_flags.pop(project_id, None)
+
+    session.delete(project)
+    return reclaimed_bytes
+
 
 @app.get("/api/projects")
 def list_projects(session: Session = Depends(get_session)):
-    """List all projects with exact calculated disk usage and total summary."""
+    """List all projects with exact disk breakdown, cached thumbnails, and vault telemetry."""
+    root = _storage_root()
+    proj_base = root / "projects"
+    assets_base = root / "assets" / "best_frames"
+    thumbs_base = root / "thumbnails"
+    previews_base = root / "previews"
+    temp_base = root / "temp"
+    proxies_base = root / "proxies"
+
     projects = session.exec(select(Project).order_by(Project.id.desc())).all()
     project_list = []
-    total_disk_bytes = 0
+    attributed_paths: set[str] = set()
+    total_source_bytes = 0
+    total_clips_bytes = 0
+    total_cache_bytes = 0
+    total_clips_count = 0
+    test_empty_count = 0
+    test_empty_bytes = 0
+    failed_cancelled_count = 0
+    failed_cancelled_bytes = 0
 
     for p in projects:
         clips = session.exec(select(ViralClip).where(ViralClip.project_id == p.id)).all()
-        p_bytes = 0
-        if p.source_path and os.path.exists(p.source_path):
-            p_bytes += os.path.getsize(p.source_path)
-        if p.proxy_path and os.path.exists(p.proxy_path):
-            p_bytes += os.path.getsize(p.proxy_path)
+        clips_count = len(clips)
+        total_clips_count += clips_count
+
+        proj_seen: set[str] = set()
+        source_bytes = 0
+        clips_bytes = 0
+        cache_bytes = 0
+
+        def _take_file(path_str: Optional[str], bucket: str) -> int:
+            nonlocal source_bytes, clips_bytes, cache_bytes
+            if not path_str or not os.path.isfile(path_str):
+                return 0
+            rk = _norm_real_path(path_str)
+            if not rk or rk in proj_seen:
+                return 0
+            proj_seen.add(rk)
+            attributed_paths.add(rk)
+            try:
+                sz = os.path.getsize(path_str)
+            except OSError:
+                return 0
+            if bucket == "source":
+                source_bytes += sz
+            elif bucket == "clips":
+                clips_bytes += sz
+            else:
+                cache_bytes += sz
+            return sz
+
+        _take_file(p.source_path, "source")
+        _take_file(p.proxy_path, "cache")
         for c in clips:
-            if c.rendered_video_path and os.path.exists(c.rendered_video_path):
-                p_bytes += os.path.getsize(c.rendered_video_path)
+            _take_file(c.rendered_video_path, "clips")
+            _take_file(getattr(c, "rendered_path", None), "clips")
+            _take_file(getattr(c, "dubbed_audio_path", None), "cache")
 
-        total_disk_bytes += p_bytes
+        p_dir = proj_base / str(p.id)
+        if p_dir.exists():
+            for walk_root, _, files in os.walk(p_dir):
+                for fname in files:
+                    fpath = os.path.join(walk_root, fname)
+                    bucket = "clips" if fname.lower().endswith(".mp4") and fname.lower() != "proxy_480p.mp4" else "cache"
+                    _take_file(fpath, bucket)
 
-        p_dict = p.model_dump()
-        p_dict["disk_size_bytes"] = p_bytes
-        p_dict["disk_size_formatted"] = format_bytes(p_bytes)
-        p_dict["clips_count"] = len(clips)
+        bf_dir = assets_base / str(p.id)
+        if bf_dir.exists():
+            for jpg in bf_dir.glob("*"):
+                if jpg.is_file():
+                    _take_file(str(jpg), "cache")
 
-        # Best available thumbnail for Quick-Resume strip
-        thumb_url = None
-        for c in clips:
-            bfs = c.get_best_frames()
-            if bfs and isinstance(bfs, list) and bfs[0].get("url"):
-                raw_u = str(bfs[0]["url"])
-                thumb_url = f"/media{raw_u}" if raw_u.startswith("/assets/") else raw_u
-                break
+        if thumbs_base.exists():
+            for tf in thumbs_base.glob(f"thumb_{p.id}_*"):
+                if tf.is_file():
+                    _take_file(str(tf), "cache")
+
+        p_bytes = source_bytes + clips_bytes + cache_bytes
+        total_source_bytes += source_bytes
+        total_clips_bytes += clips_bytes
+        total_cache_bytes += cache_bytes
+
+        pjson_data: Dict[str, Any] = {}
+        pjson_path = p_dir / "project.json"
+        if pjson_path.exists():
+            try:
+                loaded = json.loads(pjson_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    pjson_data = loaded
+            except Exception:
+                pass
+
+        # Source video thumbnail URL (cache-backed /api/projects/{id}/thumbnail)
+        source_missing = source_bytes <= 0
+        thumb_url: Optional[str] = f"/api/projects/{p.id}/thumbnail" if not source_missing else None
         if not thumb_url:
-            bf_dir = storage_assets / "best_frames" / str(p.id)
-            if bf_dir.exists():
+            for c in clips:
+                bfs = c.get_best_frames()
+                if bfs and isinstance(bfs, list) and bfs[0].get("url"):
+                    raw_u = str(bfs[0]["url"])
+                    thumb_url = f"/media{raw_u}" if raw_u.startswith("/assets/") else raw_u
+                    break
+            if not thumb_url and bf_dir.exists():
                 for jpg in sorted(bf_dir.glob("*.jpg")):
                     thumb_url = f"/media/assets/best_frames/{p.id}/{jpg.name}"
                     break
-        p_dict["thumbnail_url"] = thumb_url
 
-        # Explicit AI Mode badge for Quick-Resume cards
+        # Explicit AI Mode badge
         proj_ai_mode = getattr(p, "ai_mode", None)
         if proj_ai_mode not in ("gemini", "offline"):
-            pjson_path = storage_projects / str(p.id) / "project.json"
-            if pjson_path.exists():
-                try:
-                    pdata = json.loads(pjson_path.read_text(encoding="utf-8"))
-                    cand = pdata.get("ai_mode")
-                    if cand in ("gemini", "offline"):
-                        proj_ai_mode = cand
-                except Exception:
-                    pass
+            cand = pjson_data.get("ai_mode")
+            if cand in ("gemini", "offline"):
+                proj_ai_mode = cand
         if proj_ai_mode not in ("gemini", "offline"):
             first_src = ""
             for c in clips:
@@ -1278,17 +1455,259 @@ def list_projects(session: Session = Depends(get_session)):
             elif first_src:
                 proj_ai_mode = "gemini"
             else:
-                proj_ai_mode = "gemini" if RUNTIME_SETTINGS.get("gemini_configured") and RUNTIME_SETTINGS.get("ai_provider", "gemini") != "offline" else "offline"
+                proj_ai_mode = (
+                    "gemini"
+                    if RUNTIME_SETTINGS.get("gemini_configured") and RUNTIME_SETTINGS.get("ai_provider", "gemini") != "offline"
+                    else "offline"
+                )
+
+        err_msg = p.error_message or (pjson_data.get("error_detail") if isinstance(pjson_data, dict) else None)
+        if _is_test_or_empty_project(p, clips_count, source_bytes):
+            test_empty_count += 1
+            test_empty_bytes += p_bytes
+
+        if str(p.status or "").lower() in ("error", "failed", "cancelled"):
+            failed_cancelled_count += 1
+            failed_cancelled_bytes += p_bytes
+
+        p_dict = p.model_dump()
+        p_dict["disk_bytes"] = p_bytes
+        p_dict["disk_size_bytes"] = p_bytes
+        p_dict["disk_size_formatted"] = format_bytes(p_bytes)
+        p_dict["source_bytes"] = source_bytes
+        p_dict["clips_bytes"] = clips_bytes
+        p_dict["cache_bytes"] = cache_bytes
+        p_dict["source_missing"] = source_missing
+        p_dict["clips_count"] = clips_count
+        p_dict["thumbnail_url"] = thumb_url
         p_dict["ai_mode"] = proj_ai_mode
+        p_dict["error_message"] = err_msg
         p_dict["default_framing"] = getattr(p, "default_framing", "smart_auto") or "smart_auto"
         project_list.append(p_dict)
 
+    # Include unattributed temporary preview/temp/proxy cache on SSD
+    for cache_dir in (previews_base, temp_base, proxies_base, thumbs_base):
+        if cache_dir.exists():
+            for walk_root, _, files in os.walk(cache_dir):
+                for fname in files:
+                    fpath = os.path.join(walk_root, fname)
+                    rk = _norm_real_path(fpath)
+                    if rk and rk not in attributed_paths and os.path.isfile(fpath):
+                        try:
+                            total_cache_bytes += os.path.getsize(fpath)
+                        except OSError:
+                            pass
+
+    total_disk_bytes = total_source_bytes + total_clips_bytes + total_cache_bytes
     return {
         "projects": project_list,
         "total_projects": len(project_list),
+        "total_clips": total_clips_count,
         "total_disk_bytes": total_disk_bytes,
-        "total_disk_formatted": format_bytes(total_disk_bytes)
+        "total_disk_formatted": format_bytes(total_disk_bytes),
+        "storage_breakdown": {
+            "source_bytes": total_source_bytes,
+            "source_formatted": format_bytes(total_source_bytes),
+            "clips_bytes": total_clips_bytes,
+            "clips_formatted": format_bytes(total_clips_bytes),
+            "cache_bytes": total_cache_bytes,
+            "cache_formatted": format_bytes(total_cache_bytes),
+            "reclaimable_test_count": test_empty_count,
+            "reclaimable_test_bytes": test_empty_bytes,
+            "reclaimable_test_formatted": format_bytes(test_empty_bytes),
+            "reclaimable_failed_count": failed_cancelled_count,
+            "reclaimable_failed_bytes": failed_cancelled_bytes,
+            "reclaimable_failed_formatted": format_bytes(failed_cancelled_bytes),
+        },
     }
+
+
+@app.post("/api/projects/bulk-delete")
+def bulk_delete_projects_endpoint(
+    req: BulkDeleteProjectsRequest,
+    session: Session = Depends(get_session),
+):
+    """Delete multiple projects and remove their source, clip, and folder files on disk."""
+    unique_ids: List[int] = []
+    seen_ids: set[int] = set()
+    for pid in req.project_ids:
+        try:
+            ipid = int(pid)
+        except Exception:
+            continue
+        if ipid not in seen_ids:
+            seen_ids.add(ipid)
+            unique_ids.append(ipid)
+
+    deleted_ids: List[int] = []
+    reclaimed_bytes = 0
+    for pid in unique_ids:
+        proj = session.get(Project, pid)
+        if not proj:
+            continue
+        reclaimed_bytes += _delete_single_project_and_files(pid, session)
+        deleted_ids.append(pid)
+
+    if deleted_ids:
+        session.commit()
+
+    return {
+        "status": "ok",
+        "deleted_ids": deleted_ids,
+        "deleted_count": len(deleted_ids),
+        "reclaimed_bytes": reclaimed_bytes,
+        "reclaimed_formatted": format_bytes(reclaimed_bytes),
+    }
+
+
+@app.post("/api/projects/cleanup")
+def cleanup_projects_endpoint(
+    req: ProjectCleanupRequest,
+    session: Session = Depends(get_session),
+):
+    """
+    One-click Studio Project Vault cleanup:
+      - test_and_empty: Remove synthetic 0 B / source.mp4 test entries & 0-clip orphan records.
+      - failed_and_cancelled: Remove ERROR and CANCELLED projects and free disk space.
+      - render_cache: Purge temp preview frames and intermediate scratch while preserving sources & rendered clips.
+    """
+    mode = str(req.mode or "").strip().lower()
+    if mode not in ("test_and_empty", "failed_and_cancelled", "render_cache"):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported cleanup mode. Use 'test_and_empty', 'failed_and_cancelled', or 'render_cache'.",
+        )
+
+    root = _storage_root()
+    deleted_ids: List[int] = []
+    reclaimed_bytes = 0
+    removed_count = 0
+
+    if mode == "test_and_empty":
+        for p in session.exec(select(Project)).all():
+            clips = session.exec(select(ViralClip).where(ViralClip.project_id == p.id)).all()
+            src_bytes = 0
+            if p.source_path and os.path.isfile(p.source_path):
+                try:
+                    src_bytes = os.path.getsize(p.source_path)
+                except OSError:
+                    src_bytes = 0
+            if _is_test_or_empty_project(p, len(clips), src_bytes):
+                reclaimed_bytes += _delete_single_project_and_files(p.id, session)
+                deleted_ids.append(p.id)
+        if deleted_ids:
+            session.commit()
+        removed_count = len(deleted_ids)
+
+    elif mode == "failed_and_cancelled":
+        for p in session.exec(select(Project)).all():
+            if str(p.status or "").lower() in ("error", "failed", "cancelled"):
+                reclaimed_bytes += _delete_single_project_and_files(p.id, session)
+                deleted_ids.append(p.id)
+        if deleted_ids:
+            session.commit()
+        removed_count = len(deleted_ids)
+
+    elif mode == "render_cache":
+        # Protect all user source videos and rendered clip outputs
+        protected: set[str] = set()
+        for p in session.exec(select(Project)).all():
+            rk = _norm_real_path(p.source_path)
+            if rk:
+                protected.add(rk)
+            if p.proxy_path and os.path.isfile(p.proxy_path):
+                try:
+                    reclaimed_bytes += os.path.getsize(p.proxy_path)
+                    os.remove(p.proxy_path)
+                    removed_count += 1
+                except Exception:
+                    pass
+                p.proxy_path = None
+                session.add(p)
+        for c in session.exec(select(ViralClip)).all():
+            for attr in ("rendered_video_path", "rendered_path"):
+                rk = _norm_real_path(getattr(c, attr, None))
+                if rk:
+                    protected.add(rk)
+
+        def _purge_file(fpath: str) -> None:
+            nonlocal reclaimed_bytes, removed_count
+            rk = _norm_real_path(fpath)
+            if rk and rk in protected:
+                return
+            if os.path.isfile(fpath):
+                try:
+                    reclaimed_bytes += os.path.getsize(fpath)
+                    os.remove(fpath)
+                    removed_count += 1
+                except Exception:
+                    pass
+
+        for cdir in (root / "previews", root / "temp", root / "proxies"):
+            if cdir.exists():
+                for walk_root, _, files in os.walk(cdir):
+                    for fname in files:
+                        _purge_file(os.path.join(walk_root, fname))
+
+        proj_root = root / "projects"
+        if proj_root.exists():
+            for p_sub in proj_root.iterdir():
+                if not p_sub.is_dir():
+                    continue
+                for fname in ("proxy_480p.mp4", "audio_16k.wav", "source_thumb.jpg"):
+                    fpath = p_sub / fname
+                    if fpath.is_file():
+                        _purge_file(str(fpath))
+                for fpath in p_sub.iterdir():
+                    if fpath.is_file() and fpath.name.startswith(("temp_", "tmp_", "preview_", "pass_", "concat_")):
+                        _purge_file(str(fpath))
+
+        bf_root = root / "assets" / "best_frames"
+        if bf_root.exists():
+            for walk_root, _, files in os.walk(bf_root):
+                for fname in files:
+                    _purge_file(os.path.join(walk_root, fname))
+
+        session.commit()
+
+    return {
+        "status": "ok",
+        "mode": mode,
+        "deleted_ids": deleted_ids,
+        "removed_count": removed_count,
+        "reclaimed_bytes": reclaimed_bytes,
+        "reclaimed_formatted": format_bytes(reclaimed_bytes),
+    }
+
+
+@app.get("/api/projects/{project_id}/thumbnail")
+def get_project_thumbnail(project_id: int, session: Session = Depends(get_session)):
+    """Generate and serve a cached 480x270 JPEG frame at 15% into the project's source video."""
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if not project.source_path or not os.path.isfile(project.source_path):
+        return Response(status_code=204)
+    try:
+        if os.path.getsize(project.source_path) <= 0:
+            return Response(status_code=204)
+    except OSError:
+        return Response(status_code=204)
+
+    thumb_path = extract_source_video_thumbnail(
+        video_path=project.source_path,
+        project_id=project_id,
+        storage_dir=_storage_root(),
+    )
+    if not thumb_path or not thumb_path.exists():
+        return Response(status_code=204)
+
+    return FileResponse(
+        str(thumb_path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[str, Any]:
     """Unified ViralClip serializer exposing canonical status, rendered_path, preview_url, and video_url."""
@@ -1457,41 +1876,12 @@ def update_project(
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: int, session: Session = Depends(get_session)):
-    """Delete all project master, proxy, and rendered files from disk and remove records."""
+    """Delete all project master, proxy, rendered, thumbnail, and folder files from disk and remove records."""
     project = session.get(Project, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    reclaimed_bytes = 0
-
-    # Delete master video
-    if project.source_path and os.path.exists(project.source_path):
-        try:
-            reclaimed_bytes += os.path.getsize(project.source_path)
-            os.remove(project.source_path)
-        except Exception:
-            pass
-
-    # Delete proxy video
-    if project.proxy_path and os.path.exists(project.proxy_path):
-        try:
-            reclaimed_bytes += os.path.getsize(project.proxy_path)
-            os.remove(project.proxy_path)
-        except Exception:
-            pass
-
-    # Delete clips & rendered videos
-    clips = session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
-    for c in clips:
-        if c.rendered_video_path and os.path.exists(c.rendered_video_path):
-            try:
-                reclaimed_bytes += os.path.getsize(c.rendered_video_path)
-                os.remove(c.rendered_video_path)
-            except Exception:
-                pass
-        session.delete(c)
-
-    session.delete(project)
+    reclaimed_bytes = _delete_single_project_and_files(project_id, session)
     session.commit()
 
     return {
@@ -1564,17 +1954,21 @@ def cancel_project_job_endpoint(project_id: int):
     return {"status": "cancelled", "project_id": project_id}
 
 @app.post("/api/projects/{project_id}/retry")
+@app.post("/api/projects/{project_id}/start")
 def retry_project_job_endpoint(
     project_id: int,
     req: Optional[RetryProjectRequest] = None,
     background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    """Retry a failed or cancelled pipeline job, optionally forcing 100% offline mode."""
-    force_offline = req.force_offline if req else False
+    """Start or retry a created, failed, cancelled, or paused pipeline job."""
+    force_offline = bool(req.force_offline) if req else False
+    if req and req.ai_mode == "offline":
+        force_offline = True
     job = job_manager.retry_pipeline(project_id, background_tasks, force_offline=force_offline)
     return {
         "status": "processing",
         "project_id": project_id,
+        "job_id": project_id,
         "resumed_stage": job.get("current_stage"),
         "force_offline": force_offline
     }

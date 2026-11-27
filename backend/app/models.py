@@ -1116,6 +1116,15 @@ class ProvideKeyRequest(BaseModel):
 
 class RetryProjectRequest(BaseModel):
     force_offline: Optional[bool] = False
+    ai_mode: Optional[str] = None
+
+
+class BulkDeleteProjectsRequest(BaseModel):
+    project_ids: List[int] = Field(default_factory=list)
+
+
+class ProjectCleanupRequest(BaseModel):
+    mode: str
 
 
 class InstallPrerequisitesRequest(BaseModel):

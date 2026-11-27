@@ -843,7 +843,7 @@ export const App: React.FC = () => {
           ['created', 'proxy_ready', 'analyzing', 'processing'].includes(currentProject.status)
       )
     },
-    { id: 'projects', label: 'My clips', icon: Folder },
+    { id: 'projects', label: 'Project Vault', icon: Folder },
     { id: 'settings', label: 'Settings & Diagnostics', icon: SettingsIcon }
   ];
 
@@ -1130,7 +1130,7 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {/* VIEW 3: MY CLIPS (PROJECT & DISK MANAGER) */}
+        {/* VIEW 3: PROJECT VAULT (VISUAL PROJECTS & STORAGE MANAGER) */}
         {activeView === 'projects' && (
           <ViewProjects
             onSelectProjectForEditor={(projectId) => {
@@ -1140,6 +1140,13 @@ export const App: React.FC = () => {
             onOpenUploadModal={() => {
               setActiveView('home');
             }}
+            onViewProgress={(projectId) => {
+              setActiveProjectId(projectId);
+              setProgressTargetId(projectId);
+              setActiveView('progress');
+            }}
+            geminiConfigured={Boolean(studioSettings?.gemini_configured)}
+            isOfflineMultimodal={isOfflineMultimodal}
           />
         )}
 

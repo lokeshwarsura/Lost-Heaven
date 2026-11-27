@@ -756,7 +756,8 @@ class JobManager:
 
             # ALWAYS update project status in SQLite to "cancelled"
             try:
-                with Session(engine) as session:
+                active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                with Session(active_db_engine) as session:
                     p = session.get(Project, project_id)
                     if p:
                         p.status = "cancelled"
@@ -884,7 +885,8 @@ class JobManager:
             self._save_project_json(project_id, job)
 
             try:
-                with Session(engine) as session:
+                active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                with Session(active_db_engine) as session:
                     p = session.get(Project, project_id)
                     if p:
                         p.status = "awaiting_api_key"
@@ -916,6 +918,68 @@ class JobManager:
             self._cancel_flags[project_id] = cancel_event
 
             job = self._jobs.get(project_id) or self.get_progress(project_id)
+            if not job or job.get("status") == "not_found":
+                job = {
+                    "project_id": project_id,
+                    "title": f"Project #{project_id}",
+                    "status": "processing",
+                    "current_stage": "ingest",
+                    "stage_label": "Starting analysis pipeline",
+                    "percent": 5,
+                    "stages": [
+                        {
+                            "id": s["id"],
+                            "name": s["name"],
+                            "desc": s["desc"],
+                            "status": "pending",
+                            "percent": 0,
+                            "duration_sec": None,
+                        }
+                        for s in STAGES_CONFIG
+                    ],
+                    "logs": [],
+                    "live_metrics": {
+                        "words_transcribed": 0,
+                        "keyframes_scanned": 0,
+                        "keyframes_total": 0,
+                        "highlights_detected": 0,
+                    },
+                }
+
+            active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+            try:
+                with Session(active_db_engine) as session:
+                    p_row = session.get(Project, project_id)
+                    if p_row:
+                        if not job.get("title") or str(job.get("title", "")).startswith("Project #"):
+                            job["title"] = p_row.title
+                        if not job.get("source_path"):
+                            job["source_path"] = p_row.source_path
+                        if not job.get("source_filename"):
+                            job["source_filename"] = p_row.source_filename
+                        if not job.get("duration_preset"):
+                            job["duration_preset"] = p_row.duration_preset
+                        if not job.get("aspect_ratio"):
+                            job["aspect_ratio"] = p_row.default_aspect_ratio
+                        if not job.get("clip_count"):
+                            job["clip_count"] = p_row.clip_count
+                        if not job.get("caption_language"):
+                            job["caption_language"] = p_row.caption_language
+                        if not job.get("hardware_mode"):
+                            job["hardware_mode"] = p_row.hardware_mode
+                        if not job.get("default_framing"):
+                            job["default_framing"] = p_row.default_framing
+                        if not job.get("topic_focus") and p_row.topic_focus:
+                            job["topic_focus"] = p_row.topic_focus
+                        if not job.get("ai_mode") and getattr(p_row, "ai_mode", None):
+                            job["ai_mode"] = p_row.ai_mode
+                        p_row.status = "processing"
+                        p_row.error_message = None
+                        session.add(p_row)
+                        session.commit()
+            except Exception as e:
+                logger.error(f"Failed to sync DB project on retry: {e}")
+
             p_dir = self._get_project_dir(project_id)
             audio_path = p_dir / "audio_16k.wav"
             proxy_path = p_dir / "proxy_480p.mp4"
@@ -995,20 +1059,9 @@ class JobManager:
             }
             job.setdefault("logs", []).append(log_entry)
 
+            _normalize_job_payload(job)
             self._jobs[project_id] = job
             self._save_project_json(project_id, job)
-
-            # Update DB
-            try:
-                with Session(engine) as session:
-                    p = session.get(Project, project_id)
-                    if p:
-                        p.status = "processing"
-                        p.error_message = None
-                        session.add(p)
-                        session.commit()
-            except Exception as e:
-                logger.error(f"Failed to update db project status on retry: {e}")
 
         if self._broadcast_callback:
             try:

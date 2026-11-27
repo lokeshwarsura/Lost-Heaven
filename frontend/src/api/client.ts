@@ -224,7 +224,9 @@ export const api = {
         projects: data.projects || [],
         total_disk_bytes: data.total_disk_bytes || 0,
         total_disk_formatted: data.total_disk_formatted || '0 MB',
-        projects_count: data.total_projects || (data.projects?.length ?? 0)
+        projects_count: data.total_projects || (data.projects?.length ?? 0),
+        total_clips: data.total_clips ?? undefined,
+        storage_breakdown: data.storage_breakdown ?? undefined,
       };
     } finally {
       if (timeoutId !== null) window.clearTimeout(timeoutId);
@@ -254,6 +256,49 @@ export const api = {
     const res = await fetch(`${API_BASE}/projects/${id}`, {
       method: 'DELETE',
     });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || `Failed to delete project (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async bulkDeleteProjects(projectIds: number[]): Promise<{
+    status: string;
+    deleted_ids: number[];
+    deleted_count: number;
+    reclaimed_bytes: number;
+    reclaimed_formatted: string;
+  }> {
+    const res = await fetch(`${API_BASE}/projects/bulk-delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_ids: projectIds }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || `Bulk delete failed (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async cleanupProjects(mode: 'test_and_empty' | 'failed_and_cancelled' | 'render_cache'): Promise<{
+    status: string;
+    mode: string;
+    deleted_ids: number[];
+    removed_count: number;
+    reclaimed_bytes: number;
+    reclaimed_formatted: string;
+  }> {
+    const res = await fetch(`${API_BASE}/projects/cleanup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || `Cleanup failed (${res.status})`);
+    }
     return res.json();
   },
 

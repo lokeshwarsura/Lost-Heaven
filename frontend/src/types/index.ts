@@ -502,8 +502,8 @@ export interface Project {
   resolution_w: number;
   resolution_h: number;
   fps: number;
-  status: 'created' | 'proxy_ready' | 'analyzing' | 'analyzed' | 'processing' | 'finished' | 'error' | 'cancelled';
-  error_message?: string;
+  status: 'created' | 'proxy_ready' | 'analyzing' | 'analyzed' | 'processing' | 'finished' | 'ready' | 'awaiting_api_key' | 'queued' | 'error' | 'failed' | 'cancelled' | string;
+  error_message?: string | null;
   default_aspect_ratio: string;
   duration_preset: string;
   clip_count: number;
@@ -515,9 +515,29 @@ export interface Project {
   topic_focus?: string;
   thumbnail_url?: string | null;
   created_at: string;
+  disk_bytes?: number;
   disk_size_bytes?: number;
   disk_size_formatted?: string;
+  source_bytes?: number;
+  clips_bytes?: number;
+  cache_bytes?: number;
+  source_missing?: boolean;
   clips_count?: number;
+}
+
+export interface StorageBreakdown {
+  source_bytes: number;
+  source_formatted: string;
+  clips_bytes: number;
+  clips_formatted: string;
+  cache_bytes: number;
+  cache_formatted: string;
+  reclaimable_test_count: number;
+  reclaimable_test_bytes: number;
+  reclaimable_test_formatted: string;
+  reclaimable_failed_count: number;
+  reclaimable_failed_bytes: number;
+  reclaimable_failed_formatted: string;
 }
 
 export interface ProjectsListResponse {
@@ -525,6 +545,8 @@ export interface ProjectsListResponse {
   total_disk_bytes: number;
   total_disk_formatted: string;
   projects_count: number;
+  total_clips?: number;
+  storage_breakdown?: StorageBreakdown;
 }
 
 export interface ProjectLogItem {

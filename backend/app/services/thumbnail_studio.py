@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -324,5 +324,90 @@ def generate_depth_thumbnail(
             "timestamp": round(seek_ts, 2),
             "depth_layer": bool(depth_layer),
         }
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def extract_source_video_thumbnail(
+    video_path: Optional[str],
+    project_id: int,
+    storage_dir: Optional[Union[str, Path]] = None,
+    *,
+    force: bool = False,
+    width: int = 480,
+    height: int = 270,
+) -> Optional[Path]:
+    """
+    Extract and cache a 480x270 JPEG frame at ~15% into a project's source video.
+    Saves to `<storage>/projects/<project_id>/source_thumb.jpg` inside an ASCII temp workspace.
+    Returns `None` when the source file is missing or 0 bytes.
+    """
+    import os
+
+    base_storage = Path(storage_dir) if storage_dir else Path(settings.STORAGE_DIR)
+    proj_dir = base_storage / "projects" / str(project_id)
+    cache_path = proj_dir / "source_thumb.jpg"
+
+    if not force and cache_path.exists():
+        try:
+            if cache_path.stat().st_size > 200:
+                return cache_path
+        except OSError:
+            pass
+
+    if not video_path or not os.path.exists(video_path):
+        return None
+    try:
+        if os.path.getsize(video_path) <= 0:
+            return None
+    except OSError:
+        return None
+
+    try:
+        meta = probe_video(video_path)
+        src_dur = float(meta.get("duration") or 0.0)
+    except Exception:
+        src_dur = 0.0
+
+    seek_ts = round(max(0.0, min(max(0.0, src_dur - 0.1), src_dur * 0.15)), 3) if src_dur > 0.2 else 0.0
+    vf_expr = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"
+    ffmpeg_bin = get_ffmpeg_cmd()
+    resolved_src = str(Path(video_path).resolve())
+
+    work_dir = Path(tempfile.mkdtemp(prefix="lost_heaven_vthumb_"))
+    try:
+        tmp_jpg = work_dir / "source_thumb.jpg"
+        for attempt_ts in ([seek_ts, 0.0] if seek_ts > 0.0 else [0.0]):
+            if tmp_jpg.exists():
+                try:
+                    tmp_jpg.unlink()
+                except OSError:
+                    pass
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                "-ss",
+                f"{attempt_ts:.3f}",
+                "-i",
+                resolved_src,
+                "-vf",
+                vf_expr,
+                "-vframes",
+                "1",
+                "-q:v",
+                "3",
+                tmp_jpg.name,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, cwd=str(work_dir))
+            if proc.returncode == 0 and tmp_jpg.exists() and tmp_jpg.stat().st_size > 200:
+                proj_dir.mkdir(parents=True, exist_ok=True)
+                staged = proj_dir / f".tmp_source_thumb_{os.getpid()}.jpg"
+                shutil.copy2(tmp_jpg, staged)
+                os.replace(str(staged), str(cache_path))
+                return cache_path
+        return None
+    except Exception as exc:
+        logger.debug(f"Could not extract source thumbnail for project {project_id}: {exc}")
+        return None
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
