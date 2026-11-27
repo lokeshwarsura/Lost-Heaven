@@ -1,26 +1,193 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  UploadCloud, Sparkles, Film, Clock, Play, 
-  Trash2, ArrowRight, CheckCircle2, Layers, Globe, FileVideo,
-  AlertCircle, RefreshCw, Cpu, Zap
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  ArrowRight,
+  Check,
+  CheckCircle2,
+  Clock,
+  Cpu,
+  FileVideo,
+  Film,
+  FolderOpen,
+  KeyRound,
+  Layers,
+  Link2,
+  Loader2,
+  Plus,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+  Trash2,
+  Upload,
+  Video,
+  WifiOff,
 } from 'lucide-react';
-import { Project, AnalyticsFormulaReport, StudioSettings } from '../types';
 import { api } from '../api/client';
-import { AIEngineModal } from './AIEngineModal';
-
-const YouTubeIcon: React.FC<{ className?: string }> = ({ className = "w-4 h-4" }) => (
-  <svg className={className} viewBox="0 0 24 24" fill="currentColor">
-    <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
-  </svg>
-);
+import { Project, StudioSettings, YouTubeMetadataInfo } from '../types';
 
 interface HomeViewProps {
   onStartJob: (projectId: number) => void;
   onOpenProject: (projectId: number) => void;
   onViewProgress: (projectId: number) => void;
-  onViewLibrary?: () => void;
+  onViewLibrary: () => void;
   isOfflineMultimodal?: boolean;
   studioSettings?: Partial<StudioSettings> | null;
+}
+
+interface LocalVideoPreviewMeta {
+  file: File;
+  thumbnailDataUrl: string | null;
+  durationSec: number;
+  width: number;
+  height: number;
+  sizeBytes: number;
+}
+
+const DIRECTOR_CHIPS = [
+  'Storytime Arc',
+  'Hot Takes & Debate',
+  'Funny / High Energy',
+  'Key Takeaways',
+  'Gameplay Climax',
+];
+
+const ASPECT_OPTIONS: Array<{ value: string; label: string; sub: string }> = [
+  { value: '9:16', label: '9:16', sub: 'Shorts / Reels' },
+  { value: '16:9', label: '16:9', sub: 'Widescreen' },
+  { value: '1:1', label: '1:1', sub: 'Square' },
+  { value: '4:5', label: '4:5', sub: 'Social Feed' },
+];
+
+const LENGTH_OPTIONS = ['Auto', '15s', '30s', '45s', '60s'];
+
+const CLIP_COUNTS = [3, 5, 8, 10];
+
+const FRAMING_OPTIONS: Array<{ value: string; label: string; hint: string }> = [
+  { value: 'smart_auto', label: 'Smart Auto-Frame', hint: 'AI chooses best layout' },
+  { value: 'auto_track', label: 'Auto-Track Speaker', hint: 'Dynamic face follow' },
+  { value: 'gameplay_webcam_pip', label: 'Gameplay + Webcam PiP', hint: 'Streamer overlay' },
+  { value: 'fit_blur', label: 'Fit + Blurred Backdrop', hint: 'Full frame widescreen' },
+];
+
+const LANGUAGES = [
+  'As spoken',
+  'Hinglish',
+  'English',
+  'Hindi',
+  'Spanish',
+  'French',
+  'German',
+  'Arabic',
+  'Portuguese',
+  'Japanese',
+];
+
+function formatDurationClock(sec: number): string {
+  const clean = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(clean / 3600);
+  const m = Math.floor((clean % 3600) / 60);
+  const s = clean % 60;
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+function formatBytesCompact(bytes: number): string {
+  if (!bytes || bytes <= 0) return '—';
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
+function estimateProcessingWindow(durationSec: number, hardwareMode: string): string {
+  const dur = Math.max(15, durationSec || 60);
+  // Batched whisper + sequential ffmpeg scan typically takes ~0.12x to 0.35x realtime
+  const low = Math.max(8, Math.round(dur * (hardwareMode === 'gpu' ? 0.12 : 0.25)));
+  const high = Math.max(low + 10, Math.round(dur * (hardwareMode === 'gpu' ? 0.28 : 0.55)));
+  if (high < 90) return `~${low}-${high}s`;
+  return `~${Math.max(1, Math.round(low / 60))}-${Math.max(2, Math.round(high / 60))} min`;
+}
+
+function isValidYouTubeUrl(raw: string): boolean {
+  const s = raw.trim().toLowerCase();
+  if (!s) return false;
+  return (
+    (s.startsWith('http://') || s.startsWith('https://')) &&
+    (s.includes('youtube.com/') || s.includes('youtu.be/'))
+  );
+}
+
+async function extractLocalVideoPreview(file: File): Promise<LocalVideoPreviewMeta> {
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    return await new Promise<LocalVideoPreviewMeta>((resolve) => {
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      video.muted = true;
+      video.playsInline = true;
+
+      let settled = false;
+      const finish = (thumb: string | null, durationSec: number, width: number, height: number) => {
+        if (settled) return;
+        settled = true;
+        video.removeAttribute('src');
+        video.load();
+        resolve({
+          file,
+          thumbnailDataUrl: thumb,
+          durationSec: Number.isFinite(durationSec) ? durationSec : 0,
+          width: width || 1920,
+          height: height || 1080,
+          sizeBytes: file.size,
+        });
+      };
+
+      const timeoutId = window.setTimeout(() => {
+        finish(null, video.duration || 0, video.videoWidth || 1920, video.videoHeight || 1080);
+      }, 3500);
+
+      video.onloadedmetadata = () => {
+        const dur = Number.isFinite(video.duration) ? video.duration : 0;
+        const seekTarget = dur > 1.5 ? Math.min(dur * 0.15, 6.0) : 0.1;
+        try {
+          video.currentTime = seekTarget;
+        } catch {
+          window.clearTimeout(timeoutId);
+          finish(null, dur, video.videoWidth, video.videoHeight);
+        }
+      };
+
+      video.onseeked = () => {
+        window.clearTimeout(timeoutId);
+        let dataUrl: string | null = null;
+        try {
+          const vw = video.videoWidth || 640;
+          const vh = video.videoHeight || 360;
+          const targetW = 320;
+          const targetH = Math.max(90, Math.round((vh / vw) * targetW));
+          const canvas = document.createElement('canvas');
+          canvas.width = targetW;
+          canvas.height = targetH;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, targetW, targetH);
+            dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+          }
+        } catch {
+          dataUrl = null;
+        }
+        finish(dataUrl, video.duration || 0, video.videoWidth, video.videoHeight);
+      };
+
+      video.onerror = () => {
+        window.clearTimeout(timeoutId);
+        finish(null, 0, 1920, 1080);
+      };
+
+      video.src = objectUrl;
+    });
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }
 
 export const HomeView: React.FC<HomeViewProps> = ({
@@ -31,117 +198,265 @@ export const HomeView: React.FC<HomeViewProps> = ({
   isOfflineMultimodal = false,
   studioSettings = null,
 }) => {
-  // Ingestion Source State
-  const [activeTab, setActiveTab] = useState<'upload' | 'youtube'>('upload');
+  // Media source states
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [fileDuration, setFileDuration] = useState<number | null>(null);
-  const [fileResolution, setFileResolution] = useState<{ w: number; h: number } | null>(null);
-  const [youtubeUrl, setYoutubeUrl] = useState('');
+  const [localMeta, setLocalMeta] = useState<LocalVideoPreviewMeta | null>(null);
+  const [inspectingLocal, setInspectingLocal] = useState(false);
+
+  const [ytUrl, setYtUrl] = useState('');
+  const [ytInfo, setYtInfo] = useState<YouTubeMetadataInfo | null>(null);
+  const [fetchingYtInfo, setFetchingYtInfo] = useState(false);
+  const [ytError, setYtError] = useState<string | null>(null);
+
+  const [batchFiles, setBatchFiles] = useState<File[]>([]);
   const [isDragging, setIsDragging] = useState(false);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-
-  // Pre-Submission Setup Bar State
-  const [aspectRatio, setAspectRatio] = useState<string>('9:16');
-  const [durationPreset, setDurationPreset] = useState<string>('Auto');
-  const [clipCount, setClipCount] = useState<number>(5);
-  const [captionLanguage, setCaptionLanguage] = useState<string>('As spoken');
-  const [topicFocus, setTopicFocus] = useState<string>('');
-  const [hardwareMode, setHardwareMode] = useState<string>('gpu');
-
-  // Recent Projects
-  const [recentProjects, setRecentProjects] = useState<Project[]>([]);
-  const [isLoadingProjects, setIsLoadingProjects] = useState(true);
-  const [formulaReport, setFormulaReport] = useState<AnalyticsFormulaReport | null>(null);
-  const [localSettings, setLocalSettings] = useState<Partial<StudioSettings> | null>(studioSettings);
-  const [isEnginePromptOpen, setIsEnginePromptOpen] = useState(false);
-
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => {
-    setLocalSettings(studioSettings);
-  }, [studioSettings]);
+  // Pipeline Configuration states
+  const [aspectRatio, setAspectRatio] = useState('9:16');
+  const [durationPreset, setDurationPreset] = useState('Auto');
+  const [clipCount, setClipCount] = useState(5);
+  const [defaultFraming, setDefaultFraming] = useState('smart_auto');
+  const [captionLanguage, setCaptionLanguage] = useState('As spoken');
+  const [hardwareMode, setHardwareMode] = useState<'gpu' | 'cpu'>('gpu');
+  const [topicFocus, setTopicFocus] = useState('');
 
-  useEffect(() => {
-    loadRecentProjects();
-    api.getAnalyticsFormula().then(setFormulaReport).catch(() => null);
-    if (!studioSettings) {
-      api.getSystemSettings().then(setLocalSettings).catch(() => null);
+  // AI Engine Switcher state
+  const deriveInitialAiMode = (): 'gemini' | 'offline' => {
+    if (studioSettings?.ai_mode === 'gemini' || studioSettings?.ai_mode === 'offline') {
+      return studioSettings.ai_mode;
     }
-  }, []);
+    if (studioSettings?.effective_ai_mode === 'offline' || isOfflineMultimodal) {
+      return 'offline';
+    }
+    return studioSettings?.gemini_configured ? 'gemini' : 'offline';
+  };
+  const [aiModeChoice, setAiModeChoice] = useState<'gemini' | 'offline'>(deriveInitialAiMode);
+  const [geminiConfigured, setGeminiConfigured] = useState<boolean>(Boolean(studioSettings?.gemini_configured));
+  const [inlineKeyInput, setInlineKeyInput] = useState('');
+  const [inlineKeyStatus, setInlineKeyStatus] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [savingKey, setSavingKey] = useState(false);
+  const [switchingMode, setSwitchingMode] = useState(false);
+
+  // Submission & Projects state
+  const [recentProjects, setRecentProjects] = useState<Project[]>([]);
+  const [totalProjectsCount, setTotalProjectsCount] = useState(0);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [showEngineChoiceDialog, setShowEngineChoiceDialog] = useState(false);
+  const [dialogApiKey, setDialogApiKey] = useState('');
+  const [dialogKeyError, setDialogKeyError] = useState<string | null>(null);
+  const [dialogTestingKey, setDialogTestingKey] = useState(false);
+
+  // Sync studio settings props & initial projects fetch
+  useEffect(() => {
+    if (studioSettings) {
+      setGeminiConfigured(Boolean(studioSettings.gemini_configured));
+      if (studioSettings.ai_mode === 'gemini' || studioSettings.ai_mode === 'offline') {
+        setAiModeChoice(studioSettings.ai_mode);
+      } else if (studioSettings.effective_ai_mode === 'offline') {
+        setAiModeChoice('offline');
+      }
+      if (studioSettings.hardware_acceleration === 'cpu') {
+        setHardwareMode('cpu');
+      }
+    }
+  }, [studioSettings]);
 
   const loadRecentProjects = async () => {
     try {
-      setIsLoadingProjects(true);
       const res = await api.getProjectsList();
-      const projs = res?.projects || [];
-      // Take top 4 most recent
-      setRecentProjects(projs.slice(0, 4));
+      setRecentProjects((res.projects || []).slice(0, 4));
+      setTotalProjectsCount(res.projects_count ?? res.projects?.length ?? 0);
     } catch (err) {
       console.error('Failed to load recent projects:', err);
     } finally {
-      setIsLoadingProjects(false);
+      setLoadingProjects(false);
     }
   };
 
-  const handleFileDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      processSelectedFile(e.dataTransfer.files[0]);
+  useEffect(() => {
+    loadRecentProjects();
+    api
+      .getSettings()
+      .then((s) => {
+        setGeminiConfigured(Boolean(s.gemini_configured));
+        if (s.ai_mode === 'gemini' || s.ai_mode === 'offline') {
+          setAiModeChoice(s.ai_mode);
+        } else if (s.effective_ai_mode === 'offline') {
+          setAiModeChoice('offline');
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleSelectAiEngine = async (mode: 'gemini' | 'offline') => {
+    setAiModeChoice(mode);
+    setInlineKeyStatus(null);
+    setSwitchingMode(true);
+    try {
+      await api.updateSystemSettings({ ai_mode: mode });
+      window.dispatchEvent(new CustomEvent('lh-settings-updated'));
+    } catch (err) {
+      console.warn('Could not persist AI engine switch:', err);
+    } finally {
+      setSwitchingMode(false);
     }
   };
 
-  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      processSelectedFile(e.target.files[0]);
-    }
-  };
-
-  const processSelectedFile = (file: File) => {
-    setErrorMessage(null);
-    const validExtensions = ['.mp4', '.mov', '.mkv', '.webm'];
-    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
-    if (!validExtensions.includes(ext)) {
-      setErrorMessage(`Please upload a valid video file (${validExtensions.join(', ')})`);
+  const handleSaveInlineKey = async () => {
+    const trimmed = inlineKeyInput.trim();
+    if (!trimmed) {
+      setInlineKeyStatus({ type: 'err', text: 'Paste your Google Gemini API key (AIza...).' });
       return;
     }
-    setSelectedFile(file);
-
-    // Create temporary video element to probe duration & resolution
-    const tempUrl = URL.createObjectURL(file);
-    const v = document.createElement('video');
-    v.preload = 'metadata';
-    v.src = tempUrl;
-    v.onloadedmetadata = () => {
-      setFileDuration(v.duration);
-      setFileResolution({ w: v.videoWidth, h: v.videoHeight });
-      URL.revokeObjectURL(tempUrl);
-    };
-    v.onerror = () => {
-      URL.revokeObjectURL(tempUrl);
-    };
-  };
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-  };
-
-  const formatSeconds = (sec: number) => {
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    return `${m}:${s < 10 ? '0' : ''}${s}`;
-  };
-
-  const executeIngestionJob = async (chosenAiMode?: 'gemini' | 'offline') => {
+    setSavingKey(true);
+    setInlineKeyStatus(null);
     try {
-      setIsSubmitting(true);
-      let res: { project_id: number; title: string };
+      const testRes = await api.testGeminiModels(trimmed);
+      const anyOk = (testRes.models || []).some((m) => m.status === 'OK' || m.status === '503 High Demand');
+      const anyInvalid = (testRes.models || []).some((m) => m.status === 'Invalid Key');
+      if (anyInvalid && !anyOk) {
+        setInlineKeyStatus({ type: 'err', text: 'Key rejected by Gemini API. Check that Generative Language API is enabled.' });
+        return;
+      }
+      await api.updateSystemSettings({
+        gemini_api_key: trimmed,
+        ai_mode: 'gemini',
+        ai_provider: 'gemini',
+        gemini_enabled: true,
+        gemini_boost_enabled: true,
+      });
+      setGeminiConfigured(true);
+      setAiModeChoice('gemini');
+      setInlineKeyInput('');
+      setInlineKeyStatus({ type: 'ok', text: 'Key verified & saved!' });
+      window.dispatchEvent(new CustomEvent('lh-settings-updated'));
+    } catch (err: any) {
+      setInlineKeyStatus({ type: 'err', text: err?.message || 'Failed to validate Gemini API key' });
+    } finally {
+      setSavingKey(false);
+    }
+  };
 
-      if (activeTab === 'upload' && selectedFile) {
-        res = await api.uploadVideo(
+  const handleLocalFilePicked = async (files: FileList | File[]) => {
+    const arr = Array.from(files).filter((f) =>
+      /\.(mp4|mov|mkv|webm|avi)$/i.test(f.name) || f.type.startsWith('video/')
+    );
+    if (arr.length === 0) {
+      setSubmitError('Please select a supported video file (.mp4, .mov, .mkv, .webm).');
+      return;
+    }
+    setSubmitError(null);
+    setYtError(null);
+
+    if (arr.length === 1 && !selectedFile) {
+      const f = arr[0];
+      setSelectedFile(f);
+      setYtUrl('');
+      setYtInfo(null);
+      setInspectingLocal(true);
+      try {
+        const meta = await extractLocalVideoPreview(f);
+        setLocalMeta(meta);
+      } finally {
+        setInspectingLocal(false);
+      }
+    } else if (!selectedFile) {
+      const [first, ...rest] = arr;
+      setSelectedFile(first);
+      setBatchFiles((prev) => [...prev, ...rest]);
+      setYtUrl('');
+      setYtInfo(null);
+      setInspectingLocal(true);
+      try {
+        const meta = await extractLocalVideoPreview(first);
+        setLocalMeta(meta);
+      } finally {
+        setInspectingLocal(false);
+      }
+    } else {
+      setBatchFiles((prev) => [...prev, ...arr]);
+    }
+  };
+
+  const handleClearMedia = () => {
+    setSelectedFile(null);
+    setLocalMeta(null);
+    setYtUrl('');
+    setYtInfo(null);
+    setYtError(null);
+    setBatchFiles([]);
+    setSubmitError(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleQueueCurrentToBatch = () => {
+    if (!selectedFile) return;
+    setBatchFiles((prev) => {
+      if (prev.some((x) => x.name === selectedFile.name && x.size === selectedFile.size)) return prev;
+      return [...prev, selectedFile];
+    });
+    setSelectedFile(null);
+    setLocalMeta(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleFetchYouTubeInfo = async (explicitUrl?: string) => {
+    const target = (explicitUrl ?? ytUrl).trim();
+    if (!target) return;
+    setFetchingYtInfo(true);
+    setYtError(null);
+    setSubmitError(null);
+    try {
+      const info = await api.getYouTubeInfo(target);
+      setYtInfo(info);
+      setSelectedFile(null);
+      setLocalMeta(null);
+    } catch (err: any) {
+      setYtError(err?.message || 'Unable to fetch video metadata for that URL.');
+      setYtInfo(null);
+    } finally {
+      setFetchingYtInfo(false);
+    }
+  };
+
+  const hasValidMediaSource = Boolean(
+    selectedFile || ytInfo || isValidYouTubeUrl(ytUrl) || batchFiles.length > 0
+  );
+
+  const executeIngestion = async (chosenAiMode: 'gemini' | 'offline') => {
+    setIsSubmitting(true);
+    setSubmitError(null);
+    try {
+      // Multi-file batch queue mode
+      const allBatchFiles = selectedFile && batchFiles.length > 0 ? [selectedFile, ...batchFiles] : batchFiles;
+      if (allBatchFiles.length > 0 && !ytInfo && !isValidYouTubeUrl(ytUrl)) {
+        let firstPid = 0;
+        for (let i = 0; i < allBatchFiles.length; i++) {
+          const res = await api.uploadVideo(
+            allBatchFiles[i],
+            aspectRatio,
+            durationPreset,
+            clipCount,
+            topicFocus.trim() || undefined,
+            captionLanguage,
+            hardwareMode,
+            chosenAiMode,
+            defaultFraming,
+            allBatchFiles.length > 1
+          );
+          if (i === 0) firstPid = res.project_id;
+        }
+        if (firstPid) {
+          onStartJob(firstPid);
+          return;
+        }
+      }
+
+      if (selectedFile) {
+        const res = await api.uploadVideo(
           selectedFile,
           aspectRatio,
           durationPreset,
@@ -149,595 +464,932 @@ export const HomeView: React.FC<HomeViewProps> = ({
           topicFocus.trim() || undefined,
           captionLanguage,
           hardwareMode,
-          chosenAiMode
+          chosenAiMode,
+          defaultFraming,
+          false
         );
-      } else {
-        res = await api.importYouTube(
-          youtubeUrl.trim(),
+        onStartJob(res.project_id);
+        return;
+      }
+
+      const trimmedUrl = ytUrl.trim();
+      if (trimmedUrl) {
+        const res = await api.importYouTube(
+          trimmedUrl,
           aspectRatio,
           durationPreset,
           clipCount,
           topicFocus.trim() || undefined,
           captionLanguage,
           hardwareMode,
-          chosenAiMode
+          chosenAiMode,
+          defaultFraming,
+          false
         );
-      }
-
-      if (res && res.project_id) {
         onStartJob(res.project_id);
-      } else {
-        throw new Error('No project ID returned by server');
       }
     } catch (err: any) {
-      console.error('Submission failed:', err);
-      setErrorMessage(err.message || 'Failed to submit video for analysis');
+      setSubmitError(err?.message || 'Failed to launch extraction job.');
+    } finally {
       setIsSubmitting(false);
     }
   };
 
-  const handleStartAnalysis = async () => {
-    setErrorMessage(null);
-    if (activeTab === 'upload' && !selectedFile) {
-      setErrorMessage('Please select or drop a video file before starting analysis.');
+  const handlePrimaryAnalyzeClick = async () => {
+    if (!hasValidMediaSource || isSubmitting) return;
+    // If Gemini mode is chosen but no API key is saved yet, prompt cleanly instead of silently failing
+    if (aiModeChoice === 'gemini' && !geminiConfigured) {
+      setDialogApiKey('');
+      setDialogKeyError(null);
+      setShowEngineChoiceDialog(true);
       return;
     }
-    if (activeTab === 'youtube' && !youtubeUrl.trim()) {
-      setErrorMessage('Please enter a YouTube video URL.');
-      return;
-    }
-
-    const activeCfg = localSettings || (await api.getSystemSettings().catch(() => null));
-    if (activeCfg) setLocalSettings(activeCfg);
-
-    const hasKey = Boolean(activeCfg?.gemini_configured);
-    const explicitOffline =
-      activeCfg?.ai_mode === 'offline' ||
-      activeCfg?.ai_provider === 'offline' ||
-      activeCfg?.gemini_enabled === false ||
-      activeCfg?.gemini_boost_enabled === false ||
-      isOfflineMultimodal;
-
-    // Prompt explicitly before launching if no Gemini key is saved AND offline wasn't explicitly chosen
-    if (!hasKey && !explicitOffline) {
-      setIsEnginePromptOpen(true);
-      return;
-    }
-
-    await executeIngestionJob(explicitOffline ? 'offline' : 'gemini');
+    await api.updateSystemSettings({ ai_mode: aiModeChoice }).catch(() => {});
+    await executeIngestion(aiModeChoice);
   };
 
-  const handleDeleteProject = async (e: React.MouseEvent, id: number) => {
-    e.stopPropagation();
-    if (!confirm('Are you sure you want to delete this project and reclaim disk space?')) return;
+  const handleDialogStartGemini = async () => {
+    const clean = dialogApiKey.trim();
+    if (!clean) {
+      setDialogKeyError('Paste your Google Gemini API key (starts with AIza...).');
+      return;
+    }
+    setDialogTestingKey(true);
+    setDialogKeyError(null);
     try {
-      await api.deleteProject(id);
-      loadRecentProjects();
-    } catch (err) {
-      console.error('Delete failed:', err);
+      const testRes = await api.testGeminiModels(clean);
+      const anyOk = (testRes.models || []).some((m) => m.status === 'OK' || m.status === '503 High Demand');
+      const anyInvalid = (testRes.models || []).some((m) => m.status === 'Invalid Key');
+      if (anyInvalid && !anyOk) {
+        setDialogKeyError('Key rejected by Gemini API. Verify your key in Google AI Studio.');
+        return;
+      }
+      await api.updateSystemSettings({
+        gemini_api_key: clean,
+        ai_mode: 'gemini',
+        ai_provider: 'gemini',
+        gemini_enabled: true,
+        gemini_boost_enabled: true,
+      });
+      setGeminiConfigured(true);
+      setAiModeChoice('gemini');
+      setShowEngineChoiceDialog(false);
+      window.dispatchEvent(new CustomEvent('lh-settings-updated'));
+      await executeIngestion('gemini');
+    } catch (err: any) {
+      setDialogKeyError(err?.message || 'Could not validate Gemini key.');
+    } finally {
+      setDialogTestingKey(false);
     }
   };
+
+  const handleDialogStartOffline = async () => {
+    setShowEngineChoiceDialog(false);
+    setAiModeChoice('offline');
+    await api.updateSystemSettings({ ai_mode: 'offline' }).catch(() => {});
+    window.dispatchEvent(new CustomEvent('lh-settings-updated'));
+    await executeIngestion('offline');
+  };
+
+  const activeDurationSec = localMeta?.durationSec || ytInfo?.duration || 0;
+  const activeResolution = localMeta
+    ? `${localMeta.width}x${localMeta.height}`
+    : ytInfo?.resolution || '1080p';
+  const activeSizeText = localMeta
+    ? formatBytesCompact(localMeta.sizeBytes)
+    : ytInfo?.filesize_approx
+      ? `~${formatBytesCompact(ytInfo.filesize_approx)}`
+      : 'Remote Stream';
+  const estProcessingText = activeDurationSec > 0 ? estimateProcessingWindow(activeDurationSec, hardwareMode) : '~15-45s';
 
   return (
-    <div className="flex-1 h-full overflow-y-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] transition-colors p-6 md:p-10 select-none">
-      <div className="max-w-5xl mx-auto space-y-8 animate-fadeIn">
-        
-        {/* Header Hero */}
-        <div className="text-center space-y-2 pt-2">
-          <div className="flex flex-wrap items-center justify-center gap-2">
-            <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--accent-primary)] text-xs font-semibold shadow-sm">
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>Local-First AI Video Clipper &amp; Multi-Format Studio</span>
+    <div className="h-full overflow-y-auto px-5 py-5 lg:px-8 lg:py-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        {/* Compact Workstation Header */}
+        <header className="flex flex-wrap items-center justify-between gap-4 border-b border-[var(--border-subtle)] pb-4">
+          <div className="space-y-1">
+            <div className="flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-[var(--accent-soft)] text-[var(--accent-primary)] border border-[var(--border-subtle)]">
+                <Sparkles className="w-3 h-3" />
+                Studio Ingestion Deck
+              </span>
+              <span className="text-[11px] font-medium text-[var(--text-muted)]">
+                Local-first faster-whisper VAD · Frame-accurate FFmpeg
+              </span>
             </div>
-            {isOfflineMultimodal && (
-              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/35 text-emerald-400 text-xs font-bold shadow-sm">
-                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span>Offline Multimodal AI · Active</span>
+            <h1 className="text-2xl lg:text-3xl font-extrabold tracking-tight text-[var(--text-primary)]">
+              Create Viral Shorts From Any Long-Form Video
+            </h1>
+          </div>
+
+          <div className="flex items-center gap-2.5">
+            <div className="px-3 py-1.5 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] flex items-center gap-2 text-xs">
+              <Cpu className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+              <span className="font-semibold text-[var(--text-secondary)]">
+                {hardwareMode === 'gpu' ? 'GPU Hardware Accel' : 'CPU Safe Mode'}
+              </span>
+              <button
+                type="button"
+                onClick={() => setHardwareMode((m) => (m === 'gpu' ? 'cpu' : 'gpu'))}
+                className="px-1.5 py-0.5 rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[10px] font-bold text-[var(--text-primary)] uppercase transition-colors"
+                title="Toggle GPU / CPU acceleration"
+              >
+                Switch
+              </button>
+            </div>
+          </div>
+        </header>
+
+        {/* ================================================================ */}
+        {/* 2-COLUMN STUDIO INGESTION DECK                                   */}
+        {/* ================================================================ */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-stretch">
+          {/* LEFT COLUMN: Source Media Drop & URL Import (6 cols) */}
+          <section className="lg:col-span-6 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-5 flex flex-col justify-between gap-4 shadow-sm">
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-[var(--text-primary)] flex items-center gap-2">
+                    <FileVideo className="w-4 h-4 text-[var(--accent-primary)]" />
+                    Source Media Drop &amp; URL Import
+                  </h2>
+                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
+                    Drop a video file or paste a YouTube link for instant pre-flight inspection
+                  </p>
+                </div>
+                {(selectedFile || ytInfo || batchFiles.length > 0) && (
+                  <button
+                    type="button"
+                    onClick={handleClearMedia}
+                    className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--text-muted)] hover:text-rose-400 transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Clear
+                  </button>
+                )}
               </div>
-            )}
-          </div>
-          <h1 className="text-3xl md:text-4xl font-black tracking-tight text-[var(--text-primary)]">
-            Turn Long Videos into <span className="text-[var(--accent-primary)]">Viral Shorts</span>
-          </h1>
-          <p className="text-sm text-[var(--text-secondary)] max-w-xl mx-auto">
-            Drop raw footage or import from YouTube. Multimodal Gemini AI detects viral hooks, while faster-whisper and FFmpeg generate animated karaoke captions.
-          </p>
-        </div>
 
-        {/* Source Toggle Tabs */}
-        <div className="flex justify-center">
-          <div className="bg-[var(--bg-card)] p-1 rounded-2xl border border-[var(--border-subtle)] inline-flex gap-1 shadow-sm">
-            <button
-              onClick={() => { setActiveTab('upload'); setErrorMessage(null); }}
-              className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition ${
-                activeTab === 'upload'
-                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-md'
-                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              <UploadCloud className="w-4 h-4" />
-              Upload Local Video
-            </button>
-            <button
-              onClick={() => { setActiveTab('youtube'); setErrorMessage(null); }}
-              className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition ${
-                activeTab === 'youtube'
-                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] shadow-md'
-                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              <YouTubeIcon className="w-4 h-4 text-red-500" />
-              Import YouTube URL
-            </button>
-          </div>
-        </div>
-
-        {/* Hero Dropzone / YouTube Input */}
-        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 md:p-8 shadow-xl relative overflow-hidden transition-all">
-          {activeTab === 'upload' ? (
-            <div
-              onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={handleFileDrop}
-              onClick={() => fileInputRef.current?.click()}
-              className={`border-2 border-dashed rounded-2xl p-8 md:p-12 text-center cursor-pointer transition-all flex flex-col items-center justify-center gap-4 ${
-                isDragging
-                  ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/10 scale-[1.01]'
-                  : selectedFile
-                  ? 'border-[var(--accent-primary)]/50 bg-[var(--bg-card)]'
-                  : 'border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/40 hover:bg-[var(--bg-card)]/50'
-              }`}
-            >
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".mp4,.mov,.mkv,.webm"
+                multiple
+                accept=".mp4,.mov,.mkv,.webm,.avi,video/*"
                 className="hidden"
-                onChange={handleFileInputChange}
+                onChange={(e) => e.target.files && handleLocalFilePicked(e.target.files)}
               />
 
-              {selectedFile ? (
-                <div className="space-y-3">
-                  <div className="w-16 h-16 rounded-2xl bg-[var(--accent-primary)]/15 border border-[var(--accent-primary)]/30 flex items-center justify-center mx-auto text-[var(--accent-primary)] shadow-md">
-                    <FileVideo className="w-8 h-8" />
-                  </div>
-                  <div>
-                    <h3 className="font-bold text-base text-[var(--text-primary)]">{selectedFile.name}</h3>
-                    <div className="flex items-center justify-center gap-3 text-xs text-[var(--text-secondary)] font-mono mt-1 tabular-nums">
-                      <span>{formatFileSize(selectedFile.size)}</span>
-                      {fileDuration && <span>• {formatSeconds(fileDuration)}</span>}
-                      {fileResolution && <span>• {fileResolution.w}x{fileResolution.h}</span>}
+              {/* Either Pre-Flight Media Preview Card OR Compact Unified Dropzone */}
+              {selectedFile || ytInfo ? (
+                <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] overflow-hidden">
+                  <div className="flex flex-col sm:flex-row gap-4 p-3.5 items-stretch">
+                    {/* Crisp Visual Thumbnail */}
+                    <div className="relative w-full sm:w-44 aspect-video shrink-0 rounded-lg overflow-hidden bg-black/50 border border-[var(--border-subtle)] flex items-center justify-center">
+                      {inspectingLocal ? (
+                        <div className="flex flex-col items-center gap-1.5 text-xs text-[var(--text-muted)]">
+                          <Loader2 className="w-5 h-5 animate-spin text-[var(--accent-primary)]" />
+                          <span>Reading metadata...</span>
+                        </div>
+                      ) : localMeta?.thumbnailDataUrl ? (
+                        <img
+                          src={localMeta.thumbnailDataUrl}
+                          alt={selectedFile?.name || 'Video frame'}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : ytInfo?.thumbnail ? (
+                        <img
+                          src={ytInfo.thumbnail}
+                          alt={ytInfo.title}
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <Film className="w-8 h-8 text-[var(--text-muted)]" />
+                      )}
+
+                      {activeDurationSec > 0 && (
+                        <span className="absolute bottom-1.5 right-1.5 px-1.5 py-0.5 rounded bg-black/80 text-white font-mono text-[10px] font-bold">
+                          {formatDurationClock(activeDurationSec)}
+                        </span>
+                      )}
+                      <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded bg-black/75 text-[10px] font-bold text-[var(--accent-primary)] uppercase">
+                        {selectedFile ? 'Local' : 'YouTube'}
+                      </span>
                     </div>
+
+                    {/* Metadata Telemetry */}
+                    <div className="flex-1 min-w-0 flex flex-col justify-between gap-2">
+                      <div>
+                        <h3 className="text-sm font-bold text-[var(--text-primary)] truncate" title={selectedFile?.name || ytInfo?.title}>
+                          {selectedFile ? selectedFile.name : ytInfo?.title}
+                        </h3>
+                        {ytInfo?.uploader && (
+                          <p className="text-xs text-[var(--text-muted)] truncate mt-0.5">
+                            Channel: {ytInfo.uploader}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-3 gap-2 text-[11px]">
+                        <div className="px-2 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)]">
+                          <div className="text-[10px] uppercase text-[var(--text-muted)] font-semibold">Resolution</div>
+                          <div className="font-bold text-[var(--text-primary)] truncate">{activeResolution}</div>
+                        </div>
+                        <div className="px-2 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)]">
+                          <div className="text-[10px] uppercase text-[var(--text-muted)] font-semibold">File Size</div>
+                          <div className="font-bold text-[var(--text-primary)] truncate">{activeSizeText}</div>
+                        </div>
+                        <div className="px-2 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)]">
+                          <div className="text-[10px] uppercase text-[var(--text-muted)] font-semibold">Est. Time</div>
+                          <div className="font-bold text-[var(--accent-primary)] truncate">{estProcessingText}</div>
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                        <button
+                          type="button"
+                          onClick={handleClearMedia}
+                          className="px-2.5 py-1 rounded-lg bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-[11px] font-semibold text-[var(--text-secondary)] transition-colors"
+                        >
+                          Change / Clear
+                        </button>
+                        {selectedFile && (
+                          <button
+                            type="button"
+                            onClick={handleQueueCurrentToBatch}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-[11px] font-semibold text-[var(--text-primary)] transition-colors"
+                          >
+                            <Plus className="w-3 h-3 text-[var(--accent-primary)]" />
+                            Queue Multi-Video Batch
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-[11px] font-semibold text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                        >
+                          <Layers className="w-3 h-3" />
+                          + Add More
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => fileInputRef.current?.click()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      fileInputRef.current?.click();
+                    }
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragging(true);
+                  }}
+                  onDragLeave={() => setIsDragging(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setIsDragging(false);
+                    if (e.dataTransfer.files?.length) {
+                      handleLocalFilePicked(e.dataTransfer.files);
+                    }
+                  }}
+                  className={`rounded-xl border-2 border-dashed px-5 py-7 flex flex-col items-center justify-center text-center cursor-pointer transition-all ${
+                    isDragging
+                      ? 'border-[var(--accent-primary)] bg-[var(--accent-soft)]'
+                      : 'border-[var(--border-subtle)] bg-[var(--bg-card)]/70 hover:border-[var(--accent-primary)]/70 hover:bg-[var(--bg-card)]'
+                  }`}
+                >
+                  <div className="w-11 h-11 rounded-xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] flex items-center justify-center mb-2.5">
+                    <Upload className="w-5 h-5 text-[var(--accent-primary)]" />
+                  </div>
+                  <p className="text-sm font-bold text-[var(--text-primary)]">
+                    Drop video file(s) here or click to browse
+                  </p>
+                  <p className="text-xs text-[var(--text-muted)] mt-1">
+                    Supports MP4, MOV, MKV, WEBM · Multi-file batch drop supported
+                  </p>
+                </div>
+              )}
+
+              {/* Staged Batch Queue List */}
+              {batchFiles.length > 0 && (
+                <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] p-3 space-y-2">
+                  <div className="flex items-center justify-between text-xs font-bold text-[var(--text-primary)]">
+                    <span className="flex items-center gap-1.5">
+                      <Layers className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                      Multi-Video Batch Queue ({batchFiles.length + (selectedFile ? 1 : 0)} videos)
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="text-[11px] font-semibold text-[var(--accent-primary)] hover:underline"
+                    >
+                      + Add File
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 max-h-20 overflow-y-auto">
+                    {batchFiles.map((bf, idx) => (
+                      <span
+                        key={`${bf.name}-${idx}`}
+                        className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] font-medium text-[var(--text-secondary)] max-w-[220px]"
+                      >
+                        <span className="truncate">{bf.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => setBatchFiles((prev) => prev.filter((_, i) => i !== idx))}
+                          className="text-[var(--text-muted)] hover:text-rose-400"
+                        >
+                          ×
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Integrated YouTube URL Bar */}
+              <div className="space-y-1.5">
+                <label className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)] flex items-center gap-1.5">
+                  <Video className="w-3.5 h-3.5 text-rose-500" />
+                  Or Import Directly From YouTube URL
+                </label>
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <Link2 className="w-4 h-4 text-[var(--text-muted)] absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="url"
+                      value={ytUrl}
+                      onChange={(e) => {
+                        setYtUrl(e.target.value);
+                        setYtError(null);
+                        if (ytInfo && e.target.value.trim() !== ytInfo.webpage_url) {
+                          setYtInfo(null);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && ytUrl.trim()) {
+                          e.preventDefault();
+                          handleFetchYouTubeInfo();
+                        }
+                      }}
+                      placeholder="https://www.youtube.com/watch?v=..."
+                      className="w-full pl-9 pr-3 py-2.5 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-primary)]"
+                    />
                   </div>
                   <button
                     type="button"
-                    onClick={(e) => { e.stopPropagation(); setSelectedFile(null); }}
-                    className="text-xs text-[var(--text-secondary)] hover:text-red-400 underline pt-1"
+                    onClick={() => handleFetchYouTubeInfo()}
+                    disabled={!ytUrl.trim() || fetchingYtInfo}
+                    className="px-3.5 py-2.5 rounded-xl bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--text-primary)] disabled:opacity-45 transition-colors flex items-center gap-1.5 shrink-0"
                   >
-                    Choose a different file
+                    {fetchingYtInfo ? (
+                      <>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Fetching...
+                      </>
+                    ) : (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                        Fetch Info
+                      </>
+                    )}
                   </button>
                 </div>
-              ) : (
-                <>
-                  <div className="w-16 h-16 rounded-2xl bg-[var(--bg-card)] border border-[var(--border-subtle)] flex items-center justify-center text-[var(--accent-primary)] shadow-md">
-                    <UploadCloud className="w-8 h-8" />
-                  </div>
-                  <div className="space-y-1">
-                    <p className="font-bold text-base text-[var(--text-primary)]">
-                      Drag & Drop your raw video footage here
-                    </p>
-                    <p className="text-xs text-[var(--text-secondary)]">
-                      or click to browse from your computer (.mp4, .mov, .mkv, .webm)
-                    </p>
-                  </div>
-                  <div className="inline-flex items-center gap-2 px-3 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] text-[var(--text-secondary)]">
-                    <span>Zero file size limit</span> • <span>100% processed locally & privately</span>
-                  </div>
-                </>
+                {ytError && (
+                  <p className="text-[11px] text-rose-400 flex items-center gap-1 pt-0.5">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    {ytError}
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Bottom Gated Primary CTA */}
+            <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2">
+              {submitError && (
+                <div className="px-3 py-2 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+                  <span>{submitError}</span>
+                </div>
               )}
-            </div>
-          ) : (
-            <div className="py-6 px-4 md:px-8 space-y-4">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-red-500/10 border border-red-500/20 flex items-center justify-center text-red-500 flex-shrink-0">
-                  <YouTubeIcon className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-bold text-[var(--text-primary)]">Download & Clip YouTube Video</h3>
-                  <p className="text-xs text-[var(--text-secondary)]">Powered by yt-dlp with hardware-accelerated transcoding</p>
-                </div>
-              </div>
-
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  value={youtubeUrl}
-                  onChange={(e) => setYoutubeUrl(e.target.value)}
-                  placeholder="https://www.youtube.com/watch?v=..."
-                  className="flex-1 bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-xl px-4 py-3 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)] transition"
-                />
-                <button
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      const text = await navigator.clipboard.readText();
-                      if (text) setYoutubeUrl(text);
-                    } catch {}
-                  }}
-                  className="px-4 py-3 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-primary)]/40 transition"
-                >
-                  Paste
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Quick Pre-Submission Setup Controls Bar */}
-          <div className="mt-6 pt-6 border-t border-[var(--border-subtle)] space-y-4">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold uppercase tracking-wider text-[var(--text-secondary)] flex items-center gap-1.5">
-                <Layers className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                Quick Pipeline Setup
-              </span>
-              <span className="text-[11px] text-[var(--text-secondary)]">
-                You can fine-tune captions and framing after ingestion
-              </span>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-              {/* Aspect Ratio */}
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-[var(--text-secondary)]">Aspect Ratio</label>
-                <div className="grid grid-cols-4 gap-1">
-                  {['9:16', '16:9', '1:1', '4:5'].map((ratio) => (
-                    <button
-                      key={ratio}
-                      type="button"
-                      onClick={() => setAspectRatio(ratio)}
-                      className={`py-1.5 rounded-lg text-xs font-bold border transition ${
-                        aspectRatio === ratio
-                          ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] shadow-sm'
-                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {ratio}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Clip Length Target */}
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-[var(--text-secondary)]">Clip Duration</label>
-                <div className="grid grid-cols-5 gap-1">
-                  {['Auto', '15s', '30s', '45s', '60s'].map((d) => (
-                    <button
-                      key={d}
-                      type="button"
-                      onClick={() => setDurationPreset(d)}
-                      className={`py-1.5 rounded-lg text-[11px] font-bold border transition ${
-                        durationPreset === d
-                          ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] shadow-sm'
-                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {d}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Number of Clips */}
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-[var(--text-secondary)]">Clips to Generate</label>
-                <div className="grid grid-cols-4 gap-1">
-                  {[3, 5, 8, 10].map((num) => (
-                    <button
-                      key={num}
-                      type="button"
-                      onClick={() => setClipCount(num)}
-                      className={`py-1.5 rounded-lg text-xs font-bold border transition ${
-                        clipCount === num
-                          ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] shadow-sm'
-                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {num}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Caption Language */}
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-[var(--text-secondary)]">Spoken Language</label>
-                <select
-                  value={captionLanguage}
-                  onChange={(e) => setCaptionLanguage(e.target.value)}
-                  className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)] rounded-lg py-2 px-2.5 font-medium focus:outline-none focus:border-[var(--accent-primary)]"
-                >
-                  <option value="As spoken">Auto-detect (As spoken)</option>
-                  <option value="English">English</option>
-                  <option value="Hindi">Hindi</option>
-                  <option value="Hinglish">Hinglish (Roman Script)</option>
-                  <option value="Spanish">Spanish</option>
-                  <option value="French">French</option>
-                  <option value="German">German</option>
-                  <option value="Japanese">Japanese</option>
-                </select>
-              </div>
-            </div>
-
-            {/* Optional Topic Focus & AI Director Instructions */}
-            <div className="space-y-2">
-              <label className="text-[11px] font-bold text-[var(--text-secondary)] flex items-center justify-between">
-                <span>AI Director Instructions (Optional)</span>
-                <span className="text-[10px] text-[var(--text-secondary)]">Tap quick chips or type custom guidance</span>
-              </label>
-              <div className="flex flex-wrap gap-1.5">
-                {[
-                  'Storytime Arc',
-                  'Hot Takes & Debate',
-                  'Technical Deep-Dive',
-                  'Actionable Tips',
-                  'Funny / High Energy',
-                  'Pricing & Strategy'
-                ].map((chip) => {
-                  const isActive = topicFocus.toLowerCase().includes(chip.toLowerCase());
-                  return (
-                    <button
-                      key={chip}
-                      type="button"
-                      onClick={() => {
-                        if (isActive) {
-                          const next = topicFocus
-                            .split(',')
-                            .map((s) => s.trim())
-                            .filter((s) => s && s.toLowerCase() !== chip.toLowerCase())
-                            .join(', ');
-                          setTopicFocus(next);
-                        } else {
-                          setTopicFocus(topicFocus.trim() ? `${topicFocus.trim()}, ${chip}` : chip);
-                        }
-                      }}
-                      className={`px-2.5 py-1 rounded-full border text-[10px] font-semibold transition ${
-                        isActive
-                          ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      {chip}
-                    </button>
-                  );
-                })}
-              </div>
-              <input
-                type="text"
-                value={topicFocus}
-                onChange={(e) => setTopicFocus(e.target.value)}
-                placeholder="Give AI specific guidance on what moments to extract..."
-                className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-xl px-4 py-2 text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)] transition"
-              />
-            </div>
-
-            {/* Error Banner */}
-            {errorMessage && (
-              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl flex items-center gap-2 text-xs text-red-400">
-                <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                <span>{errorMessage}</span>
-              </div>
-            )}
-
-            {/* Submit Action CTA */}
-            <div className="pt-2 flex flex-col sm:flex-row items-center justify-between gap-4">
-              <div className="flex items-center gap-3 flex-wrap">
-                <button
-                  type="button"
-                  onClick={() => setHardwareMode((m) => (m === 'gpu' ? 'cpu' : 'gpu'))}
-                  className="flex items-center gap-2 text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] px-2.5 py-1 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] transition"
-                  title="Click to switch between GPU NVENC and CPU libx264 encoding"
-                >
-                  <Zap className={`w-4 h-4 ${hardwareMode === 'gpu' ? 'text-emerald-400' : 'text-amber-400'}`} />
-                  <span>
-                    {hardwareMode === 'gpu'
-                      ? 'GPU Acceleration active (Whisper + NVENC)'
-                      : 'CPU Mode (libx264 Fallback)'}
-                  </span>
-                </button>
-                <label className="px-3 py-1.5 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-xs font-semibold text-[var(--text-primary)] cursor-pointer transition">
-                  + Queue Multi-Video Batch
-                  <input
-                    type="file"
-                    multiple
-                    accept=".mp4,.mov,.mkv,.webm"
-                    className="hidden"
-                    onChange={async (e) => {
-                      const files = Array.from(e.target.files || []);
-                      if (!files.length) return;
-                      try {
-                        setIsSubmitting(true);
-                        const res = await api.enqueueBatchUpload(files, {
-                          aspect_ratio: aspectRatio,
-                          duration_preset: durationPreset,
-                          clip_count: clipCount,
-                          topic_focus: topicFocus.trim() || undefined,
-                          caption_language: captionLanguage,
-                          hardware_mode: hardwareMode
-                        });
-                        if (res.enqueued?.[0]?.project_id) {
-                          onStartJob(res.enqueued[0].project_id);
-                        }
-                      } catch (err: any) {
-                        setErrorMessage(err?.message || 'Batch upload failed');
-                      } finally {
-                        setIsSubmitting(false);
-                      }
-                    }}
-                  />
-                </label>
-              </div>
 
               <button
                 type="button"
-                onClick={handleStartAnalysis}
-                disabled={isSubmitting}
-                className="w-full sm:w-auto px-8 py-3.5 rounded-2xl bg-gradient-to-r from-[#F97316] to-[#F59E0B] text-black font-black text-sm shadow-xl shadow-[rgba(245,158,11,0.25)] hover:scale-105 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:scale-100"
+                disabled={!hasValidMediaSource || isSubmitting}
+                onClick={handlePrimaryAnalyzeClick}
+                className="w-full py-3.5 px-5 rounded-xl font-extrabold text-sm tracking-wide flex items-center justify-center gap-2 shadow-md transition-all bg-[var(--accent-primary)] text-[var(--accent-foreground)] hover:brightness-110 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:brightness-100"
               >
                 {isSubmitting ? (
                   <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Launching Pipeline...</span>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Uploading &amp; Initializing Pipeline...
                   </>
                 ) : (
                   <>
                     <Sparkles className="w-4 h-4" />
-                    <span>Analyze & Generate Clips</span>
+                    {batchFiles.length > 0
+                      ? `Analyze & Queue ${batchFiles.length + (selectedFile ? 1 : 0)} Videos`
+                      : 'Analyze & Generate Clips'}
                     <ArrowRight className="w-4 h-4" />
                   </>
                 )}
               </button>
+
+              <p className="text-center text-[11px] text-[var(--text-muted)]">
+                {!hasValidMediaSource
+                  ? 'Select a video file or paste a YouTube link to begin'
+                  : aiModeChoice === 'gemini'
+                    ? `Ready · Will analyze with Gemini Cloud AI · Target ${clipCount} clips (${aspectRatio})`
+                    : `Ready · Will analyze 100% locally (Offline Multimodal AI) · Target ${clipCount} clips (${aspectRatio})`}
+              </p>
             </div>
-          </div>
+          </section>
+
+          {/* RIGHT COLUMN: AI Engine & Pipeline Configuration (6 cols) */}
+          <section className="lg:col-span-6 bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-5 flex flex-col justify-between gap-4 shadow-sm">
+            <div className="space-y-4">
+              {/* Interactive AI Engine Switcher */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-[var(--text-primary)] flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-[var(--accent-primary)]" />
+                    AI Analysis Engine
+                  </h2>
+                  {switchingMode && <span className="text-[11px] text-[var(--text-muted)]">Saving mode...</span>}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {/* Gemini Cloud Card */}
+                  <button
+                    type="button"
+                    onClick={() => handleSelectAiEngine('gemini')}
+                    className={`p-3 rounded-xl border text-left transition-all flex flex-col justify-between gap-1.5 ${
+                      aiModeChoice === 'gemini'
+                        ? 'bg-[var(--accent-soft)] border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]/40'
+                        : 'bg-[var(--bg-card)] border-[var(--border-subtle)] hover:bg-[var(--bg-hover)]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-[var(--text-primary)] flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                        Gemini Cloud + Multimodal AI
+                      </span>
+                      {aiModeChoice === 'gemini' && <Check className="w-3.5 h-3.5 text-[var(--accent-primary)] shrink-0" />}
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      {geminiConfigured ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                          <CheckCircle2 className="w-3 h-3" />
+                          Key Connected
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                          <KeyRound className="w-3 h-3" />
+                          Key Needed
+                        </span>
+                      )}
+                      <span className="text-[10px] text-[var(--text-muted)] truncate">
+                        Cloud hook &amp; transcript AI
+                      </span>
+                    </div>
+                  </button>
+
+                  {/* Offline Local Card */}
+                  <button
+                    type="button"
+                    onClick={() => handleSelectAiEngine('offline')}
+                    className={`p-3 rounded-xl border text-left transition-all flex flex-col justify-between gap-1.5 ${
+                      aiModeChoice === 'offline'
+                        ? 'bg-[var(--accent-soft)] border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]/40'
+                        : 'bg-[var(--bg-card)] border-[var(--border-subtle)] hover:bg-[var(--bg-hover)]'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-[var(--text-primary)] flex items-center gap-1.5">
+                        <WifiOff className="w-3.5 h-3.5 text-emerald-400" />
+                        Offline Multimodal AI (100% Local)
+                      </span>
+                      {aiModeChoice === 'offline' && <Check className="w-3.5 h-3.5 text-[var(--accent-primary)] shrink-0" />}
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                        <ShieldCheck className="w-3 h-3" />
+                        No Key Required
+                      </span>
+                      <span className="text-[10px] text-[var(--text-muted)] truncate">
+                        Facial Emotion + Prosody + Whisper
+                      </span>
+                    </div>
+                  </button>
+                </div>
+
+                {/* Inline API Key Input when Gemini is active & unconfigured */}
+                {aiModeChoice === 'gemini' && !geminiConfigured && (
+                  <div className="rounded-xl bg-[var(--bg-card)] border border-amber-500/35 p-3 space-y-2">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-bold text-amber-400 flex items-center gap-1.5">
+                        <KeyRound className="w-3.5 h-3.5" />
+                        Connect Google Gemini API Key
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleSelectAiEngine('offline')}
+                        className="text-[11px] font-semibold text-[var(--text-muted)] hover:text-[var(--text-primary)] underline"
+                      >
+                        Or use 100% Offline AI
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="password"
+                        value={inlineKeyInput}
+                        onChange={(e) => setInlineKeyInput(e.target.value)}
+                        placeholder="Paste Gemini API key (AIza...)"
+                        className="flex-1 px-3 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)]"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleSaveInlineKey}
+                        disabled={savingKey}
+                        className="px-3 py-1.5 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold hover:brightness-110 disabled:opacity-50 shrink-0"
+                      >
+                        {savingKey ? 'Testing...' : 'Verify & Save'}
+                      </button>
+                    </div>
+                    {inlineKeyStatus && (
+                      <p className={`text-[11px] ${inlineKeyStatus.type === 'ok' ? 'text-emerald-400' : 'text-rose-400'}`}>
+                        {inlineKeyStatus.text}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Clean 2x2 Configuration Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {/* 1. Aspect Ratio */}
+                <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+                      Aspect Ratio
+                    </span>
+                    <span className="text-[11px] font-bold text-[var(--accent-primary)]">{aspectRatio}</span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {ASPECT_OPTIONS.map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => setAspectRatio(opt.value)}
+                        title={opt.sub}
+                        className={`py-1.5 rounded-lg text-xs font-bold border transition-colors ${
+                          aspectRatio === opt.value
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-transparent'
+                            : 'bg-[var(--bg-input)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:bg-[var(--bg-hover)]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 2. Target Clip Length */}
+                <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+                      Target Clip Length
+                    </span>
+                    <span className="text-[11px] font-bold text-[var(--accent-primary)]">{durationPreset}</span>
+                  </div>
+                  <div className="grid grid-cols-5 gap-1">
+                    {LENGTH_OPTIONS.map((len) => (
+                      <button
+                        key={len}
+                        type="button"
+                        onClick={() => setDurationPreset(len)}
+                        className={`py-1.5 rounded-lg text-[11px] font-bold border transition-colors ${
+                          durationPreset === len
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-transparent'
+                            : 'bg-[var(--bg-input)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:bg-[var(--bg-hover)]'
+                        }`}
+                      >
+                        {len}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 3. Clips to Extract */}
+                <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+                      Clips to Extract
+                    </span>
+                    <span className="text-[11px] font-bold text-[var(--accent-primary)]">{clipCount} clips</span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1.5">
+                    {CLIP_COUNTS.map((cnt) => (
+                      <button
+                        key={cnt}
+                        type="button"
+                        onClick={() => setClipCount(cnt)}
+                        className={`py-1.5 rounded-lg text-xs font-bold border transition-colors ${
+                          clipCount === cnt
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-transparent'
+                            : 'bg-[var(--bg-input)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:bg-[var(--bg-hover)]'
+                        }`}
+                      >
+                        {cnt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 4. Default Framing */}
+                <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+                      Default Framing
+                    </span>
+                  </div>
+                  <select
+                    value={defaultFraming}
+                    onChange={(e) => setDefaultFraming(e.target.value)}
+                    className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)]"
+                  >
+                    {FRAMING_OPTIONS.map((f) => (
+                      <option key={f.value} value={f.value}>
+                        {f.label} ({f.hint})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Compact Spoken Language + Director Guidance */}
+              <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-start">
+                <div className="sm:col-span-4 space-y-1">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+                    Spoken Language
+                  </label>
+                  <select
+                    value={captionLanguage}
+                    onChange={(e) => setCaptionLanguage(e.target.value)}
+                    className="w-full px-2.5 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)]"
+                  >
+                    {LANGUAGES.map((lang) => (
+                      <option key={lang} value={lang}>
+                        {lang}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="sm:col-span-8 space-y-1.5">
+                  <label className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+                    AI Director Guidance (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={topicFocus}
+                    onChange={(e) => setTopicFocus(e.target.value)}
+                    placeholder="e.g. Prioritize funny reactions, clutch moments, and debates..."
+                    className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-primary)]"
+                  />
+                  <div className="flex flex-wrap gap-1.5">
+                    {DIRECTOR_CHIPS.map((chip) => {
+                      const active = topicFocus.toLowerCase().includes(chip.toLowerCase());
+                      return (
+                        <button
+                          key={chip}
+                          type="button"
+                          onClick={() =>
+                            setTopicFocus((prev) =>
+                              active
+                                ? prev
+                                    .replace(new RegExp(chip.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i'), '')
+                                    .replace(/\s*[,·]\s*$/g, '')
+                                    .trim()
+                                : prev.trim()
+                                  ? `${prev.trim()}, ${chip}`
+                                  : chip
+                            )
+                          }
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border transition-colors ${
+                            active
+                              ? 'bg-[var(--accent-soft)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
+                              : 'bg-[var(--bg-card)] text-[var(--text-muted)] border-[var(--border-subtle)] hover:text-[var(--text-primary)]'
+                          }`}
+                        >
+                          + {chip}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
         </div>
 
-        {/* Local Style Intelligence Card */}
-        {formulaReport && (
-          <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 shadow-sm">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 rounded-xl bg-[var(--accent-subtle)] border border-[var(--accent-primary)]/40 flex items-center justify-center shrink-0">
-                <Sparkles className="w-4 h-4 text-[var(--accent-primary)]" />
-              </div>
-              <div className="min-w-0">
-                <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--accent-primary)]">
-                  Your Top Performing Formula
-                  {formulaReport.sample_count > 0 ? ` · ${formulaReport.sample_count} tracked` : ''}
-                </div>
-                <div className="text-xs font-semibold text-[var(--text-primary)] truncate">
-                  {formulaReport.headline}
-                </div>
-              </div>
-            </div>
-            {formulaReport.has_data && (
-              <div className="flex items-center gap-3 text-[11px] font-mono text-[var(--text-secondary)] shrink-0">
-                {formulaReport.avg_views > 0 && (
-                  <span>{formulaReport.avg_views.toLocaleString()} avg views</span>
-                )}
-                {formulaReport.avg_retention_pct > 0 && (
-                  <span className="text-emerald-400 font-bold">
-                    {formulaReport.avg_retention_pct}% avg retention
-                  </span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Recent Projects Grid */}
-        <div className="space-y-4">
+        {/* ================================================================ */}
+        {/* RECENT PROJECTS QUICK-RESUME STRIP                               */}
+        {/* ================================================================ */}
+        <section className="space-y-3 pt-1">
           <div className="flex items-center justify-between">
-            <h2 className="text-base font-bold text-[var(--text-primary)] flex items-center gap-2">
-              <Film className="w-4 h-4 text-[var(--accent-primary)]" />
-              Recent Studio Projects
-            </h2>
+            <div className="flex items-center gap-2">
+              <FolderOpen className="w-4 h-4 text-[var(--accent-primary)]" />
+              <h2 className="text-sm font-bold uppercase tracking-wider text-[var(--text-primary)]">
+                Recent Studio Projects
+              </h2>
+              {totalProjectsCount > 0 && (
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-muted)]">
+                  {totalProjectsCount} total
+                </span>
+              )}
+            </div>
+
             <button
               type="button"
-              onClick={() => (onViewLibrary ? onViewLibrary() : onOpenProject(recentProjects[0]?.id || 0))}
-              className="text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--accent-primary)] transition"
+              onClick={onViewLibrary}
+              className="inline-flex items-center gap-1 text-xs font-bold text-[var(--accent-primary)] hover:underline"
             >
-              View all library →
+              View All Projects
+              <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>
 
-          {isLoadingProjects ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-              {[1, 2, 3, 4].map((n) => (
-                <div key={n} className="h-44 bg-[var(--bg-card)] rounded-2xl border border-[var(--border-subtle)] animate-pulse" />
+          {loadingProjects ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+              {[1, 2, 3, 4].map((idx) => (
+                <div
+                  key={idx}
+                  className="h-44 rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] animate-pulse"
+                />
               ))}
             </div>
           ) : recentProjects.length === 0 ? (
-            <div className="p-8 text-center bg-[var(--bg-card)] rounded-2xl border border-[var(--border-subtle)] text-xs text-[var(--text-secondary)]">
-              No previous projects yet. Upload a video above to generate your first set of clips!
+            <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-6 text-center text-xs text-[var(--text-muted)]">
+              No projects processed yet — load your first video above to populate your quick-resume deck.
             </div>
           ) : (
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
-              {recentProjects.map((p) => {
-                const isFinished = p.status === 'analyzed' || p.status === 'finished';
-                const isProcessing = p.status === 'created' || p.status === 'proxy_ready' || p.status === 'analyzing' || p.status === 'processing';
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+              {recentProjects.map((proj) => {
+                const isRunning = ['created', 'proxy_ready', 'analyzing', 'processing'].includes(proj.status);
+                const isError = proj.status === 'error';
+                const isOfflineProj = proj.ai_mode === 'offline';
 
                 return (
                   <div
-                    key={p.id}
-                    onClick={() => {
-                      if (isFinished) onOpenProject(p.id);
-                      else onViewProgress(p.id);
-                    }}
-                    className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-2xl p-4 hover:border-[var(--accent-primary)]/50 transition-all cursor-pointer group flex flex-col justify-between shadow-sm relative overflow-hidden"
+                    key={proj.id}
+                    className="group rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/60 overflow-hidden flex flex-col justify-between transition-all shadow-sm"
                   >
-                    <div className="space-y-2.5">
-                      {/* Top badge */}
-                      <div className="flex items-center justify-between">
-                        <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-full ${
-                          isFinished
-                            ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
-                            : isProcessing
-                            ? 'bg-amber-500/15 text-amber-400 border border-amber-500/30 animate-pulse'
-                            : 'bg-red-500/15 text-red-400 border border-red-500/30'
-                        }`}>
-                          {p.status}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={(e) => handleDeleteProject(e, p.id)}
-                          className="text-[var(--text-secondary)] hover:text-red-400 p-1 opacity-0 group-hover:opacity-100 transition"
-                          title="Delete Project"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-
-                      {/* Title & Specs */}
-                      <div>
-                        <h4 className="font-bold text-xs text-[var(--text-primary)] line-clamp-2 group-hover:text-[var(--accent-primary)] transition">
-                          {p.title}
-                        </h4>
-                        <div className="flex items-center gap-2 text-[10px] text-[var(--text-secondary)] mt-1 font-mono tabular-nums">
-                          <span>{p.duration > 0 ? `${formatSeconds(p.duration)}` : 'Duration N/A'}</span>
-                          <span>• {p.default_aspect_ratio || '9:16'}</span>
+                    {/* Aspect Video Visual Thumbnail */}
+                    <div className="relative aspect-video bg-[var(--bg-card)] border-b border-[var(--border-subtle)] overflow-hidden flex items-center justify-center">
+                      {proj.thumbnail_url ? (
+                        <img
+                          src={proj.thumbnail_url}
+                          alt={proj.title}
+                          className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-300"
+                        />
+                      ) : (
+                        <div className="flex flex-col items-center gap-1 text-[var(--text-muted)]">
+                          <Film className="w-7 h-7 opacity-60" />
+                          <span className="text-[10px] font-semibold uppercase tracking-wider opacity-75">
+                            {proj.default_aspect_ratio || '9:16'} Project
+                          </span>
                         </div>
+                      )}
+
+                      {/* Top Left AI Mode Badge */}
+                      <span
+                        className={`absolute top-2 left-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold backdrop-blur-md border ${
+                          isOfflineProj
+                            ? 'bg-emerald-950/75 text-emerald-300 border-emerald-500/40'
+                            : 'bg-indigo-950/75 text-indigo-200 border-indigo-400/40'
+                        }`}
+                      >
+                        {isOfflineProj ? <WifiOff className="w-2.5 h-2.5" /> : <Sparkles className="w-2.5 h-2.5" />}
+                        {isOfflineProj ? 'Offline AI' : 'Gemini'}
+                      </span>
+
+                      {/* Bottom Right Duration / Clip Count */}
+                      <div className="absolute bottom-2 right-2 flex items-center gap-1.5">
+                        {proj.duration > 0 && (
+                          <span className="px-1.5 py-0.5 rounded bg-black/75 text-white font-mono text-[10px] font-bold flex items-center gap-1">
+                            <Clock className="w-2.5 h-2.5 opacity-80" />
+                            {formatDurationClock(proj.duration)}
+                          </span>
+                        )}
                       </div>
                     </div>
 
-                    {/* Bottom Action */}
-                    <div className="pt-3 mt-3 border-t border-[var(--border-subtle)] flex items-center justify-between text-xs font-bold">
-                      <span className="text-[10px] text-[var(--text-secondary)] tabular-nums">
-                        {p.clips_count !== undefined ? `${p.clips_count} clips` : ''}
-                      </span>
-                      <span className="text-[var(--accent-primary)] flex items-center gap-1 text-[11px] group-hover:translate-x-0.5 transition-transform">
-                        {isFinished ? 'Open in Editor' : isProcessing ? 'View Progress' : 'Check Error'}
-                        <ArrowRight className="w-3 h-3" />
-                      </span>
+                    {/* Card Body & Quick Resume CTA */}
+                    <div className="p-3.5 space-y-2.5">
+                      <div>
+                        <h3 className="text-xs font-bold text-[var(--text-primary)] truncate" title={proj.title}>
+                          {proj.title}
+                        </h3>
+                        <p className="text-[11px] text-[var(--text-muted)] mt-0.5 flex items-center justify-between">
+                          <span>
+                            {proj.clips_count ?? 0} {(proj.clips_count ?? 0) === 1 ? 'clip' : 'clips'}
+                          </span>
+                          <span
+                            className={`font-semibold ${
+                              isRunning
+                                ? 'text-[var(--accent-primary)]'
+                                : isError
+                                  ? 'text-rose-400'
+                                  : 'text-emerald-400'
+                            }`}
+                          >
+                            {isRunning ? 'Running' : isError ? 'Failed' : 'Ready'}
+                          </span>
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => (isRunning || isError ? onViewProgress(proj.id) : onOpenProject(proj.id))}
+                        className="w-full py-2 px-3 rounded-xl bg-[var(--bg-elevated)] hover:bg-[var(--accent-primary)] text-[var(--text-primary)] hover:text-[var(--accent-foreground)] border border-[var(--border-subtle)] text-xs font-bold flex items-center justify-center gap-1.5 transition-colors"
+                      >
+                        {isRunning ? 'View Live Progress' : isError ? 'Inspect / Retry' : 'Open in Studio'}
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </button>
                     </div>
                   </div>
                 );
               })}
             </div>
           )}
-        </div>
-
+        </section>
       </div>
 
-      <AIEngineModal
-        isOpen={isEnginePromptOpen}
-        onClose={() => setIsEnginePromptOpen(false)}
-        title="Choose AI Analysis Engine"
-        subtitle="No Gemini API key is configured yet. Enter a key or run 100% locally in Offline Multimodal AI Mode."
-        currentMode={isOfflineMultimodal ? 'offline' : localSettings?.ai_mode || null}
-        geminiConfigured={Boolean(localSettings?.gemini_configured)}
-        onChosen={async (mode) => {
-          setIsEnginePromptOpen(false);
-          await executeIngestionJob(mode);
-        }}
-      />
+      {/* Choose AI Analysis Engine Dialog (only shown if Gemini chosen without saved key) */}
+      {showEngineChoiceDialog && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-lg rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-6 space-y-4 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-extrabold text-[var(--text-primary)]">
+                  Choose AI Analysis Engine
+                </h3>
+                <p className="text-xs text-[var(--text-muted)] mt-1">
+                  Gemini Cloud mode needs a Google Gemini API key, or you can run 100% locally using Offline Multimodal AI.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowEngineChoiceDialog(false)}
+                className="text-xs font-bold text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] p-4 space-y-2.5">
+              <div className="text-xs font-bold text-[var(--text-primary)] flex items-center gap-1.5">
+                <KeyRound className="w-4 h-4 text-[var(--accent-primary)]" />
+                Option 1: Connect Google Gemini API Key
+              </div>
+              <div className="flex gap-2">
+                <input
+                  type="password"
+                  value={dialogApiKey}
+                  onChange={(e) => setDialogApiKey(e.target.value)}
+                  placeholder="Paste Gemini API key (AIza...)"
+                  className="flex-1 px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent-primary)]"
+                />
+                <button
+                  type="button"
+                  disabled={dialogTestingKey}
+                  onClick={handleDialogStartGemini}
+                  className="px-4 py-2 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold hover:brightness-110 disabled:opacity-50"
+                >
+                  {dialogTestingKey ? 'Checking...' : 'Save & Start'}
+                </button>
+              </div>
+              {dialogKeyError && <p className="text-[11px] text-rose-400">{dialogKeyError}</p>}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleDialogStartOffline}
+              className="w-full py-3 px-4 rounded-xl bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--text-primary)] flex items-center justify-between"
+            >
+              <span className="flex items-center gap-2">
+                <WifiOff className="w-4 h-4 text-emerald-400" />
+                Option 2: Run in Offline Multimodal AI Mode (Zero Key Required)
+              </span>
+              <ArrowRight className="w-4 h-4 text-[var(--accent-primary)]" />
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -1092,6 +1092,51 @@ def list_projects(session: Session = Depends(get_session)):
         p_dict["disk_size_bytes"] = p_bytes
         p_dict["disk_size_formatted"] = format_bytes(p_bytes)
         p_dict["clips_count"] = len(clips)
+
+        # Best available thumbnail for Quick-Resume strip
+        thumb_url = None
+        for c in clips:
+            bfs = c.get_best_frames()
+            if bfs and isinstance(bfs, list) and bfs[0].get("url"):
+                raw_u = str(bfs[0]["url"])
+                thumb_url = f"/media{raw_u}" if raw_u.startswith("/assets/") else raw_u
+                break
+        if not thumb_url:
+            bf_dir = storage_assets / "best_frames" / str(p.id)
+            if bf_dir.exists():
+                for jpg in sorted(bf_dir.glob("*.jpg")):
+                    thumb_url = f"/media/assets/best_frames/{p.id}/{jpg.name}"
+                    break
+        p_dict["thumbnail_url"] = thumb_url
+
+        # Explicit AI Mode badge for Quick-Resume cards
+        proj_ai_mode = getattr(p, "ai_mode", None)
+        if proj_ai_mode not in ("gemini", "offline"):
+            pjson_path = storage_projects / str(p.id) / "project.json"
+            if pjson_path.exists():
+                try:
+                    pdata = json.loads(pjson_path.read_text(encoding="utf-8"))
+                    cand = pdata.get("ai_mode")
+                    if cand in ("gemini", "offline"):
+                        proj_ai_mode = cand
+                except Exception:
+                    pass
+        if proj_ai_mode not in ("gemini", "offline"):
+            first_src = ""
+            for c in clips:
+                opts = c.get_options()
+                src_tag = str(opts.get("analysis_source") or "").lower()
+                if src_tag:
+                    first_src = src_tag
+                    break
+            if first_src.startswith("offline"):
+                proj_ai_mode = "offline"
+            elif first_src:
+                proj_ai_mode = "gemini"
+            else:
+                proj_ai_mode = "gemini" if RUNTIME_SETTINGS.get("gemini_configured") and RUNTIME_SETTINGS.get("ai_provider", "gemini") != "offline" else "offline"
+        p_dict["ai_mode"] = proj_ai_mode
+        p_dict["default_framing"] = getattr(p, "default_framing", "smart_auto") or "smart_auto"
         project_list.append(p_dict)
 
     return {
@@ -1358,6 +1403,11 @@ def get_project_pipeline_logs(project_id: int, session: Session = Depends(get_se
 # Background Job Ingestion & Real-Time Tracking Endpoints
 # -------------------------------------------------------------
 
+@app.get("/api/jobs")
+def list_jobs_endpoint(limit: int = 20):
+    """Return active running jobs, queued batch jobs, and recent completed/failed jobs."""
+    return job_manager.list_jobs(limit=limit)
+
 @app.get("/api/projects/{project_id}/progress")
 def get_project_progress_endpoint(project_id: int):
     """Return real-time job progress, percentage, stage milestones, and timestamped logs."""
@@ -1424,6 +1474,61 @@ def provide_key_endpoint(
         "resumed_stage": job.get("current_stage")
     }
 
+@app.get("/api/ingest/youtube-info")
+@app.get("/api/projects/youtube-info")
+def get_youtube_info_endpoint(url: str):
+    """Inspect a YouTube video URL instantly without downloading via yt-dlp --dump-json semantics."""
+    clean_url = (url or "").strip()
+    if not clean_url or not (
+        "youtube.com" in clean_url.lower()
+        or "youtu.be" in clean_url.lower()
+        or clean_url.lower().startswith("http")
+    ):
+        raise HTTPException(status_code=400, detail="Please enter a valid YouTube or video URL.")
+
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(clean_url, download=False)
+    except Exception as exc:
+        logger.warning(f"yt-dlp metadata lookup failed for '{clean_url}': {exc}")
+        raise HTTPException(status_code=400, detail=f"Could not fetch video metadata: {str(exc)}")
+
+    if not isinstance(info, dict):
+        raise HTTPException(status_code=404, detail="Video metadata unavailable for this URL.")
+
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    if (not width or not height) and isinstance(info.get("formats"), list):
+        for fmt in reversed(info["formats"]):
+            if fmt.get("width") and fmt.get("height"):
+                width = int(fmt["width"])
+                height = int(fmt["height"])
+                break
+
+    thumb = info.get("thumbnail")
+    if not thumb and isinstance(info.get("thumbnails"), list) and info["thumbnails"]:
+        thumb = info["thumbnails"][-1].get("url")
+
+    resolution = f"{width}x{height}" if (width and height) else str(info.get("resolution") or "1080p")
+    return {
+        "title": info.get("title") or "YouTube Video",
+        "thumbnail": thumb,
+        "duration": float(info.get("duration") or 0.0),
+        "width": width or 1920,
+        "height": height or 1080,
+        "resolution": resolution,
+        "uploader": info.get("uploader") or info.get("channel") or "",
+        "webpage_url": info.get("webpage_url") or clean_url,
+        "filesize_approx": int(info.get("filesize_approx") or info.get("filesize") or 0),
+    }
+
+
 @app.post("/api/ingest/upload")
 @app.post("/api/projects/upload")
 async def upload_video(
@@ -1434,6 +1539,7 @@ async def upload_video(
     topic_focus: Optional[str] = Form(None),
     caption_language: Optional[str] = Form("As spoken"),
     hardware_mode: Optional[str] = Form("gpu"),
+    default_framing: Optional[str] = Form("smart_auto"),
     ai_mode: Optional[str] = Form(None),
     batch_queue: Optional[bool] = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -1450,6 +1556,12 @@ async def upload_video(
         while chunk := await file.read(1024 * 1024 * 4):
             buffer.write(chunk)
 
+    from app.services.job_manager import resolve_ai_mode
+    clean_ai_mode = ai_mode if ai_mode in ("gemini", "offline") else None
+    resolved_mode = resolve_ai_mode(get_persisted_settings(), explicit_ai_mode=clean_ai_mode)
+    stored_ai_mode = resolved_mode if resolved_mode in ("gemini", "offline") else clean_ai_mode
+    framing_choice = default_framing or "smart_auto"
+
     title = Path(file.filename).stem.replace("_", " ").title()
     project = Project(
         title=title,
@@ -1462,6 +1574,8 @@ async def upload_video(
         clip_count=clip_count or 5,
         caption_language=caption_language or "As spoken",
         hardware_mode=hardware_mode or "gpu",
+        default_framing=framing_choice,
+        ai_mode=stored_ai_mode,
         topic_focus=topic_focus
     )
     session.add(project)
@@ -1480,16 +1594,29 @@ async def upload_video(
         caption_language=caption_language or "As spoken",
         topic_focus=topic_focus,
         hardware_mode=hardware_mode or "gpu",
-        ai_mode=ai_mode,
+        ai_mode=clean_ai_mode,
+        default_framing=framing_choice,
     )
 
     if batch_queue:
         enqueue_batch_project(project.id, project.title, source="upload", auto_start=True)
-        return {"project_id": project.id, "title": project.title, "status": "queued"}
+        return {
+            "project_id": project.id,
+            "title": project.title,
+            "status": "queued",
+            "ai_mode": stored_ai_mode,
+            "default_framing": framing_choice,
+        }
 
     background_tasks.add_task(job_manager.run_pipeline, project.id)
 
-    return {"project_id": project.id, "title": project.title, "status": "processing"}
+    return {
+        "project_id": project.id,
+        "title": project.title,
+        "status": "processing",
+        "ai_mode": stored_ai_mode,
+        "default_framing": framing_choice,
+    }
 
 @app.post("/api/ingest/youtube")
 @app.post("/api/projects/youtube")
@@ -1518,6 +1645,12 @@ async def import_youtube(
         logger.error(f"yt-dlp download failed: {e}")
         raise HTTPException(status_code=400, detail=f"Failed to import YouTube video: {str(e)}")
 
+    from app.services.job_manager import resolve_ai_mode
+    clean_ai_mode = req.ai_mode if req.ai_mode in ("gemini", "offline") else None
+    resolved_mode = resolve_ai_mode(get_persisted_settings(), explicit_ai_mode=clean_ai_mode)
+    stored_ai_mode = resolved_mode if resolved_mode in ("gemini", "offline") else clean_ai_mode
+    framing_choice = req.default_framing or "smart_auto"
+
     project = Project(
         title=video_title,
         source_type="youtube",
@@ -1529,6 +1662,8 @@ async def import_youtube(
         clip_count=req.clip_count or 5,
         caption_language=req.caption_language or "As spoken",
         hardware_mode=req.hardware_mode or "gpu",
+        default_framing=framing_choice,
+        ai_mode=stored_ai_mode,
         topic_focus=req.topic_focus
     )
     session.add(project)
@@ -1547,12 +1682,29 @@ async def import_youtube(
         caption_language=req.caption_language or "As spoken",
         topic_focus=req.topic_focus,
         hardware_mode=req.hardware_mode or "gpu",
-        ai_mode=req.ai_mode,
+        ai_mode=clean_ai_mode,
+        default_framing=framing_choice,
     )
+
+    if req.batch_queue:
+        enqueue_batch_project(project.id, project.title, source="youtube", auto_start=True)
+        return {
+            "project_id": project.id,
+            "title": project.title,
+            "status": "queued",
+            "ai_mode": stored_ai_mode,
+            "default_framing": framing_choice,
+        }
 
     background_tasks.add_task(job_manager.run_pipeline, project.id)
 
-    return {"project_id": project.id, "title": project.title, "status": "processing"}
+    return {
+        "project_id": project.id,
+        "title": project.title,
+        "status": "processing",
+        "ai_mode": stored_ai_mode,
+        "default_framing": framing_choice,
+    }
 
 # -------------------------------------------------------------
 # Clips Voice Recognition & Captions API

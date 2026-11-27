@@ -15,7 +15,10 @@ import {
   GeminiModelInfo,
   SourceWebcamRegion,
   FramingOverride,
-  FramingMapResponse
+  FramingMapResponse,
+  JobProgress,
+  JobsListResponse,
+  YouTubeMetadataInfo
 } from '../types';
 
 declare global {
@@ -190,10 +193,27 @@ export const api = {
     return res.json();
   },
 
-  async getProjectProgress(id: number): Promise<any> {
+  async getJobs(limit: number = 20): Promise<JobsListResponse> {
+    const res = await fetch(`${API_BASE}/jobs?limit=${limit}`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch jobs (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async getProjectProgress(id: number): Promise<JobProgress> {
     const res = await fetch(`${API_BASE}/projects/${id}/progress`);
     if (!res.ok) {
       throw new Error(`Failed to fetch project progress (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async getYouTubeInfo(url: string): Promise<YouTubeMetadataInfo> {
+    const res = await fetch(`${API_BASE}/ingest/youtube-info?url=${encodeURIComponent(url)}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Could not inspect YouTube video metadata' }));
+      throw new Error(err.detail || 'Could not inspect YouTube video metadata');
     }
     return res.json();
   },
@@ -249,8 +269,10 @@ export const api = {
     topicFocus?: string,
     captionLanguage: string = 'As spoken',
     hardwareMode: string = 'gpu',
-    aiMode?: 'gemini' | 'offline'
-  ): Promise<{ project_id: number; title: string }> {
+    aiMode?: 'gemini' | 'offline',
+    defaultFraming: string = 'smart_auto',
+    batchQueue: boolean = false
+  ): Promise<{ project_id: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('aspect_ratio', aspectRatio);
@@ -258,6 +280,8 @@ export const api = {
     formData.append('clip_count', clipCount.toString());
     formData.append('caption_language', captionLanguage);
     formData.append('hardware_mode', hardwareMode);
+    formData.append('default_framing', defaultFraming || 'smart_auto');
+    formData.append('batch_queue', batchQueue ? 'true' : 'false');
     if (aiMode) {
       formData.append('ai_mode', aiMode);
     }
@@ -281,8 +305,10 @@ export const api = {
     topicFocus?: string,
     captionLanguage: string = 'As spoken',
     hardwareMode: string = 'gpu',
-    aiMode?: 'gemini' | 'offline'
-  ): Promise<{ project_id: number; title: string }> {
+    aiMode?: 'gemini' | 'offline',
+    defaultFraming: string = 'smart_auto',
+    batchQueue: boolean = false
+  ): Promise<{ project_id: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
     const res = await fetch(`${API_BASE}/ingest/youtube`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -294,7 +320,9 @@ export const api = {
         topic_focus: topicFocus,
         caption_language: captionLanguage,
         hardware_mode: hardwareMode,
-        ai_mode: aiMode
+        ai_mode: aiMode,
+        default_framing: defaultFraming || 'smart_auto',
+        batch_queue: batchQueue
       }),
     });
     if (!res.ok) {

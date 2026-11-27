@@ -31,6 +31,8 @@ class Project(SQLModel, table=True):
     clip_length_target: str = SQLField(default="Auto") # Auto, 15s, 30s, 45s, 60s, 90s
     caption_language: str = SQLField(default="As spoken") # As spoken, Hinglish, English, Hindi, Spanish, French, German, Arabic, Portuguese, Japanese
     hardware_mode: str = SQLField(default="gpu") # gpu (Graphics card) or cpu (Processor only)
+    default_framing: str = SQLField(default="smart_auto") # smart_auto, auto_track, gameplay_webcam_pip, fit_blur
+    ai_mode: Optional[str] = SQLField(default=None) # Explicit per-project "gemini" or "offline"
     topic_focus: Optional[str] = SQLField(default=None) # Optional creative guidance for Gemini
     multimodal_analysis_json: str = SQLField(default="") # Persistent audio+video multimodal timeline & summary
 
@@ -731,7 +733,9 @@ class YouTubeImportRequest(BaseModel):
     topic_focus: Optional[str] = None
     caption_language: Optional[str] = "As spoken"
     hardware_mode: Optional[str] = "gpu"
+    default_framing: Optional[str] = "smart_auto"
     ai_mode: Optional[str] = None
+    batch_queue: Optional[bool] = False
 
 
 class UpdateClipRequest(BaseModel):

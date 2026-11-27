@@ -88,6 +88,12 @@ def init_db():
                 if p_cols and "multimodal_analysis_json" not in p_cols:
                     session.exec(text("ALTER TABLE projects ADD COLUMN multimodal_analysis_json TEXT DEFAULT ''"))
                     added = True
+                if p_cols and "default_framing" not in p_cols:
+                    session.exec(text("ALTER TABLE projects ADD COLUMN default_framing TEXT DEFAULT 'smart_auto'"))
+                    added = True
+                if p_cols and "ai_mode" not in p_cols:
+                    session.exec(text("ALTER TABLE projects ADD COLUMN ai_mode TEXT"))
+                    added = True
                 if added:
                     session.commit()
     except Exception as e:

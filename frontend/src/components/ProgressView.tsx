@@ -1,706 +1,1028 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { 
-  CheckCircle2, Clock, Terminal, ChevronDown, ChevronUp,
-  AlertCircle, RefreshCw, XCircle, ArrowRight, Sparkles,
-  Cpu, HardDrive, FileVideo, Layers, ShieldCheck, Key, Eye, EyeOff,
-  Copy, Check
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Activity,
+  AlertCircle,
+  ArrowLeft,
+  ArrowRight,
+  Check,
+  CheckCircle2,
+  Clock,
+  Copy,
+  Cpu,
+  Eye,
+  FileVideo,
+  Film,
+  Filter,
+  FolderOpen,
+  History,
+  KeyRound,
+  Layers,
+  Loader2,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  Sparkles,
+  Square,
+  Terminal,
+  WifiOff,
+  XCircle,
 } from 'lucide-react';
-import { JobProgress, BatchQueueItem } from '../types';
 import { api } from '../api/client';
+import { JobProgress, JobsListResponse, PipelineLog, PipelineStage } from '../types';
 
 interface ProgressViewProps {
-  projectId: number;
+  projectId?: number | null;
   onOpenEditor: (projectId: number) => void;
   onBackToHome: () => void;
 }
 
+type StageFilterKey = 'ALL' | 'ingest' | 'audio' | 'transcribe' | 'gemini' | 'ready';
+
+function formatClock(sec: number): string {
+  const clean = Math.max(0, Math.floor(sec || 0));
+  const h = Math.floor(clean / 3600);
+  const m = Math.floor((clean % 3600) / 60);
+  const s = clean % 60;
+  if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+}
+
+function formatStepDuration(sec: number | null | undefined): string {
+  if (sec === null || sec === undefined || Number.isNaN(sec)) return '';
+  if (sec < 0.1) return '< 0.1s';
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return `${m}m ${s}s`;
+}
+
+function formatTimestampShort(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso.slice(11, 19) || '';
+    return d.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
+function logMatchesStageFilter(log: PipelineLog, filterKey: StageFilterKey): boolean {
+  if (filterKey === 'ALL') return true;
+  const tag = (log.stage || '').trim().toUpperCase();
+  if (filterKey === 'ingest') return ['INGEST', 'MEDIA', 'INIT', 'SYSTEM'].includes(tag);
+  if (filterKey === 'audio') return tag === 'AUDIO';
+  if (filterKey === 'transcribe') return tag === 'TRANSCRIBE';
+  if (filterKey === 'gemini') return ['GEMINI', 'OFFLINE AI', 'OLLAMA', 'ANALYSIS'].includes(tag);
+  if (filterKey === 'ready') return ['READY', 'RENDER'].includes(tag);
+  return true;
+}
+
 export const ProgressView: React.FC<ProgressViewProps> = ({
-  projectId,
+  projectId = null,
   onOpenEditor,
-  onBackToHome
+  onBackToHome,
 }) => {
-  const [progress, setProgress] = useState<JobProgress | null>(null);
-  const [batchItems, setBatchItems] = useState<BatchQueueItem[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isCancelling, setIsCancelling] = useState(false);
-  const [isRetrying, setIsRetrying] = useState(false);
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [autoOpenEditor, setAutoOpenEditor] = useState(true);
-  const [autoOpenCountdown, setAutoOpenCountdown] = useState<number | null>(null);
-  const [isLogsExpanded, setIsLogsExpanded] = useState(true);
-  const [autoScrollLogs, setAutoScrollLogs] = useState(true);
+  const [selectedJobId, setSelectedJobId] = useState<number | null>(projectId ?? null);
+  const [inspectingHistorical, setInspectingHistorical] = useState(false);
+
+  const [jobsSummary, setJobsSummary] = useState<JobsListResponse | null>(null);
+  const [loadingJobs, setLoadingJobs] = useState(true);
+
+  const [job, setJob] = useState<JobProgress | null>(null);
+  const [liveElapsedSec, setLiveElapsedSec] = useState<number>(0);
+
+  // Terminal controls (open by default!)
+  const [stageFilter, setStageFilter] = useState<StageFilterKey>('ALL');
+  const [autoScroll, setAutoScroll] = useState(true);
   const [copiedLogs, setCopiedLogs] = useState(false);
+  const logViewportRef = useRef<HTMLDivElement>(null);
 
-  // Gemini API Key Recovery Card State
-  const [apiKeyInput, setApiKeyInput] = useState('');
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [isProvidingKey, setIsProvidingKey] = useState(false);
+  // Action states
+  const [cancelling, setCancelling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [inlineKey, setInlineKey] = useState('');
   const [keyError, setKeyError] = useState<string | null>(null);
-  const [isRetryingOffline, setIsRetryingOffline] = useState(false);
+  const [submittingKey, setSubmittingKey] = useState(false);
 
-  const logsEndRef = useRef<HTMLDivElement>(null);
+  // Track if current selectedJobId was observed running live so we only auto-transition on fresh completion
+  const wasObservedRunningRef = useRef<boolean>(false);
+  const autoTransitionTriggeredRef = useRef<boolean>(false);
 
-  // Poll progress every 1s
+  // Sync incoming prop changes cleanly
   useEffect(() => {
-    let isMounted = true;
+    setSelectedJobId(projectId ?? null);
+    setInspectingHistorical(false);
+    wasObservedRunningRef.current = false;
+    autoTransitionTriggeredRef.current = false;
+    setStageFilter('ALL');
+  }, [projectId]);
 
-    const fetchProgress = async () => {
-      try {
-        const [data, batchRes] = await Promise.all([
-          api.getProjectProgress(projectId),
-          api.getBatchQueue().catch(() => ({ items: [] }))
-        ]);
-        if (isMounted) {
-          setProgress(data);
-          setBatchItems(batchRes?.items || []);
-          setIsLoading(false);
-        }
-      } catch (err) {
-        console.error('Failed to fetch job progress:', err);
+  // Poll GET /api/jobs to keep Command Center & Auto-Binding fresh
+  const fetchJobsSummary = async () => {
+    try {
+      const data = await api.getJobs(20);
+      setJobsSummary(data);
+      // Auto-bind to running job whenever user opens Pipeline Progress without an explicit projectId
+      if (selectedJobId === null && !inspectingHistorical && data.active_jobs?.length > 0) {
+        setSelectedJobId(data.active_jobs[0].project_id);
+        wasObservedRunningRef.current = true;
+      }
+    } catch (err) {
+      console.error('Failed to fetch jobs list:', err);
+    } finally {
+      setLoadingJobs(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchJobsSummary();
+    const timer = window.setInterval(fetchJobsSummary, 3000);
+    return () => window.clearInterval(timer);
+  }, [selectedJobId, inspectingHistorical]);
+
+  // Stream & poll active job progress when a job ID is selected
+  useEffect(() => {
+    if (selectedJobId === null) {
+      setJob(null);
+      return;
+    }
+
+    let cancelled = false;
+    let pollTimer: number | null = null;
+    let redirectTimer: number | null = null;
+
+    const handleJobPayload = (payload: JobProgress) => {
+      if (cancelled || !payload || payload.project_id !== selectedJobId) return;
+      setJob(payload);
+      if (typeof payload.elapsed_seconds === 'number') {
+        setLiveElapsedSec(payload.elapsed_seconds);
+      } else if (typeof payload.elapsed_sec === 'number') {
+        setLiveElapsedSec(payload.elapsed_sec);
+      }
+
+      const st = payload.status;
+      if (st === 'processing' || st === 'created' || st === 'awaiting_api_key' || st === 'queued') {
+        wasObservedRunningRef.current = true;
+      }
+
+      if (
+        (st === 'finished' || st === 'analyzed') &&
+        wasObservedRunningRef.current &&
+        !autoTransitionTriggeredRef.current
+      ) {
+        autoTransitionTriggeredRef.current = true;
+        redirectTimer = window.setTimeout(() => {
+          if (!cancelled) {
+            onOpenEditor(selectedJobId);
+          }
+        }, 1300);
       }
     };
 
-    fetchProgress();
-    const interval = setInterval(fetchProgress, 1000);
-    return () => {
-      isMounted = false;
-      clearInterval(interval);
+    const pullProgress = async () => {
+      try {
+        const res = await api.getProjectProgress(selectedJobId);
+        handleJobPayload(res);
+      } catch (err) {
+        console.error('Failed to poll job progress:', err);
+      }
     };
-  }, [projectId]);
 
-  // Track elapsed timer accurately using server-computed elapsed_seconds
-  useEffect(() => {
-    if (typeof progress?.elapsed_seconds === 'number') {
-      setElapsedSeconds(Math.max(0, progress.elapsed_seconds));
-    } else if (progress?.started_at) {
-      const startTime = new Date(progress.started_at).getTime();
-      const isComplete = progress.status === 'finished' || progress.status === 'analyzed' || progress.status === 'error' || progress.status === 'failed' || progress.status === 'cancelled' || progress.status === 'awaiting_api_key';
-      const endTime = isComplete && progress.updated_at ? new Date(progress.updated_at).getTime() : Date.now();
-      setElapsedSeconds(Math.max(0, Math.floor((endTime - startTime) / 1000)));
-    } else {
-      setElapsedSeconds(0);
-    }
+    pullProgress();
 
-    let timer: any = null;
-    if (progress?.status === 'processing') {
-      timer = setInterval(() => {
-        setElapsedSeconds((prev) => prev + 1);
-      }, 1000);
-    }
+    const unsubscribe = api.subscribeToEvents((ev) => {
+      if (ev?.type === 'progress' && ev.data?.project_id === selectedJobId) {
+        handleJobPayload(ev.data as JobProgress);
+      }
+    });
+
+    pollTimer = window.setInterval(pullProgress, 2000);
+
     return () => {
-      if (timer) clearInterval(timer);
+      cancelled = true;
+      unsubscribe();
+      if (pollTimer) window.clearInterval(pollTimer);
+      if (redirectTimer) window.clearTimeout(redirectTimer);
     };
-  }, [progress?.elapsed_seconds, progress?.started_at, progress?.status, progress?.updated_at]);
+  }, [selectedJobId]);
 
-  // Auto-scroll logs cleanly when Auto-Scroll is enabled
+  const isRunningStatus = Boolean(
+    job && ['processing', 'created', 'proxy_ready', 'analyzing'].includes(job.status)
+  );
+  const isFinishedStatus = Boolean(job && (job.status === 'finished' || job.status === 'analyzed'));
+  const isAwaitingKey = Boolean(job && job.status === 'awaiting_api_key');
+  const isFailedOrCancelled = Boolean(
+    job && (job.status === 'error' || job.status === 'failed' || job.status === 'cancelled')
+  );
+
+  // Smooth monotonic 1s client ticker anchored to server elapsed_seconds only while running
   useEffect(() => {
-    if (isLogsExpanded && autoScrollLogs) {
-      logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
-  }, [progress?.logs, isLogsExpanded, autoScrollLogs]);
+    if (!isRunningStatus) return;
+    const tick = window.setInterval(() => {
+      setLiveElapsedSec((prev) => prev + 1);
+    }, 1000);
+    return () => window.clearInterval(tick);
+  }, [isRunningStatus]);
 
-  const handleCopyLogs = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const lines = (progress?.logs || []).map(
-      (l) => `[${new Date(l.timestamp).toLocaleTimeString()}] [${l.stage}] ${l.message}`
-    );
-    try {
-      await navigator.clipboard.writeText(lines.join('\n'));
-      setCopiedLogs(true);
-      setTimeout(() => setCopiedLogs(false), 2000);
-    } catch {
-      // ignore clipboard restrictions
-    }
-  };
-
-  // Reset auto-redirect countdown when project switches
-  useEffect(() => {
-    setAutoOpenCountdown(null);
-  }, [projectId]);
-
-  // Handle completion auto-redirect countdown
-  useEffect(() => {
-    const isFinished = progress?.status === 'finished' || progress?.status === 'analyzed';
-    if (isFinished && autoOpenEditor && autoOpenCountdown === null) {
-      setAutoOpenCountdown(3);
-    }
-  }, [progress?.status, autoOpenEditor, autoOpenCountdown]);
+  // Auto-scroll terminal console when enabled
+  const filteredLogs = useMemo(() => {
+    const allLogs = job?.logs || [];
+    return allLogs.filter((l) => logMatchesStageFilter(l, stageFilter));
+  }, [job?.logs, stageFilter]);
 
   useEffect(() => {
-    if (autoOpenCountdown !== null && autoOpenCountdown > 0) {
-      const t = setTimeout(() => {
-        setAutoOpenCountdown(autoOpenCountdown - 1);
-      }, 1000);
-      return () => clearTimeout(t);
-    } else if (autoOpenCountdown === 0) {
-      onOpenEditor(projectId);
+    if (autoScroll && logViewportRef.current) {
+      logViewportRef.current.scrollTop = logViewportRef.current.scrollHeight;
     }
-  }, [autoOpenCountdown, onOpenEditor, projectId]);
+  }, [filteredLogs.length, autoScroll]);
 
   const handleCancelJob = async () => {
-    if (!confirm('Are you sure you want to abort this analysis pipeline?')) return;
+    if (!selectedJobId || cancelling) return;
+    setCancelling(true);
     try {
-      setIsCancelling(true);
-      await api.cancelProject(projectId);
-      const data = await api.getProjectProgress(projectId);
-      setProgress(data);
+      await api.cancelProject(selectedJobId);
+      const updated = await api.getProjectProgress(selectedJobId);
+      setJob(updated);
+      fetchJobsSummary();
     } catch (err) {
-      console.error('Cancel failed:', err);
+      console.error('Failed to cancel job:', err);
     } finally {
-      setIsCancelling(false);
+      setCancelling(false);
     }
   };
 
-  const handleRetryJob = async () => {
-    try {
-      setIsRetrying(true);
-      await api.retryProject(projectId, false);
-      const data = await api.getProjectProgress(projectId);
-      setProgress(data);
-    } catch (err: any) {
-      alert(`Failed to retry project: ${err?.message || err}`);
-    } finally {
-      setIsRetrying(false);
-    }
-  };
-
-  const handleProvideKey = async (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (!apiKeyInput.trim()) {
-      setKeyError('Please enter a Google Gemini API key.');
-      return;
-    }
+  const handleRetryJob = async (targetId: number, forceOffline: boolean = false) => {
+    if (retrying) return;
+    setRetrying(true);
     setKeyError(null);
-    setIsProvidingKey(true);
+    wasObservedRunningRef.current = true;
+    autoTransitionTriggeredRef.current = false;
     try {
-      await api.provideApiKey(projectId, apiKeyInput.trim());
-      const data = await api.getProjectProgress(projectId);
-      setProgress(data);
-      setApiKeyInput('');
+      await api.retryProject(targetId, forceOffline);
+      setSelectedJobId(targetId);
+      setInspectingHistorical(false);
+      const updated = await api.getProjectProgress(targetId);
+      setJob(updated);
+      fetchJobsSummary();
     } catch (err: any) {
-      setKeyError(err?.message || 'Verification failed. Please check your Gemini API key.');
+      setKeyError(err?.message || 'Retry request failed');
     } finally {
-      setIsProvidingKey(false);
+      setRetrying(false);
     }
   };
 
-  const handleContinueOffline = async () => {
-    setIsRetryingOffline(true);
+  const handleSubmitResumeKey = async () => {
+    if (!selectedJobId || !inlineKey.trim() || submittingKey) return;
+    setSubmittingKey(true);
+    setKeyError(null);
+    wasObservedRunningRef.current = true;
+    autoTransitionTriggeredRef.current = false;
     try {
-      await api.retryProject(projectId, true);
-      const data = await api.getProjectProgress(projectId);
-      setProgress(data);
+      await api.provideApiKey(selectedJobId, inlineKey.trim());
+      setInlineKey('');
+      window.dispatchEvent(new CustomEvent('lh-settings-updated'));
+      const updated = await api.getProjectProgress(selectedJobId);
+      setJob(updated);
     } catch (err: any) {
-      alert(`Failed to switch to offline mode: ${err?.message || err}`);
+      setKeyError(err?.message || 'Gemini API key verification failed');
     } finally {
-      setIsRetryingOffline(false);
+      setSubmittingKey(false);
     }
   };
 
-  const formatTimer = (sec: number) => {
-    const m = Math.floor(sec / 60);
-    const s = Math.floor(sec % 60);
-    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  const handleCopyLogs = async () => {
+    const text = filteredLogs
+      .map((l) => `[${formatTimestampShort(l.timestamp)}] [${l.stage}] [${l.level}] ${l.message}`)
+      .join('\n');
+    try {
+      await navigator.clipboard.writeText(text || 'No logs available.');
+      setCopiedLogs(true);
+      window.setTimeout(() => setCopiedLogs(false), 1800);
+    } catch {
+      setCopiedLogs(false);
+    }
   };
 
-  const isFinished = progress?.status === 'finished' || progress?.status === 'analyzed';
-  const isError = progress?.status === 'error' || progress?.status === 'failed';
-  const isCancelled = progress?.status === 'cancelled';
-  const isAwaitingApiKey = progress?.status === 'awaiting_api_key';
+  // =========================================================================
+  // IDLE / NO ACTIVE JOB -> PIPELINE COMMAND CENTER
+  // =========================================================================
+  if (selectedJobId === null || (!job && !loadingJobs && !jobsSummary?.active_jobs?.length)) {
+    const queuedJobs = jobsSummary?.queued_jobs || [];
+    const recentJobs = jobsSummary?.recent_jobs || [];
 
-  const isOfflineMode = progress?.ai_mode === 'offline' || progress?.ai_provider === 'offline';
-
-  return (
-    <div className="flex-1 h-full overflow-y-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] transition-colors px-4 py-6 md:p-8 select-none flex flex-col items-center justify-start">
-      <div className="w-full max-w-4xl mx-auto my-auto space-y-6 animate-fadeIn pt-4 pb-6">
-        
-        {/* Main Central Studio Progress Card */}
-        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-3xl p-6 md:p-8 shadow-2xl space-y-6 relative overflow-visible">
-          
-          {/* Top Metadata Bar */}
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 pb-5 border-b border-[var(--border-subtle)]">
-            <div className="flex items-center gap-3">
-              <div className="w-12 h-12 rounded-2xl bg-[var(--accent-primary)]/15 border border-[var(--accent-primary)]/30 flex items-center justify-center text-[var(--accent-primary)]">
-                <FileVideo className="w-6 h-6" />
-              </div>
-              <div>
-                <h2 className="font-bold text-base text-[var(--text-primary)] truncate max-w-sm">
-                  {progress?.title || 'Processing Video...'}
-                </h2>
-                <div className="flex items-center gap-2 text-xs text-[var(--text-secondary)] font-mono mt-0.5">
-                  {progress?.source_filename && <span>{progress.source_filename}</span>}
-                  {progress?.file_size_formatted && <span>• {progress.file_size_formatted}</span>}
-                </div>
-              </div>
-            </div>
-
-            {/* Hardware Telemetry Badge & Time */}
-            <div className="flex items-center gap-3 self-end sm:self-auto font-mono text-xs">
-              <div className="px-3 py-1.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] flex items-center gap-2 text-[var(--text-secondary)]">
-                <Cpu className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-[11px] font-bold text-[var(--text-primary)]">
-                  {progress?.hardware_badge || 'GPU Hardware Acceleration'}
+    return (
+      <div className="h-full overflow-y-auto px-5 py-6 lg:px-8">
+        <div className="max-w-6xl mx-auto space-y-6">
+          {/* Command Center Hero */}
+          <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-6 flex flex-wrap items-center justify-between gap-4 shadow-sm">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--text-secondary)]">
+                  <Activity className="w-3 h-3 text-[var(--accent-primary)]" />
+                  Pipeline Command Center
+                </span>
+                <span className="text-xs font-semibold text-emerald-400 flex items-center gap-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                  No Active Jobs Running
                 </span>
               </div>
-              <div className="px-3 py-1.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] flex items-center gap-1.5 text-[var(--text-secondary)]">
-                <Clock className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                <span className="font-bold text-[var(--text-primary)] tabular-nums">{formatTimer(elapsedSeconds)}</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Animated Horizontal Progress Bar */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-[var(--text-primary)] flex items-center gap-2">
-                {isFinished ? (
-                  <span className="text-emerald-400 flex items-center gap-1.5">
-                    <CheckCircle2 className="w-4 h-4" /> Pipeline Complete
-                  </span>
-                ) : isAwaitingApiKey ? (
-                  <span className="text-amber-400 flex items-center gap-1.5 font-bold animate-pulse">
-                    <Key className="w-4 h-4" /> Action Required: Gemini API Key Needed
-                  </span>
-                ) : isError ? (
-                  <span className="text-red-400 flex items-center gap-1.5">
-                    <AlertCircle className="w-4 h-4" /> Pipeline Failed
-                  </span>
-                ) : isCancelled ? (
-                  <span className="text-amber-400">Cancelled</span>
-                ) : (
-                  <span className="flex items-center gap-1.5">
-                    <RefreshCw className="w-3.5 h-3.5 text-[var(--accent-primary)] animate-spin" />
-                    {progress?.stage_label || 'Executing pipeline stages...'}
-                  </span>
-                )}
-              </span>
-
-              <span className="font-mono font-black text-sm text-[var(--accent-primary)] tabular-nums">
-                {progress?.percent ?? 0}%
-              </span>
+              <h1 className="text-2xl font-extrabold text-[var(--text-primary)] tracking-tight">
+                Pipeline Telemetry &amp; Execution History
+              </h1>
+              <p className="text-xs text-[var(--text-muted)]">
+                Launch a new ingestion job or inspect logs, recover checkpoints, and open completed clips from recent runs.
+              </p>
             </div>
 
-            {/* Track */}
-            <div className="w-full h-3.5 bg-[var(--bg-input)] rounded-full overflow-hidden p-0.5 border border-[var(--border-subtle)] shadow-inner">
-              <div
-                className={`h-full rounded-full transition-all duration-500 ease-out ${
-                  isError
-                    ? 'bg-red-500'
-                    : isFinished
-                    ? 'bg-emerald-500 shadow-md shadow-emerald-500/30'
-                    : isAwaitingApiKey
-                    ? 'bg-amber-500 shadow-md shadow-amber-500/40'
-                    : 'bg-gradient-to-r from-[#F97316] to-[#F59E0B] shadow-md shadow-[rgba(245,158,11,0.3)]'
-                }`}
-                style={{ width: `${Math.max(5, progress?.percent ?? 5)}%` }}
-              />
-            </div>
-
-            {/* Estimated time remaining */}
-            {!isFinished && !isError && !isAwaitingApiKey && progress?.eta_seconds !== undefined && progress.eta_seconds > 0 && (
-              <div className="text-[11px] text-right text-[var(--text-secondary)] font-mono tabular-nums">
-                Estimated time remaining: ~{progress.eta_seconds}s
-              </div>
-            )}
-          </div>
-
-          {/* 5-Step Pipeline Stepper */}
-          <div className="grid grid-cols-5 gap-2.5 pt-4 overflow-visible">
-            {(progress?.stages || [
-              { id: 'ingest', name: 'Media Prep', desc: 'Probing video stream', status: 'running', percent: 20 },
-              {
-                id: 'audio',
-                name: progress?.needs_proxy ? '480p Proxy' : 'Fast Audio Extract',
-                desc: progress?.needs_proxy ? '16kHz WAV & 480p proxy' : '16kHz mono WAV',
-                status: 'pending',
-                percent: 0,
-              },
-              { id: 'transcribe', name: 'Whisper VAD', desc: 'Voice recognition', status: 'pending', percent: 0 },
-              {
-                id: 'gemini',
-                name: isOfflineMode ? 'Offline Multimodal AI' : 'Gemini Multimodal AI',
-                desc: isOfflineMode ? 'Local emotion & arc engine' : 'Viral moment detection',
-                status: 'pending',
-                percent: 0,
-              },
-              { id: 'ready', name: 'Sync & Ready', desc: 'Generating clips', status: 'pending', percent: 0 }
-            ]).map((st, idx) => {
-              const isDone = st.status === 'done';
-              const isRunning = st.status === 'running';
-              const isFailed = st.status === 'failed';
-              const isActionRequired = st.status === 'action_required' || (isAwaitingApiKey && st.id === 'gemini');
-
-              return (
-                <div
-                  key={st.id || idx}
-                  className={`p-3 rounded-2xl border text-center transition flex flex-col items-center justify-between gap-1.5 overflow-visible ${
-                    isDone
-                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                      : isActionRequired
-                      ? 'bg-amber-500/15 border-amber-500/50 text-amber-400 ring-2 ring-amber-500/30 animate-pulse'
-                      : isRunning
-                      ? 'bg-[var(--accent-primary)]/10 border-[var(--accent-primary)] text-[var(--text-primary)] ring-1 ring-[var(--accent-primary)]/30'
-                      : isFailed
-                      ? 'bg-red-500/10 border-red-500/30 text-red-400'
-                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] opacity-75'
-                  }`}
-                >
-                  <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-black shrink-0">
-                    {isDone ? (
-                      <CheckCircle2 className="w-5 h-5 text-emerald-400" />
-                    ) : isActionRequired ? (
-                      <Key className="w-4 h-4 text-amber-400" />
-                    ) : isRunning ? (
-                      <RefreshCw className="w-4 h-4 text-[var(--accent-primary)] animate-spin" />
-                    ) : isFailed ? (
-                      <AlertCircle className="w-5 h-5 text-red-400" />
-                    ) : (
-                      <span className="text-xs font-mono">{idx + 1}</span>
-                    )}
-                  </div>
-
-                  <div className="w-full min-w-0 text-center">
-                    <span className="block text-[11px] font-bold text-[var(--text-primary)] leading-snug">
-                      {st.name}
-                    </span>
-                    <span className="block text-[9px] text-[var(--text-secondary)] leading-tight mt-0.5 line-clamp-2">
-                      {isActionRequired ? 'Key Required' : st.desc}
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Interactive Gemini API Key Recovery Card */}
-          {isAwaitingApiKey && (
-            <div className="p-6 rounded-2xl bg-amber-500/10 border border-amber-500/40 space-y-4 animate-fadeIn">
-              <div className="flex items-start gap-3">
-                <div className="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <Key className="w-5 h-5" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <h3 className="font-bold text-sm text-[var(--text-primary)]">
-                      {progress?.api_key_reason === 'invalid'
-                        ? 'Gemini API Key Not Recognized'
-                        : 'Gemini API Key Needed for AI Highlights'}
-                    </h3>
-                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-500 border border-amber-500/30">
-                        Action Required
-                      </span>
-                    </div>
-                    <p className="text-xs text-[var(--text-secondary)] mt-1 leading-relaxed">
-                      Stages 1–3 (Media Prep, Audio Extraction, Whisper VAD) completed successfully and are safely cached. 
-                      Provide a valid Google Gemini API key to run AI moment detection, or complete immediately in 100% Offline Mode.
-                    </p>
-                    {progress?.api_key_message && (
-                      <p className="text-xs font-mono text-amber-500 mt-1.5 bg-amber-500/10 p-2 rounded-lg border border-amber-500/25">
-                        {progress.api_key_message}
-                      </p>
-                    )}
-                  </div>
-                </div>
-
-                {/* Key Input Form */}
-                <form onSubmit={handleProvideKey} className="space-y-3 pt-1">
-                  <div className="relative">
-                    <input
-                      type={showApiKey ? 'text' : 'password'}
-                      value={apiKeyInput}
-                      onChange={(e) => {
-                        setApiKeyInput(e.target.value);
-                        if (keyError) setKeyError(null);
-                      }}
-                      placeholder="Paste AI Studio API key (AIzaSy...)"
-                      className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] focus:border-amber-500 rounded-xl px-4 py-2.5 text-xs text-[var(--text-primary)] placeholder-[var(--text-secondary)] pr-10 outline-none transition font-mono"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowApiKey(!showApiKey)}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-                    >
-                      {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                    </button>
-                  </div>
-
-                {keyError && (
-                  <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 p-2.5 rounded-xl border border-red-500/20">
-                    <AlertCircle className="w-4 h-4 flex-shrink-0" />
-                    <span>{keyError}</span>
-                  </div>
-                )}
-
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-1">
-                  <a
-                    href="https://aistudio.google.com/apikey"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-[11px] text-amber-400 hover:text-amber-300 underline underline-offset-2 flex items-center gap-1"
-                  >
-                    <span>Get free API Key from Google AI Studio</span>
-                    <ArrowRight className="w-3 h-3" />
-                  </a>
-
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleContinueOffline}
-                      disabled={isRetryingOffline || isProvidingKey}
-                      className="px-4 py-2 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] hover:bg-[var(--bg-input)] text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition flex items-center gap-1.5 disabled:opacity-50"
-                      title="Extract clips using local acoustic energy + Whisper without Gemini"
-                    >
-                      <Cpu className="w-3.5 h-3.5 text-amber-400" />
-                      <span>{isRetryingOffline ? 'Switching...' : 'Continue in 100% Offline Mode'}</span>
-                    </button>
-
-                    <button
-                      type="submit"
-                      disabled={isProvidingKey || !apiKeyInput.trim()}
-                      className="px-5 py-2 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 text-black font-black text-xs shadow-md shadow-amber-500/20 transition flex items-center gap-1.5 disabled:opacity-50"
-                    >
-                      <Sparkles className={`w-3.5 h-3.5 ${isProvidingKey ? 'animate-spin' : ''}`} />
-                      <span>{isProvidingKey ? 'Verifying...' : 'Verify Key & Resume Gemini AI'}</span>
-                    </button>
-                  </div>
-                </div>
-              </form>
-            </div>
-          )}
-
-          {/* Completion CTA Actions */}
-          {isFinished && (
-            <div className="p-5 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex flex-col sm:flex-row items-center justify-between gap-4 animate-fadeIn">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center flex-shrink-0">
-                  <Sparkles className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-bold text-sm text-[var(--text-primary)]">
-                    Viral Moments Successfully Extracted!
-                  </h3>
-                  <p className="text-xs text-[var(--text-secondary)]">
-                    {progress?.clips_count || 'Multiple'} clips ready with word-level karaoke captions.
-                  </p>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)] cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={autoOpenEditor}
-                    onChange={(e) => setAutoOpenEditor(e.target.checked)}
-                    className="rounded bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--accent-primary)] focus:ring-0"
-                  />
-                  <span>Auto-open {autoOpenCountdown !== null ? `(${autoOpenCountdown}s)` : ''}</span>
-                </label>
-
-                <button
-                  type="button"
-                  onClick={() => onOpenEditor(projectId)}
-                  className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-[#F97316] to-[#F59E0B] text-black font-black text-xs shadow-lg shadow-[rgba(245,158,11,0.25)] hover:scale-105 active:scale-95 transition-all flex items-center gap-2"
-                >
-                  <span>Open Clips in Studio Editor</span>
-                  <ArrowRight className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Error Details & Retry */}
-          {isError && (
-            <div className="p-4 rounded-2xl bg-red-500/10 border border-red-500/30 space-y-3 animate-fadeIn">
-              <div className="flex items-center gap-2 text-red-400 text-xs font-bold">
-                <AlertCircle className="w-4 h-4" />
-                <span>Processing Encountered an Error</span>
-              </div>
-              <div className="p-3 bg-[var(--bg-input)] rounded-xl font-mono text-[11px] text-red-500 overflow-x-auto max-h-32">
-                {progress?.error_detail || 'Unknown pipeline exception.'}
-              </div>
-              <div className="flex flex-wrap justify-end gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={onBackToHome}
-                  className="px-4 py-2 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
-                >
-                  Back to Home
-                </button>
-                <button
-                  type="button"
-                  onClick={handleContinueOffline}
-                  disabled={isRetryingOffline}
-                  className="px-4 py-2 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs font-semibold text-amber-500 hover:text-amber-400 hover:bg-[var(--bg-input)] transition flex items-center gap-1.5 disabled:opacity-50"
-                  title="Complete remaining stages offline"
-                >
-                  <Cpu className="w-3.5 h-3.5 text-amber-400" />
-                  <span>{isRetryingOffline ? 'Resuming...' : 'Complete in Offline Mode'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleRetryJob}
-                  disabled={isRetrying}
-                  className="px-4 py-2 rounded-xl bg-red-600 hover:bg-red-500 text-white text-xs font-bold transition flex items-center gap-1.5 disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isRetrying ? 'animate-spin' : ''}`} />
-                  {isRetrying ? 'Resuming...' : 'Retry Job'}
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Multi-Video Batch Queue */}
-          {batchItems.length > 0 && (
-            <div className="border border-[var(--border-subtle)] rounded-2xl p-4 bg-[var(--bg-card)] space-y-2.5">
-              <div className="flex items-center justify-between text-xs font-bold text-[var(--text-primary)]">
-                <span className="flex items-center gap-2">
-                  <Layers className="w-4 h-4 text-[var(--accent-primary)]" />
-                  Sequential Multi-Video Batch Queue ({batchItems.length})
-                </span>
-                <span className="text-[10px] font-mono text-[var(--text-secondary)]">
-                  Auto-executes sequentially
-                </span>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-36 overflow-y-auto">
-                {batchItems.map((b) => (
-                  <div
-                    key={b.project_id}
-                    className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs"
-                  >
-                    <span className="font-semibold text-[var(--text-primary)] truncate">{b.title}</span>
-                    <span
-                      className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-full shrink-0 ${
-                        b.status === 'completed'
-                          ? 'bg-emerald-500/15 text-emerald-400'
-                          : b.status === 'processing'
-                          ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)]'
-                          : b.status === 'error'
-                          ? 'bg-red-500/15 text-red-400'
-                          : 'bg-[var(--bg-card)] text-[var(--text-secondary)]'
-                      }`}
-                    >
-                      {b.status}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Live Console Logs Accordion */}
-          <div className="border border-[var(--border-subtle)] rounded-2xl overflow-hidden bg-[var(--bg-card)]">
-            <div className="px-4 py-2.5 bg-[var(--bg-input)] border-b border-[var(--border-subtle)]/60 flex flex-wrap items-center justify-between gap-2 text-xs">
-              <button
-                type="button"
-                onClick={() => setIsLogsExpanded(!isLogsExpanded)}
-                className="flex flex-wrap items-center gap-2 font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition"
-              >
-                <Terminal className="w-4 h-4 text-[var(--accent-primary)] shrink-0" />
-                <span className="text-[var(--text-primary)]">Live Studio Terminal Console</span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--text-secondary)] tabular-nums">
-                  {progress?.logs?.length || 0} events
-                </span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-500/10 border border-sky-500/30 text-sky-400 font-bold">
-                  {progress?.whisper_badge || 'GPU / CPU'}
-                </span>
-                <span
-                  className={`text-[10px] font-mono px-2 py-0.5 rounded border font-bold ${
-                    isOfflineMode
-                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                      : 'bg-[var(--accent-subtle)] border-[var(--accent-primary)]/35 text-[var(--accent-primary)]'
-                  }`}
-                >
-                  Mode: {isOfflineMode ? 'Offline AI' : progress?.ai_provider === 'ollama' ? 'Ollama' : 'Gemini'}
-                </span>
-                {isLogsExpanded ? <ChevronUp className="w-3.5 h-3.5 ml-0.5" /> : <ChevronDown className="w-3.5 h-3.5 ml-0.5" />}
-              </button>
-
-              <div className="flex items-center gap-1.5 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setAutoScrollLogs((v) => !v)}
-                  className={`px-2 py-1 rounded-lg border text-[10px] font-bold transition ${
-                    autoScrollLogs
-                      ? 'bg-emerald-500/15 border-emerald-500/35 text-emerald-400'
-                      : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
-                  }`}
-                  title="Toggle automatic scrolling to latest log line"
-                >
-                  Auto-Scroll: {autoScrollLogs ? 'ON' : 'OFF'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleCopyLogs}
-                  className="px-2 py-1 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] text-[10px] font-bold flex items-center gap-1 transition"
-                  title="Copy full terminal output"
-                >
-                  {copiedLogs ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                  <span>{copiedLogs ? 'Copied' : 'Copy Logs'}</span>
-                </button>
-                {!isFinished && !isError && !isCancelled && (
-                  <button
-                    type="button"
-                    onClick={handleCancelJob}
-                    disabled={isCancelling}
-                    className="px-2 py-1 rounded-lg bg-red-500/15 border border-red-500/35 hover:bg-red-500/25 text-red-400 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50"
-                    title="Abort current pipeline job"
-                  >
-                    <XCircle className="w-3 h-3" />
-                    <span>{isCancelling ? 'Aborting...' : 'Cancel Job'}</span>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {isLogsExpanded && (
-              <div className="px-4 pt-3.5 pb-3 font-mono text-[11px] max-h-52 overflow-y-auto space-y-2 bg-[var(--bg-input)] text-[var(--text-primary)]">
-                {(progress?.logs || []).map((l, i) => (
-                  <div key={i} className="flex items-start gap-2 leading-relaxed">
-                    <span className="text-[var(--text-secondary)] flex-shrink-0 tabular-nums">
-                      {new Date(l.timestamp).toLocaleTimeString()}
-                    </span>
-                    <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded flex-shrink-0 ${
-                      l.level === 'SUCCESS'
-                        ? 'bg-emerald-500/20 text-emerald-400'
-                        : l.level === 'ERROR'
-                        ? 'bg-red-500/20 text-red-400'
-                        : l.level === 'WARN'
-                        ? 'bg-amber-500/20 text-amber-400'
-                        : 'bg-[var(--bg-card)] text-[var(--text-secondary)] border border-[var(--border-subtle)]'
-                    }`}>
-                      {l.stage}
-                    </span>
-                    <span className="text-[var(--text-primary)] break-words min-w-0">{l.message}</span>
-                  </div>
-                ))}
-                <div ref={logsEndRef} />
-              </div>
-            )}
-          </div>
-
-          {/* Bottom Actions */}
-          <div className="flex items-center justify-between pt-2">
             <button
               type="button"
               onClick={onBackToHome}
-              className="text-xs text-[var(--text-secondary)] hover:text-[var(--text-primary)] font-semibold transition flex items-center gap-1.5"
+              className="px-5 py-3 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-extrabold text-xs tracking-wide flex items-center gap-2 hover:brightness-110 transition-all shadow-md"
             >
-              ← Back to Ingestion Home
+              <Play className="w-4 h-4 fill-current" />
+              Start New Ingestion
             </button>
-
-            {!isFinished && !isError && !isCancelled && (
-              <button
-                type="button"
-                onClick={handleCancelJob}
-                disabled={isCancelling}
-                className="px-4 py-2 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition disabled:opacity-50"
-              >
-                {isCancelling ? 'Aborting...' : 'Cancel Job'}
-              </button>
-            )}
           </div>
 
+          {/* Queued Multi-Video Batch Jobs */}
+          {queuedJobs.length > 0 && (
+            <section className="space-y-2.5">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-[var(--text-primary)] flex items-center gap-2">
+                <Layers className="w-4 h-4 text-[var(--accent-primary)]" />
+                Queued Batch Jobs ({queuedJobs.length})
+              </h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {queuedJobs.map((qj) => (
+                  <div
+                    key={qj.project_id}
+                    className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4 flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0">
+                      <h3 className="text-sm font-bold text-[var(--text-primary)] truncate">{qj.title}</h3>
+                      <p className="text-xs text-[var(--text-muted)] truncate">
+                        {qj.filename || 'Queued upload'} · Waiting for active worker slot
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setInspectingHistorical(true);
+                        setSelectedJobId(qj.project_id);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-[var(--bg-card)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--text-primary)] hover:bg-[var(--bg-hover)] shrink-0"
+                    >
+                      Inspect
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
+          {/* Recent Runs History */}
+          <section className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xs font-bold uppercase tracking-wider text-[var(--text-primary)] flex items-center gap-2">
+                <History className="w-4 h-4 text-[var(--accent-primary)]" />
+                Recent Runs History ({recentJobs.length})
+              </h2>
+              <button
+                type="button"
+                onClick={fetchJobsSummary}
+                className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--text-muted)] hover:text-[var(--text-primary)]"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Refresh
+              </button>
+            </div>
+
+            {loadingJobs ? (
+              <div className="space-y-2.5">
+                {[1, 2, 3].map((i) => (
+                  <div key={i} className="h-20 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] animate-pulse" />
+                ))}
+              </div>
+            ) : recentJobs.length === 0 ? (
+              <div className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-10 text-center space-y-3">
+                <FolderOpen className="w-9 h-9 mx-auto text-[var(--text-muted)] opacity-60" />
+                <div className="space-y-1">
+                  <p className="text-sm font-bold text-[var(--text-primary)]">No pipeline runs recorded yet</p>
+                  <p className="text-xs text-[var(--text-muted)]">
+                    Import a local video or YouTube URL from Home Ingestion to track live Whisper + Vision + AI extraction.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={onBackToHome}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold"
+                >
+                  Start New Ingestion
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {recentJobs.map((rj) => {
+                  const isOk = rj.status === 'finished' || rj.status === 'analyzed';
+                  const isErr = rj.status === 'error' || rj.status === 'failed' || rj.status === 'cancelled';
+                  const isOff = rj.ai_mode === 'offline';
+
+                  return (
+                    <div
+                      key={rj.project_id}
+                      className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4 flex flex-wrap items-center justify-between gap-4 hover:border-[var(--accent-primary)]/40 transition-colors"
+                    >
+                      <div className="flex items-center gap-3.5 min-w-0 flex-1">
+                        <div
+                          className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border ${
+                            isOk
+                              ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                              : isErr
+                                ? 'bg-rose-500/10 border-rose-500/30 text-rose-400'
+                                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-muted)]'
+                          }`}
+                        >
+                          {isOk ? (
+                            <CheckCircle2 className="w-5 h-5" />
+                          ) : isErr ? (
+                            <XCircle className="w-5 h-5" />
+                          ) : (
+                            <FileVideo className="w-5 h-5" />
+                          )}
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="text-sm font-bold text-[var(--text-primary)] truncate max-w-md">
+                              {rj.title}
+                            </h3>
+                            <span
+                              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                                isOff
+                                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                                  : 'bg-indigo-500/10 text-indigo-300 border-indigo-500/30'
+                              }`}
+                            >
+                              {isOff ? <WifiOff className="w-2.5 h-2.5" /> : <Sparkles className="w-2.5 h-2.5" />}
+                              {isOff ? 'Offline AI' : 'Gemini'}
+                            </span>
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase ${
+                                isOk
+                                  ? 'bg-emerald-500/15 text-emerald-400'
+                                  : isErr
+                                    ? 'bg-rose-500/15 text-rose-400'
+                                    : 'bg-[var(--bg-card)] text-[var(--text-muted)]'
+                              }`}
+                            >
+                              {isOk ? 'Completed' : rj.status}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-3 text-[11px] text-[var(--text-muted)] mt-1">
+                            <span className="truncate max-w-[200px]">{rj.filename || rj.source_filename || 'Source video'}</span>
+                            {rj.file_size_formatted && <span>· {rj.file_size_formatted}</span>}
+                            {(rj.duration_sec ?? 0) > 0 && <span>· {formatClock(rj.duration_sec || 0)} video</span>}
+                            <span>· {rj.clips_count ?? 0} clips</span>
+                            {(rj.elapsed_sec ?? rj.elapsed_seconds ?? 0) > 0 && (
+                              <span>· Ran {formatClock(rj.elapsed_sec ?? rj.elapsed_seconds ?? 0)}</span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setInspectingHistorical(true);
+                            setSelectedJobId(rj.project_id);
+                          }}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] transition-colors"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          View Logs
+                        </button>
+
+                        {isErr && (
+                          <button
+                            type="button"
+                            disabled={retrying}
+                            onClick={() => handleRetryJob(rj.project_id, false)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-xs font-bold text-amber-300 transition-colors"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            Retry Failed Job
+                          </button>
+                        )}
+
+                        {(isOk || (rj.clips_count ?? 0) > 0) && (
+                          <button
+                            type="button"
+                            onClick={() => onOpenEditor(rj.project_id)}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold hover:brightness-110 transition-all"
+                          >
+                            Open Clips
+                            <ArrowRight className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </div>
+      </div>
+    );
+  }
+
+  // =========================================================================
+  // ACTIVE JOB MISSION CONTROL (Single Cancel Button, 4 Telemetry Counters,
+  // Interactive 5-Stage Stepper + Step Durations, 240px Console Open by Default)
+  // =========================================================================
+  const progressPct = job?.progress_pct ?? job?.percent ?? 0;
+  const hwLabel = job?.hardware_label || job?.hardware_badge || 'CPU Multi-Core';
+  const isOfflineEngine = job?.ai_mode === 'offline' || job?.ai_provider === 'offline';
+  const engineLabel = isOfflineEngine ? 'Offline Multimodal AI' : 'Gemini Multimodal AI';
+  const metrics = job?.live_metrics || {
+    words_transcribed: 0,
+    keyframes_scanned: 0,
+    keyframes_total: 0,
+    highlights_detected: job?.clips_count || 0,
+  };
+  const stages: PipelineStage[] = job?.stages || [];
+
+  return (
+    <div className="h-full overflow-y-auto px-5 py-5 lg:px-8">
+      <div className="max-w-6xl mx-auto space-y-5">
+        {/* Top Breadcrumb Navigation */}
+        <div className="flex items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={() => {
+              setInspectingHistorical(true);
+              setSelectedJobId(null);
+            }}
+            className="inline-flex items-center gap-1.5 text-xs font-bold text-[var(--text-secondary)] hover:text-[var(--accent-primary)] transition-colors"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            All Pipeline Runs
+          </button>
+
+          <button
+            type="button"
+            onClick={onBackToHome}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-[var(--text-secondary)] transition-colors"
+          >
+            + New Ingestion
+          </button>
+        </div>
+
+        {/* 1. RICH JOB HEADER CARD (Single Cancel Button in top-right) */}
+        <section className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-5 space-y-4 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="flex items-start gap-4 min-w-0 flex-1">
+              <div className="w-16 h-12 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] flex items-center justify-center shrink-0">
+                {isRunningStatus ? (
+                  <Loader2 className="w-6 h-6 animate-spin text-[var(--accent-primary)]" />
+                ) : isFinishedStatus ? (
+                  <CheckCircle2 className="w-6 h-6 text-emerald-400" />
+                ) : isFailedOrCancelled ? (
+                  <AlertCircle className="w-6 h-6 text-rose-400" />
+                ) : (
+                  <Film className="w-6 h-6 text-[var(--accent-primary)]" />
+                )}
+              </div>
+
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h1 className="text-lg lg:text-xl font-extrabold text-[var(--text-primary)] truncate">
+                    {job?.title || `Processing Project #${selectedJobId}`}
+                  </h1>
+                </div>
+
+                {/* File metadata + ONE Hardware badge + ONE Engine badge */}
+                <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--text-muted)]">
+                  <span className="truncate max-w-xs font-medium text-[var(--text-secondary)]">
+                    {job?.filename || job?.source_filename || 'Source video'}
+                  </span>
+                  {job?.file_size_formatted && <span>· {job.file_size_formatted}</span>}
+                  {(job?.duration_sec ?? 0) > 0 && <span>· {formatClock(job?.duration_sec || 0)}</span>}
+
+                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-[var(--bg-card)] border border-[var(--border-subtle)] text-[var(--text-primary)]">
+                    <Cpu className="w-3 h-3 text-[var(--accent-primary)]" />
+                    {hwLabel}
+                  </span>
+
+                  <span
+                    className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                      isOfflineEngine
+                        ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                        : 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                    }`}
+                  >
+                    {isOfflineEngine ? <WifiOff className="w-3 h-3" /> : <Sparkles className="w-3 h-3" />}
+                    {engineLabel}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Right-aligned Server-Synced Elapsed Timer + ONLY Cancel Job Button */}
+            <div className="flex items-center gap-3 shrink-0">
+              <div className="px-3.5 py-2 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] text-right">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] flex items-center justify-end gap-1">
+                  <Clock className="w-3 h-3" />
+                  Elapsed
+                </div>
+                <div className="text-sm font-mono font-extrabold text-[var(--text-primary)]">
+                  {formatClock(liveElapsedSec)}
+                </div>
+              </div>
+
+              {(isRunningStatus || isAwaitingKey) && (
+                <button
+                  type="button"
+                  disabled={cancelling}
+                  onClick={handleCancelJob}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/40 text-xs font-bold text-rose-300 transition-colors disabled:opacity-50"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  {cancelling ? 'Stopping...' : 'Cancel Job'}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Primary Progress Bar */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-bold text-[var(--text-primary)]">
+                {job?.stage_label || 'Initializing pipeline...'}
+              </span>
+              <span className="font-mono font-extrabold text-[var(--accent-primary)]">{progressPct}%</span>
+            </div>
+            <div className="h-2.5 w-full rounded-full bg-[var(--bg-input)] border border-[var(--border-subtle)] overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ${
+                  isFailedOrCancelled
+                    ? 'bg-rose-500'
+                    : isFinishedStatus
+                      ? 'bg-emerald-500'
+                      : 'bg-[var(--accent-primary)]'
+                }`}
+                style={{ width: `${Math.max(2, Math.min(100, progressPct))}%` }}
+              />
+            </div>
+          </div>
+        </section>
+
+        {/* Completion Auto-Transition Banner */}
+        {isFinishedStatus && (
+          <div className="rounded-2xl bg-emerald-500/15 border border-emerald-500/40 p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-sm font-extrabold text-emerald-300">
+              <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+              <span>
+                {wasObservedRunningRef.current
+                  ? '✓ Ready — Opening Studio Editor...'
+                  : `✓ Pipeline Completed — ${job?.clips_count ?? metrics.highlights_detected} viral clips ready in Studio Editor`}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => onOpenEditor(selectedJobId)}
+              className="px-4 py-2 rounded-xl bg-emerald-500 text-slate-950 font-extrabold text-xs hover:brightness-110 flex items-center gap-1.5"
+            >
+              Open Studio Editor
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* API Key Pause Recovery Card */}
+        {isAwaitingKey && (
+          <div className="rounded-2xl bg-amber-500/10 border border-amber-500/40 p-4 space-y-3">
+            <div className="flex items-start gap-2.5">
+              <KeyRound className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <h2 className="text-sm font-extrabold text-amber-300">
+                  Gemini API Key Required to Continue Stage 4
+                </h2>
+                <p className="text-xs text-[var(--text-secondary)]">
+                  {job?.api_key_message ||
+                    'Speech transcription & checkpoints are already saved. Paste a valid Gemini API key to continue with Cloud AI, or complete locally in Offline Multimodal AI Mode.'}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="password"
+                value={inlineKey}
+                onChange={(e) => setInlineKey(e.target.value)}
+                placeholder="Paste Google Gemini API key (AIza...)"
+                className="flex-1 min-w-[240px] px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs text-[var(--text-primary)]"
+              />
+              <button
+                type="button"
+                disabled={submittingKey || !inlineKey.trim()}
+                onClick={handleSubmitResumeKey}
+                className="px-4 py-2 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold disabled:opacity-50"
+              >
+                {submittingKey ? 'Verifying...' : 'Save Key & Resume'}
+              </button>
+              <button
+                type="button"
+                disabled={retrying}
+                onClick={() => handleRetryJob(selectedJobId, true)}
+                className="px-4 py-2 rounded-xl bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-emerald-400"
+              >
+                Complete in Offline Mode
+              </button>
+            </div>
+            {keyError && <p className="text-xs text-rose-400">{keyError}</p>}
+          </div>
+        )}
+
+        {/* Failed / Cancelled Recovery Banner (No duplicate Cancel button!) */}
+        {isFailedOrCancelled && (
+          <div className="rounded-2xl bg-rose-500/10 border border-rose-500/35 p-4 flex flex-wrap items-center justify-between gap-4">
+            <div className="space-y-1 min-w-0 flex-1">
+              <h2 className="text-sm font-extrabold text-rose-300 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                {job?.status === 'cancelled' ? 'Job Cancelled' : 'Pipeline Interrupted or Failed'}
+              </h2>
+              <p className="text-xs text-[var(--text-secondary)] break-words">
+                {job?.error_detail || 'Checkpoints up to the last completed stage are preserved on disk.'}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                disabled={retrying}
+                onClick={() => handleRetryJob(selectedJobId, false)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold hover:brightness-110 disabled:opacity-50"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Retry From Checkpoint
+              </button>
+              <button
+                type="button"
+                disabled={retrying}
+                onClick={() => handleRetryJob(selectedJobId, true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[var(--bg-card)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-xs font-bold text-emerald-400"
+              >
+                <WifiOff className="w-3.5 h-3.5" />
+                Complete in Offline Mode
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* 2. FOUR LIVE TELEMETRY COUNTERS */}
+        <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+              Words Transcribed
+            </div>
+            <div className="text-xl font-mono font-extrabold text-[var(--text-primary)] mt-1">
+              {(metrics.words_transcribed || 0).toLocaleString()}
+            </div>
+            <div className="text-[11px] text-[var(--text-muted)] mt-0.5">faster-whisper VAD</div>
+          </div>
+
+          <div className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+              Keyframes Scanned
+            </div>
+            <div className="text-xl font-mono font-extrabold text-[var(--text-primary)] mt-1">
+              {metrics.keyframes_total > 0
+                ? `${metrics.keyframes_scanned.toLocaleString()} / ${metrics.keyframes_total.toLocaleString()}`
+                : (metrics.keyframes_scanned || 0).toLocaleString()}
+            </div>
+            <div className="text-[11px] text-[var(--text-muted)] mt-0.5">Sequential vision pass</div>
+          </div>
+
+          <div className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+              Highlights Detected
+            </div>
+            <div className="text-xl font-mono font-extrabold text-[var(--accent-primary)] mt-1">
+              {Math.max(metrics.highlights_detected || 0, job?.clips_count || 0)}
+            </div>
+            <div className="text-[11px] text-[var(--text-muted)] mt-0.5">Viral segments scored</div>
+          </div>
+
+          <div className="rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-[var(--text-muted)]">
+              Est. Time Remaining
+            </div>
+            <div className="text-xl font-mono font-extrabold text-[var(--text-primary)] mt-1">
+              {isFinishedStatus
+                ? 'Done'
+                : isFailedOrCancelled
+                  ? 'Stopped'
+                  : (job?.eta_seconds ?? 0) > 0
+                    ? formatClock(job?.eta_seconds || 0)
+                    : '—'}
+            </div>
+            <div className="text-[11px] text-[var(--text-muted)] mt-0.5">
+              {isRunningStatus ? 'Live stage ETA' : 'Execution complete'}
+            </div>
+          </div>
+        </section>
+
+        {/* 3. INTERACTIVE 5-STAGE STEPPER (Click stage to filter logs + step duration badges) */}
+        <section className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-4 space-y-3">
+          <div className="flex items-center justify-between text-xs">
+            <span className="font-bold uppercase tracking-wider text-[var(--text-primary)]">
+              5-Stage Pipeline Stepper
+            </span>
+            <span className="text-[11px] text-[var(--text-muted)]">
+              Click any stage card to filter terminal logs below
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+            {stages.map((st, idx) => {
+              const filterId = (st.id as StageFilterKey) || 'ALL';
+              const isSelectedFilter = stageFilter === filterId;
+              const stepDur = formatStepDuration(st.duration_sec);
+
+              return (
+                <button
+                  key={st.id || idx}
+                  type="button"
+                  onClick={() => setStageFilter((prev) => (prev === filterId ? 'ALL' : filterId))}
+                  className={`p-3 rounded-xl border text-left transition-all flex flex-col justify-between gap-2 ${
+                    isSelectedFilter
+                      ? 'bg-[var(--accent-soft)] border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]/40'
+                      : st.status === 'running'
+                        ? 'bg-[var(--bg-card)] border-[var(--accent-primary)]/70'
+                        : st.status === 'done'
+                          ? 'bg-[var(--bg-card)] border-emerald-500/35 hover:border-emerald-400/70'
+                          : st.status === 'failed'
+                            ? 'bg-rose-500/10 border-rose-500/40'
+                            : 'bg-[var(--bg-card)]/60 border-[var(--border-subtle)] opacity-80 hover:opacity-100'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-1.5">
+                    <span className="text-[10px] font-mono font-bold text-[var(--text-muted)]">
+                      0{idx + 1}
+                    </span>
+
+                    <div className="flex items-center gap-1.5">
+                      {stepDur && st.status === 'done' && (
+                        <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 font-mono text-[10px] font-bold">
+                          {stepDur}
+                        </span>
+                      )}
+                      {st.status === 'done' ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      ) : st.status === 'running' ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-[var(--accent-primary)] shrink-0" />
+                      ) : st.status === 'failed' ? (
+                        <XCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                      ) : (
+                        <span className="w-2.5 h-2.5 rounded-full bg-[var(--border-subtle)] shrink-0" />
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="text-xs font-bold text-[var(--text-primary)] truncate">{st.name}</div>
+                    <div className="text-[10px] text-[var(--text-muted)] line-clamp-2 mt-0.5">{st.desc}</div>
+                  </div>
+
+                  {st.status === 'running' && (
+                    <div className="text-[10px] font-mono font-bold text-[var(--accent-primary)]">
+                      Active · {st.percent}%
+                    </div>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+
+        {/* 4. EXPANDED LIVE TERMINAL CONSOLE (h-[240px] OPEN BY DEFAULT) */}
+        <section className="rounded-2xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] overflow-hidden shadow-sm">
+          {/* Console Toolbar (NO Cancel button here!) */}
+          <div className="px-4 py-2.5 bg-[var(--bg-card)] border-b border-[var(--border-subtle)] flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-[var(--text-primary)] mr-1">
+                <Terminal className="w-4 h-4 text-[var(--accent-primary)]" />
+                Live Telemetry Console
+              </div>
+
+              {/* Filter by Stage Pills */}
+              <div className="flex flex-wrap items-center gap-1">
+                <Filter className="w-3 h-3 text-[var(--text-muted)] mr-0.5" />
+                {(
+                  [
+                    { key: 'ALL', label: 'All Stages' },
+                    { key: 'ingest', label: 'Ingest' },
+                    { key: 'audio', label: 'Audio' },
+                    { key: 'transcribe', label: 'Transcribe' },
+                    { key: 'gemini', label: 'AI / Vision' },
+                    { key: 'ready', label: 'Ready' },
+                  ] as Array<{ key: StageFilterKey; label: string }>
+                ).map((item) => (
+                  <button
+                    key={item.key}
+                    type="button"
+                    onClick={() => setStageFilter(item.key)}
+                    className={`px-2 py-0.5 rounded-md text-[10px] font-bold transition-colors ${
+                      stageFilter === item.key
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                        : 'bg-[var(--bg-input)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setAutoScroll((v) => !v)}
+                className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-colors ${
+                  autoScroll
+                    ? 'bg-[var(--accent-soft)] border-[var(--accent-primary)]/50 text-[var(--accent-primary)]'
+                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-muted)]'
+                }`}
+              >
+                Auto-Scroll: {autoScroll ? 'ON' : 'OFF'}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopyLogs}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[var(--bg-input)] hover:bg-[var(--bg-hover)] border border-[var(--border-subtle)] text-[11px] font-bold text-[var(--text-primary)] transition-colors"
+              >
+                {copiedLogs ? (
+                  <>
+                    <Check className="w-3 h-3 text-emerald-400" />
+                    Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3 h-3 text-[var(--accent-primary)]" />
+                    Copy Logs
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Monospace Scrolling Log Stream (h-[240px]) */}
+          <div
+            ref={logViewportRef}
+            className="h-[240px] overflow-y-auto p-3.5 font-mono text-[11px] leading-relaxed bg-[var(--bg-canvas)] space-y-1.5"
+          >
+            {filteredLogs.length === 0 ? (
+              <div className="h-full flex items-center justify-center text-[var(--text-muted)]">
+                {stageFilter === 'ALL'
+                  ? 'Waiting for telemetry events...'
+                  : `No log events recorded for stage filter '${stageFilter.toUpperCase()}'.`}
+              </div>
+            ) : (
+              filteredLogs.map((log, idx) => {
+                const lvlColor =
+                  log.level === 'ERROR'
+                    ? 'text-rose-400'
+                    : log.level === 'WARN'
+                      ? 'text-amber-300'
+                      : log.level === 'SUCCESS'
+                        ? 'text-emerald-400'
+                        : 'text-[var(--text-secondary)]';
+                const tag = (log.stage || 'INFO').toUpperCase();
+                const tagBadge =
+                  tag === 'OFFLINE AI'
+                    ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                    : tag === 'GEMINI'
+                      ? 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+                      : tag === 'ERROR'
+                        ? 'bg-rose-500/15 text-rose-400 border-rose-500/30'
+                        : 'bg-[var(--bg-surface)] text-[var(--accent-primary)] border-[var(--border-subtle)]';
+
+                return (
+                  <div key={idx} className="flex items-start gap-2 break-words">
+                    <span className="text-[var(--text-muted)] shrink-0 select-none">
+                      {formatTimestampShort(log.timestamp)}
+                    </span>
+                    <span className={`px-1.5 py-0 rounded border text-[10px] font-bold shrink-0 ${tagBadge}`}>
+                      [{tag}]
+                    </span>
+                    <span className={lvlColor}>{log.message}</span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </section>
       </div>
     </div>
   );

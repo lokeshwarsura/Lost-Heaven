@@ -495,14 +495,19 @@ def transcribe_audio_full(
             if on_progress and total_duration > 0:
                 pct = min(100, int((seg_end / total_duration) * 100))
                 if pct >= next_milestone or pct >= 99:
-                    on_progress(
-                        pct,
-                        f"Transcribed {_fmt_duration(seg_end)} / {_fmt_duration(total_duration)} ({pct}%)...",
-                    )
+                    msg_txt = f"Transcribed {_fmt_duration(seg_end)} / {_fmt_duration(total_duration)} ({pct}%)..."
+                    try:
+                        on_progress(pct, msg_txt, len(words_list))
+                    except TypeError:
+                        on_progress(pct, msg_txt)
                     while next_milestone <= pct:
                         next_milestone += 15
         if on_progress and total_duration > 0 and last_end > 0 and next_milestone <= 100:
-            on_progress(100, f"Transcribed {_fmt_duration(total_duration)} / {_fmt_duration(total_duration)} (100%)...")
+            msg_done = f"Transcribed {_fmt_duration(total_duration)} / {_fmt_duration(total_duration)} (100%)..."
+            try:
+                on_progress(100, msg_done, len(words_list))
+            except TypeError:
+                on_progress(100, msg_done)
 
     try:
         try:

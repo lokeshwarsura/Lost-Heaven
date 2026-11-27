@@ -502,7 +502,7 @@ export interface Project {
   resolution_w: number;
   resolution_h: number;
   fps: number;
-  status: 'created' | 'proxy_ready' | 'analyzing' | 'analyzed' | 'processing' | 'finished' | 'error';
+  status: 'created' | 'proxy_ready' | 'analyzing' | 'analyzed' | 'processing' | 'finished' | 'error' | 'cancelled';
   error_message?: string;
   default_aspect_ratio: string;
   duration_preset: string;
@@ -510,7 +510,10 @@ export interface Project {
   clip_length_target?: string;
   caption_language?: string;
   hardware_mode?: string;
+  default_framing?: string;
+  ai_mode?: 'gemini' | 'offline' | string;
   topic_focus?: string;
+  thumbnail_url?: string | null;
   created_at: string;
   disk_size_bytes?: number;
   disk_size_formatted?: string;
@@ -808,6 +811,9 @@ export interface PipelineStage {
   desc: string;
   status: 'pending' | 'running' | 'done' | 'failed' | 'action_required' | 'skipped';
   percent: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  duration_sec?: number | null;
 }
 
 export interface PipelineLog {
@@ -817,26 +823,52 @@ export interface PipelineLog {
   message: string;
 }
 
+export interface JobLiveMetrics {
+  words_transcribed: number;
+  keyframes_scanned: number;
+  keyframes_total: number;
+  highlights_detected: number;
+}
+
+export interface YouTubeMetadataInfo {
+  title: string;
+  thumbnail?: string | null;
+  duration: number;
+  width: number;
+  height: number;
+  resolution: string;
+  uploader?: string;
+  webpage_url: string;
+  filesize_approx?: number;
+}
+
 export interface JobProgress {
   project_id: number;
   title: string;
-  status: 'created' | 'processing' | 'finished' | 'analyzed' | 'error' | 'failed' | 'cancelled' | 'not_found' | 'awaiting_api_key';
+  status: 'created' | 'processing' | 'finished' | 'analyzed' | 'error' | 'failed' | 'cancelled' | 'not_found' | 'awaiting_api_key' | 'queued';
   api_key_reason?: 'missing' | 'invalid';
   api_key_message?: string;
   current_stage: string;
+  stage_index?: number;
   stage_label: string;
   percent: number;
+  progress_pct?: number;
   started_at?: string;
   active_started_at?: string;
   accumulated_seconds?: number;
   elapsed_seconds?: number;
+  elapsed_sec?: number;
   updated_at?: string;
   eta_seconds?: number;
   source_path?: string;
   source_filename?: string;
+  filename?: string;
   file_size_bytes?: number;
   file_size_formatted?: string;
+  file_size_mb?: number;
+  duration_sec?: number;
   hardware_badge?: string;
+  hardware_label?: string;
   whisper_badge?: string;
   ai_mode?: 'gemini' | 'offline' | 'needs_api_key_or_offline_choice' | string;
   ai_provider?: string;
@@ -846,10 +878,19 @@ export interface JobProgress {
   aspect_ratio?: string;
   clip_count?: number;
   caption_language?: string;
+  default_framing?: string;
   topic_focus?: string;
   hardware_mode?: string;
+  live_metrics?: JobLiveMetrics;
   stages: PipelineStage[];
   logs: PipelineLog[];
   error_detail?: string;
   clips_count?: number;
+}
+
+export interface JobsListResponse {
+  active_jobs: JobProgress[];
+  queued_jobs: JobProgress[];
+  recent_jobs: JobProgress[];
+  jobs: JobProgress[];
 }

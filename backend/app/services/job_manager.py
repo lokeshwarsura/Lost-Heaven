@@ -283,6 +283,48 @@ def _sync_stage_labels(
     return updated
 
 
+def _normalize_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure every job payload carries consistent telemetry, metrics, and UI-friendly mirrors."""
+    if not isinstance(job, dict):
+        return job
+    elapsed = _compute_elapsed_seconds(job)
+    job["elapsed_seconds"] = elapsed
+    job["elapsed_sec"] = elapsed
+    pct = int(max(0, min(100, int(job.get("percent") or 0))))
+    job["percent"] = pct
+    job["progress_pct"] = pct
+    hw_badge = str(job.get("hardware_badge") or job.get("hardware_label") or "CPU Multi-Core (libx264)")
+    job["hardware_badge"] = hw_badge
+    job["hardware_label"] = hw_badge
+    fname = str(job.get("source_filename") or job.get("filename") or os.path.basename(str(job.get("source_path") or "")) or "")
+    job["source_filename"] = fname
+    job["filename"] = fname
+    fbytes = int(job.get("file_size_bytes") or 0)
+    job["file_size_mb"] = round(fbytes / (1024 ** 2), 2) if fbytes > 0 else float(job.get("file_size_mb") or 0.0)
+    job["duration_sec"] = round(float(job.get("duration_sec") or 0.0), 2)
+    job["default_framing"] = str(job.get("default_framing") or "smart_auto")
+
+    lm = job.get("live_metrics")
+    if not isinstance(lm, dict):
+        lm = {}
+    job["live_metrics"] = {
+        "words_transcribed": int(lm.get("words_transcribed") or 0),
+        "keyframes_scanned": int(lm.get("keyframes_scanned") or 0),
+        "keyframes_total": int(lm.get("keyframes_total") or 0),
+        "highlights_detected": int(lm.get("highlights_detected") or job.get("clips_count") or 0),
+    }
+
+    stages = job.get("stages") or []
+    cur_stage = str(job.get("current_stage") or "ingest")
+    stage_ids = [str(s.get("id")) for s in stages if isinstance(s, dict)]
+    if cur_stage in stage_ids:
+        job["stage_index"] = stage_ids.index(cur_stage)
+    else:
+        default_ids = [s["id"] for s in STAGES_CONFIG]
+        job["stage_index"] = default_ids.index(cur_stage) if cur_stage in default_ids else 0
+    return job
+
+
 STAGES_CONFIG = _build_dynamic_stages(needs_proxy=False, ai_mode="gemini", ai_provider="gemini")
 
 class JobManager:
@@ -347,6 +389,7 @@ class JobManager:
         topic_focus: Optional[str] = None,
         hardware_mode: str = "gpu",
         ai_mode: Optional[str] = None,
+        default_framing: str = "smart_auto",
     ) -> Dict[str, Any]:
         with self._lock:
             cancel_event = threading.Event()
@@ -388,6 +431,7 @@ class JobManager:
             gem_analysis_mode = str(persisted.get("gemini_analysis_mode") or settings.GEMINI_ANALYSIS_MODE or "transcript")
             needs_proxy = (resolved_mode == "gemini" and ai_provider == "gemini" and gem_analysis_mode == "multimodal")
 
+            now_iso = utc_now_iso()
             dyn_stages = _build_dynamic_stages(
                 needs_proxy=needs_proxy,
                 ai_mode=resolved_mode,
@@ -399,12 +443,14 @@ class JobManager:
                     "name": s["name"],
                     "desc": s["desc"],
                     "status": "running" if i == 0 else "pending",
-                    "percent": 0
+                    "percent": 0,
+                    "started_at": now_iso if i == 0 else None,
+                    "completed_at": None,
+                    "duration_sec": None,
                 }
                 for i, s in enumerate(dyn_stages)
             ]
 
-            now_iso = utc_now_iso()
             job_state = {
                 "project_id": project_id,
                 "title": title,
@@ -422,7 +468,10 @@ class JobManager:
                 "source_filename": source_filename or os.path.basename(source_path),
                 "file_size_bytes": file_size,
                 "file_size_formatted": format_size(file_size),
+                "file_size_mb": round(file_size / (1024 ** 2), 2),
+                "duration_sec": 0.0,
                 "hardware_badge": hw_badge,
+                "hardware_label": hw_badge,
                 "whisper_badge": whisper_badge,
                 "ai_mode": resolved_mode,
                 "ai_provider": ai_provider,
@@ -432,8 +481,15 @@ class JobManager:
                 "aspect_ratio": aspect_ratio,
                 "clip_count": clip_count,
                 "caption_language": caption_language,
+                "default_framing": default_framing or "smart_auto",
                 "topic_focus": topic_focus,
                 "hardware_mode": hardware_mode,
+                "live_metrics": {
+                    "words_transcribed": 0,
+                    "keyframes_scanned": 0,
+                    "keyframes_total": 0,
+                    "highlights_detected": 0,
+                },
                 "stages": stages,
                 "logs": [
                     {
@@ -446,6 +502,7 @@ class JobManager:
                 "error_detail": None,
                 "clips_count": 0
             }
+            _normalize_job_payload(job_state)
 
             self._jobs[project_id] = job_state
             self._save_project_json(project_id, job_state)
@@ -461,6 +518,8 @@ class JobManager:
         level: str = "INFO",
         eta_seconds: Optional[int] = None,
         log_stage: Optional[str] = None,
+        live_metrics: Optional[Dict[str, Any]] = None,
+        duration_sec: Optional[float] = None,
     ):
         with self._lock:
             job = self._jobs.get(project_id)
@@ -470,23 +529,38 @@ class JobManager:
                 if not job:
                     return
 
+            now_dt = utc_now()
+            now_iso = now_dt.isoformat().replace("+00:00", "Z")
             job["percent"] = max(0, min(100, percent))
             job["current_stage"] = stage
             job["stage_label"] = stage_label
-            job["updated_at"] = utc_now_iso()
-            job["elapsed_seconds"] = _compute_elapsed_seconds(job)
+            job["updated_at"] = now_iso
             if eta_seconds is not None:
                 job["eta_seconds"] = max(0, eta_seconds)
+            if duration_sec is not None:
+                job["duration_sec"] = round(float(duration_sec), 2)
+            if isinstance(live_metrics, dict):
+                lm = job.setdefault("live_metrics", {})
+                for k, v in live_metrics.items():
+                    if v is not None:
+                        lm[k] = v
 
-            # Update stages status
+            # Update stages status + per-stage durations
             stage_order = [s["id"] for s in STAGES_CONFIG]
             current_idx = stage_order.index(stage) if stage in stage_order else 0
 
             for i, st in enumerate(job.get("stages", [])):
                 if i < current_idx:
+                    if st.get("status") != "done":
+                        st["completed_at"] = st.get("completed_at") or now_iso
+                        s_dt = _parse_utc_iso(st.get("started_at"))
+                        if st.get("duration_sec") is None:
+                            st["duration_sec"] = round(max(0.1, (now_dt - s_dt).total_seconds()), 1) if s_dt else 0.0
                     st["status"] = "done"
                     st["percent"] = 100
                 elif i == current_idx:
+                    if not st.get("started_at"):
+                        st["started_at"] = now_iso
                     st["status"] = "running"
                     st["percent"] = percent
                 else:
@@ -496,13 +570,14 @@ class JobManager:
             if message:
                 tag = (log_stage or stage).strip().upper()
                 log_entry = {
-                    "timestamp": utc_now_iso(),
+                    "timestamp": now_iso,
                     "stage": tag,
                     "level": level,
                     "message": message
                 }
                 job.setdefault("logs", []).append(log_entry)
 
+            _normalize_job_payload(job)
             self._jobs[project_id] = job
             self._save_project_json(project_id, job)
 
@@ -520,31 +595,38 @@ class JobManager:
             if not job:
                 return
 
+            now_dt = utc_now()
+            now_iso = now_dt.isoformat().replace("+00:00", "Z")
             job["status"] = "error"
             job["stage_label"] = "Processing failed"
             job["error_detail"] = error_detail or error_message
-            job["updated_at"] = utc_now_iso()
+            job["updated_at"] = now_iso
             _freeze_timer(job)
 
             # Mark current stage as failed
             for st in job.get("stages", []):
-                if st["status"] == "running":
+                if st.get("status") == "running":
                     st["status"] = "failed"
+                    s_dt = _parse_utc_iso(st.get("started_at"))
+                    if st.get("duration_sec") is None and s_dt:
+                        st["duration_sec"] = round(max(0.1, (now_dt - s_dt).total_seconds()), 1)
 
             log_entry = {
-                "timestamp": utc_now_iso(),
+                "timestamp": now_iso,
                 "stage": "ERROR",
                 "level": "ERROR",
                 "message": f"Pipeline failure: {error_message}"
             }
             job.setdefault("logs", []).append(log_entry)
 
+            _normalize_job_payload(job)
             self._jobs[project_id] = job
             self._save_project_json(project_id, job)
 
             # Also update SQLite DB record
             try:
-                with Session(engine) as session:
+                active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                with Session(active_db_engine) as session:
                     p = session.get(Project, project_id)
                     if p:
                         p.status = "error"
@@ -568,33 +650,44 @@ class JobManager:
             if not job:
                 return
 
+            now_dt = utc_now()
+            now_iso = now_dt.isoformat().replace("+00:00", "Z")
             job["status"] = "finished"
             job["current_stage"] = "ready"
             job["stage_label"] = "Clips Ready & Synchronized"
             job["percent"] = 100
             job["eta_seconds"] = 0
             job["clips_count"] = clips_count
-            job["updated_at"] = utc_now_iso()
+            job["updated_at"] = now_iso
             _freeze_timer(job)
+            lm = job.setdefault("live_metrics", {})
+            lm["highlights_detected"] = max(int(clips_count or 0), int(lm.get("highlights_detected") or 0))
 
             for st in job.get("stages", []):
+                if st.get("status") != "done":
+                    st["completed_at"] = st.get("completed_at") or now_iso
+                    s_dt = _parse_utc_iso(st.get("started_at"))
+                    if st.get("duration_sec") is None:
+                        st["duration_sec"] = round(max(0.1, (now_dt - s_dt).total_seconds()), 1) if s_dt else 0.0
                 st["status"] = "done"
                 st["percent"] = 100
 
             log_entry = {
-                "timestamp": utc_now_iso(),
+                "timestamp": now_iso,
                 "stage": "READY",
                 "level": "SUCCESS",
                 "message": f"Pipeline completed successfully! {clips_count} viral clips ready for editing."
             }
             job.setdefault("logs", []).append(log_entry)
 
+            _normalize_job_payload(job)
             self._jobs[project_id] = job
             self._save_project_json(project_id, job)
 
             # Update DB
             try:
-                with Session(engine) as session:
+                active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                with Session(active_db_engine) as session:
                     p = session.get(Project, project_id)
                     if p:
                         p.status = "analyzed"
@@ -911,7 +1004,7 @@ class JobManager:
         with self._lock:
             if project_id in self._jobs:
                 job = self._jobs[project_id]
-                job["elapsed_seconds"] = _compute_elapsed_seconds(job)
+                _normalize_job_payload(job)
                 return job
 
         # Check disk
@@ -920,7 +1013,7 @@ class JobManager:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    data["elapsed_seconds"] = _compute_elapsed_seconds(data)
+                    _normalize_job_payload(data)
                     with self._lock:
                         self._jobs[project_id] = data
                     return data
@@ -929,19 +1022,33 @@ class JobManager:
 
         # Fallback to DB
         try:
-            with Session(engine) as session:
+            active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+            with Session(active_db_engine) as session:
                 project = session.get(Project, project_id)
                 if not project:
                     return {
                         "project_id": project_id,
                         "status": "not_found",
                         "percent": 0,
+                        "progress_pct": 0,
                         "stages": [],
-                        "logs": []
+                        "logs": [],
+                        "live_metrics": {
+                            "words_transcribed": 0,
+                            "keyframes_scanned": 0,
+                            "keyframes_total": 0,
+                            "highlights_detected": 0,
+                        },
                     }
                 clips = session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
                 status = "finished" if project.status in ["analyzed", "ready"] else project.status
-                return {
+                file_size = 0
+                if project.source_path and os.path.exists(project.source_path):
+                    try:
+                        file_size = os.path.getsize(project.source_path)
+                    except Exception:
+                        pass
+                fallback_job = {
                     "project_id": project.id,
                     "title": project.title,
                     "status": status,
@@ -954,24 +1061,145 @@ class JobManager:
                     "eta_seconds": 0,
                     "source_path": project.source_path,
                     "source_filename": project.source_filename,
+                    "file_size_bytes": file_size,
+                    "duration_sec": float(project.duration or 0.0),
+                    "ai_mode": getattr(project, "ai_mode", None) or "offline",
+                    "default_framing": getattr(project, "default_framing", "smart_auto") or "smart_auto",
                     "clips_count": len(clips),
+                    "live_metrics": {
+                        "words_transcribed": sum(len(c.get_transcript()) for c in clips),
+                        "keyframes_scanned": 0,
+                        "keyframes_total": 0,
+                        "highlights_detected": len(clips),
+                    },
                     "stages": [
-                        {"id": s["id"], "name": s["name"], "desc": s["desc"], "status": "done" if status == "finished" else "pending", "percent": 100 if status == "finished" else 0}
+                        {
+                            "id": s["id"],
+                            "name": s["name"],
+                            "desc": s["desc"],
+                            "status": "done" if status == "finished" else "pending",
+                            "percent": 100 if status == "finished" else 0,
+                            "duration_sec": None,
+                        }
                         for s in STAGES_CONFIG
                     ],
                     "logs": [
                         {"timestamp": project.created_at, "stage": "INIT", "level": "INFO", "message": f"Project '{project.title}' initialized."}
                     ]
                 }
+                return _normalize_job_payload(fallback_job)
         except Exception as e:
             return {
                 "project_id": project_id,
                 "status": "error",
                 "percent": 0,
+                "progress_pct": 0,
                 "error_detail": str(e),
                 "stages": [],
-                "logs": []
+                "logs": [],
+                "live_metrics": {
+                    "words_transcribed": 0,
+                    "keyframes_scanned": 0,
+                    "keyframes_total": 0,
+                    "highlights_detected": 0,
+                },
             }
+
+    def list_jobs(self, limit: int = 20) -> Dict[str, Any]:
+        """
+        Return normalized active running jobs, queued batch jobs, and recent completed/failed jobs
+        by merging in-memory job state, persisted project.json files, SQLite projects, and batch queue.
+        """
+        from app.services.batch_queue import list_batch_queue
+
+        by_pid: Dict[int, Dict[str, Any]] = {}
+        active_db_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+
+        try:
+            with Session(active_db_engine) as session:
+                db_projects = session.exec(
+                    select(Project).order_by(Project.id.desc()).limit(max(limit, 30))
+                ).all()
+        except Exception as db_err:
+            logger.warning(f"list_jobs could not read DB projects: {db_err}")
+            db_projects = []
+
+        # Seed from DB rows (newest first), enriched by in-memory/project.json job telemetry
+        db_by_pid = {int(p.id): p for p in db_projects if p.id is not None}
+        candidate_pids: List[int] = [int(p.id) for p in db_projects if p.id is not None]
+        with self._lock:
+            for mem_pid in self._jobs.keys():
+                if mem_pid not in db_by_pid and mem_pid not in candidate_pids:
+                    candidate_pids.append(mem_pid)
+
+        for pid in candidate_pids:
+            job_data = self.get_progress(pid)
+            if not job_data or job_data.get("status") == "not_found":
+                continue
+            item = dict(job_data)
+            p_row = db_by_pid.get(pid)
+            if p_row:
+                if not item.get("duration_sec") and p_row.duration:
+                    item["duration_sec"] = round(float(p_row.duration), 2)
+                if not item.get("title"):
+                    item["title"] = p_row.title
+                if not item.get("ai_mode") and getattr(p_row, "ai_mode", None):
+                    item["ai_mode"] = p_row.ai_mode
+                if not item.get("default_framing") and getattr(p_row, "default_framing", None):
+                    item["default_framing"] = p_row.default_framing
+            _normalize_job_payload(item)
+            by_pid[pid] = item
+
+        # Merge queued batch items
+        queued_jobs: List[Dict[str, Any]] = []
+        queued_pids = set()
+        for q in list_batch_queue():
+            try:
+                q_pid = int(q.get("project_id", 0))
+            except Exception:
+                continue
+            q_status = str(q.get("status") or "queued").lower()
+            if q_status == "queued":
+                queued_pids.add(q_pid)
+                existing = dict(by_pid.get(q_pid) or {
+                    "project_id": q_pid,
+                    "title": q.get("title") or f"Project #{q_pid}",
+                    "status": "queued",
+                    "percent": 0,
+                    "current_stage": "ingest",
+                    "stage_label": "Queued in Batch",
+                    "started_at": q.get("enqueued_at"),
+                    "stages": [],
+                    "logs": [],
+                })
+                existing["status"] = "queued"
+                existing["stage_label"] = "Queued in Multi-Video Batch"
+                _normalize_job_payload(existing)
+                by_pid[q_pid] = existing
+                queued_jobs.append(existing)
+
+        active_statuses = {"processing", "analyzing", "awaiting_api_key", "proxy_ready", "created"}
+        active_jobs: List[Dict[str, Any]] = []
+        recent_jobs: List[Dict[str, Any]] = []
+
+        for pid in sorted(by_pid.keys(), reverse=True):
+            item = by_pid[pid]
+            st = str(item.get("status") or "").lower()
+            if pid in queued_pids and st == "queued":
+                continue
+            if st in active_statuses:
+                active_jobs.append(item)
+            else:
+                recent_jobs.append(item)
+
+        recent_jobs = recent_jobs[:limit]
+        combined = active_jobs + queued_jobs + recent_jobs
+        return {
+            "active_jobs": active_jobs,
+            "queued_jobs": queued_jobs,
+            "recent_jobs": recent_jobs,
+            "jobs": combined,
+        }
 
     def run_pipeline(self, project_id: int, force_offline: bool = False):
         """Top-level bulletproof thread entry point. Catches BaseException to guarantee no silent thread death."""
@@ -1079,7 +1307,8 @@ class JobManager:
             self.update_progress(
                 project_id, 15, "ingest", "Media probed successfully",
                 message=f"Stream specs: {width}x{height} @ {fps:.1f}fps, total duration: {duration:.1f}s",
-                eta_seconds=40
+                eta_seconds=40,
+                duration_sec=duration,
             )
 
             # -------------------------------------------------------------
@@ -1166,18 +1395,20 @@ class JobManager:
                             self.update_progress(
                                 project_id, 65, "transcribe", "Voice recognition loaded from checkpoint",
                                 message=f"Loaded {len(transcript_words)} cached words with timestamps from checkpoint",
-                                eta_seconds=20
+                                eta_seconds=20,
+                                live_metrics={"words_transcribed": len(transcript_words)},
                             )
                 except Exception as ex:
                     logger.warning(f"Could not load cached transcript: {ex}")
 
             if not transcript_words:
-                def on_speech_progress(pct: int, msg: str):
+                def on_speech_progress(pct: int, msg: str, word_count: Optional[int] = None):
                     progress_val = 35 + int(pct * 0.28)
                     self.update_progress(
                         project_id, progress_val, "transcribe", "Transcribing spoken words & timestamps...",
                         message=msg,
-                        eta_seconds=max(5, int(25 * (1 - pct / 100)))
+                        eta_seconds=max(5, int(25 * (1 - pct / 100))),
+                        live_metrics={"words_transcribed": int(word_count)} if word_count is not None else None,
                     )
 
                 self.update_progress(
@@ -1199,7 +1430,8 @@ class JobManager:
                 self.update_progress(
                     project_id, 65, "transcribe", "Voice recognition complete",
                     message=f"Successfully transcribed {len(transcript_words)} words across {duration:.1f}s",
-                    eta_seconds=18
+                    eta_seconds=18,
+                    live_metrics={"words_transcribed": len(transcript_words)},
                 )
 
             # -------------------------------------------------------------
@@ -1245,11 +1477,14 @@ class JobManager:
                     cached_mm = json.loads(mm_ckpt_path.read_text(encoding="utf-8"))
                     if isinstance(cached_mm, dict) and (cached_mm.get("timeline") or cached_mm.get("summary")):
                         mm_analysis = cached_mm
+                        mm_summary = cached_mm.get("summary") or {}
+                        cached_fc = int(mm_summary.get("frame_count") or 0)
                         self.update_progress(
                             project_id, 69, "gemini", "Multimodal checkpoint loaded",
                             message="Reused cached multimodal_analysis.json (< 0.1s)",
                             eta_seconds=10,
                             log_stage="ANALYSIS",
+                            live_metrics={"keyframes_scanned": cached_fc, "keyframes_total": cached_fc} if cached_fc > 0 else None,
                         )
                         active_mm_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
                         with Session(active_mm_engine) as msession:
@@ -1297,6 +1532,7 @@ class JobManager:
                             message=f"Scanned {scanned:,} / {total_fr:,} keyframes ({pct}%)...",
                             eta_seconds=max(4, int(14 * (1 - pct / 100.0))),
                             log_stage="ANALYSIS",
+                            live_metrics={"keyframes_scanned": int(scanned), "keyframes_total": int(total_fr)},
                         )
 
                     cancel_ev = self._cancel_flags.get(project_id)
@@ -1408,6 +1644,7 @@ class JobManager:
                     message=f"Extracted {len(raw_clips)} viral moments locally with Offline Multimodal AI",
                     eta_seconds=8,
                     log_stage="OFFLINE AI",
+                    live_metrics={"highlights_detected": len(raw_clips)},
                 )
             elif ai_provider == "ollama":
                 self.update_progress(
@@ -1528,6 +1765,7 @@ class JobManager:
                     message=f"Extracted {len(raw_clips)} viral moments with hook headlines & retention scoring",
                     eta_seconds=8,
                     log_stage="GEMINI",
+                    live_metrics={"highlights_detected": len(raw_clips)},
                 )
 
             # -------------------------------------------------------------
@@ -1688,7 +1926,19 @@ class JobManager:
                                 use_cache=True,
                             )
                             rec = recommend_optimal_framing(vmap)
-                            clip.frame_layout = rec["frame_layout"]
+                            proj_framing = str(getattr(project, "default_framing", "smart_auto") or "smart_auto")
+                            explicit_layouts = {
+                                "auto_track",
+                                "gameplay_webcam_pip",
+                                "webcam_gameplay_pip",
+                                "webcam_gameplay_split",
+                                "split_podcast",
+                                "fit_blur",
+                            }
+                            if proj_framing != "smart_auto" and proj_framing in explicit_layouts:
+                                clip.frame_layout = proj_framing
+                            else:
+                                clip.frame_layout = rec["frame_layout"]
                             clip.webcam_corner = rec["webcam_corner"]
                             clip.set_visual_map(vmap)
                             if rec.get("source_webcam_region"):

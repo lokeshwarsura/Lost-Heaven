@@ -43,6 +43,7 @@ import {
 export const App: React.FC = () => {
   const [activeView, setActiveView] = useState<'home' | 'progress' | 'editor' | 'projects' | 'settings'>('home');
   const [activeProjectId, setActiveProjectId] = useState<number | null>(null);
+  const [progressTargetId, setProgressTargetId] = useState<number | null>(null);
   const [previewSeekTime, setPreviewSeekTime] = useState<number | undefined>(undefined);
   const [currentPlaybackTime, setCurrentPlaybackTime] = useState<number | undefined>(undefined);
 
@@ -124,6 +125,8 @@ export const App: React.FC = () => {
       const detail = (evt as CustomEvent<Partial<StudioSettings>>)?.detail;
       if (detail && typeof detail === 'object') {
         setStudioSettings((prev) => ({ ...(prev || {}), ...detail }));
+      } else {
+        api.getSystemSettings().then((s) => setStudioSettings(s)).catch(() => {});
       }
     };
     window.addEventListener('lh-settings-updated', handleSettingsUpdated);
@@ -875,7 +878,12 @@ export const App: React.FC = () => {
                 <button
                   key={item.id}
                   type="button"
-                  onClick={() => setActiveView(item.id)}
+                  onClick={() => {
+                    if (item.id === 'progress') {
+                      setProgressTargetId(null);
+                    }
+                    setActiveView(item.id);
+                  }}
                   className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors group relative ${
                     isActive
                       ? 'bg-[var(--bg-card)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/50 shadow-sm'
@@ -933,6 +941,7 @@ export const App: React.FC = () => {
           <HomeView
             onStartJob={(id) => {
               setActiveProjectId(id);
+              setProgressTargetId(id);
               setActiveView('progress');
             }}
             onOpenProject={(id) => {
@@ -941,6 +950,7 @@ export const App: React.FC = () => {
             }}
             onViewProgress={(id) => {
               setActiveProjectId(id);
+              setProgressTargetId(id);
               setActiveView('progress');
             }}
             onViewLibrary={() => setActiveView('projects')}
@@ -952,7 +962,7 @@ export const App: React.FC = () => {
         {/* VIEW 1: DEDICATED PROGRESS PIPELINE VIEW */}
         {activeView === 'progress' && (
           <ProgressView
-            projectId={activeProjectId || currentProject?.id || (projects[0]?.id ?? 1)}
+            projectId={progressTargetId}
             onOpenEditor={(id) => {
               selectProject(id);
               setActiveView('editor');
