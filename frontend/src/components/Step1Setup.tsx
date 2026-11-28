@@ -44,6 +44,8 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
     }
   };
   const [clipOptsOpen, setClipOptsOpen] = useState(true);
+  const [targetsCardOpen, setTargetsCardOpen] = useState(true);
+  const [langCardOpen, setLangCardOpen] = useState(true);
   const [webcamRegion, setWebcamRegion] = useState<SourceWebcamRegion | null>(
     clip?.source_webcam_region ?? null
   );
@@ -51,11 +53,33 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
   const [framingMap, setFramingMap] = useState<FramingMapResponse | null>(null);
   const [bestFrames, setBestFrames] = useState<BestFrameItem[]>(clip?.best_frames || []);
   const [isLoadingBestFrames, setIsLoadingBestFrames] = useState(false);
+  const [timelineFxSummary, setTimelineFxSummary] = useState<{
+    cold_open_label?: string;
+    dead_air_label?: string;
+    punch_zoom_label?: string;
+  } | null>(null);
 
-  const isWebcamTemplate =
+  useEffect(() => {
+    const onSummary = (ev: Event) => {
+      const detail = (ev as CustomEvent)?.detail;
+      if (detail && detail.clip_id === clip?.id && detail.summary) {
+        setTimelineFxSummary(detail.summary);
+      }
+    };
+    window.addEventListener('lh-timeline-fx-summary', onSummary);
+    return () => window.removeEventListener('lh-timeline-fx-summary', onSummary);
+  }, [clip?.id]);
+
+  const isMultiRegionTemplate =
     clip?.frame_layout === 'webcam_gameplay_split' ||
     clip?.frame_layout === 'gameplay_webcam_pip' ||
-    clip?.frame_layout === 'webcam_gameplay_pip';
+    clip?.frame_layout === 'webcam_gameplay_pip' ||
+    clip?.frame_layout === 'split_podcast' ||
+    clip?.frame_layout === 'triple_gaming_hud' ||
+    clip?.frame_layout === 'portrait_pip_badge' ||
+    clip?.frame_layout === 'side_by_side_50_50';
+
+  const isWebcamTemplate = isMultiRegionTemplate;
 
   useEffect(() => {
     setWebcamRegion(clip?.source_webcam_region ?? null);
@@ -166,13 +190,28 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
     id: ViralClip['frame_layout'];
     label: string;
     desc: string;
-    schematic: 'single' | 'blur' | 'split_v' | 'pip' | 'split_h';
+    schematic:
+      | 'single'
+      | 'blur'
+      | 'split_v'
+      | 'pip'
+      | 'split_h'
+      | 'cinema_letterbox'
+      | 'triple_hud'
+      | 'portrait_pip'
+      | 'punch_crop'
+      | 'side_50_50';
   }[] = [
     { id: 'auto_track', label: 'Auto-Track Speaker', desc: 'Smart face centering', schematic: 'single' },
-    { id: 'fit_blur', label: 'Fit + Blurred Backdrop', desc: 'Best for 16:9 & gaming', schematic: 'blur' },
+    { id: 'fit_blur', label: 'Fit + Blurred Backdrop', desc: 'Full 16:9 over blur', schematic: 'blur' },
     { id: 'webcam_gameplay_split', label: 'Webcam + Gameplay Split', desc: 'Top cam, bottom action', schematic: 'split_v' },
     { id: 'gameplay_webcam_pip', label: 'Gameplay + Webcam PiP', desc: 'Corner face overlay', schematic: 'pip' },
-    { id: 'split_podcast', label: 'Split Podcast', desc: 'Dual speaker stack', schematic: 'split_h' }
+    { id: 'split_podcast', label: 'Split Podcast', desc: 'Dual speaker stack', schematic: 'split_h' },
+    { id: 'cinema_letterbox_blur', label: 'Cinema 2.39:1 + Blur', desc: 'Letterbox + ambient fill', schematic: 'cinema_letterbox' },
+    { id: 'triple_gaming_hud', label: 'Triple Stack: Cam + HUD', desc: 'Cam + action + mini-map', schematic: 'triple_hud' },
+    { id: 'portrait_pip_badge', label: 'Portrait Facecam Card', desc: 'Full video + 3:4 cam badge', schematic: 'portrait_pip' },
+    { id: 'dynamic_punch_crop', label: 'Action Punch Crop (1.28x)', desc: 'Tight focus mobile fill', schematic: 'punch_crop' },
+    { id: 'side_by_side_50_50', label: 'Side-by-Side 50/50 Split', desc: 'Dual vertical split screen', schematic: 'side_50_50' },
   ];
 
   const clipLengths = ['Auto', '15s', '30s', '45s', '60s', '90s'];
@@ -181,39 +220,105 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
   const currentLanguage = clip.caption_language || project?.caption_language || 'As spoken';
 
   const renderSchematic = (kind: string) => {
+    const frameShell = 'w-8 h-10 shrink-0';
     switch (kind) {
       case 'blur':
         return (
-          <div className="w-6 h-8 rounded border border-current/40 flex items-center justify-center p-0.5 opacity-80">
-            <div className="w-full h-3 bg-current/35 rounded-[2px]" />
-          </div>
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <line x1="6" y1="7" x2="26" y2="7" stroke="currentColor" strokeOpacity="0.25" strokeWidth="1.2" strokeLinecap="round" />
+            <line x1="8" y1="33" x2="24" y2="33" stroke="currentColor" strokeOpacity="0.25" strokeWidth="1.2" strokeLinecap="round" />
+            <rect x="3" y="13" width="26" height="14" rx="2" fill="currentColor" fillOpacity="0.28" stroke="currentColor" strokeOpacity="0.7" strokeWidth="1.2" />
+          </svg>
         );
       case 'split_v':
         return (
-          <div className="w-6 h-8 rounded border border-current/40 flex flex-col gap-0.5 p-0.5 opacity-80">
-            <div className="w-full h-3 bg-current/40 rounded-[2px]" />
-            <div className="w-full flex-1 bg-current/25 rounded-[2px]" />
-          </div>
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <rect x="3" y="3" width="26" height="14" rx="2" fill="currentColor" fillOpacity="0.32" />
+            <circle cx="16" cy="9.5" r="3" fill="currentColor" fillOpacity="0.85" />
+            <line x1="2" y1="18.5" x2="30" y2="18.5" stroke="currentColor" strokeWidth="1.5" strokeOpacity="0.85" />
+            <rect x="3" y="20.5" width="26" height="16.5" rx="2" fill="currentColor" fillOpacity="0.16" />
+          </svg>
         );
       case 'pip':
         return (
-          <div className="w-6 h-8 rounded border border-current/40 relative p-0.5 bg-current/15 opacity-80">
-            <div className="w-2.5 h-2 bg-current/70 rounded-[1px] absolute top-1 left-1" />
-          </div>
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" fill="currentColor" fillOpacity="0.12" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <rect x="15" y="5" width="12.5" height="9.5" rx="2" fill="currentColor" fillOpacity="0.42" stroke="currentColor" strokeWidth="1.3" />
+            <circle cx="21.25" cy="9.2" r="2" fill="currentColor" fillOpacity="0.9" />
+          </svg>
         );
       case 'split_h':
         return (
-          <div className="w-6 h-8 rounded border border-current/40 flex flex-col gap-0.5 p-0.5 opacity-80">
-            <div className="w-full flex-1 bg-current/35 rounded-[2px]" />
-            <div className="w-full flex-1 bg-current/35 rounded-[2px]" />
-          </div>
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <rect x="3" y="3" width="26" height="16" rx="2" fill="currentColor" fillOpacity="0.28" />
+            <circle cx="16" cy="10.5" r="3.2" fill="currentColor" fillOpacity="0.8" />
+            <line x1="2" y1="20" x2="30" y2="20" stroke="currentColor" strokeWidth="1.4" strokeOpacity="0.85" />
+            <rect x="3" y="21.5" width="26" height="15.5" rx="2" fill="currentColor" fillOpacity="0.22" />
+            <circle cx="16" cy="29" r="3.2" fill="currentColor" fillOpacity="0.8" />
+          </svg>
+        );
+      case 'cinema_letterbox':
+        return (
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <line x1="7" y1="6.5" x2="25" y2="6.5" stroke="currentColor" strokeOpacity="0.25" strokeWidth="1.2" strokeLinecap="round" />
+            <line x1="7" y1="33.5" x2="25" y2="33.5" stroke="currentColor" strokeOpacity="0.25" strokeWidth="1.2" strokeLinecap="round" />
+            <rect x="2.5" y="12.5" width="27" height="2.2" fill="currentColor" fillOpacity="0.85" />
+            <rect x="2.5" y="15" width="27" height="10" fill="currentColor" fillOpacity="0.30" />
+            <rect x="2.5" y="25.3" width="27" height="2.2" fill="currentColor" fillOpacity="0.85" />
+          </svg>
+        );
+      case 'triple_hud':
+        return (
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <rect x="3" y="3" width="26" height="10.5" rx="1.5" fill="currentColor" fillOpacity="0.34" />
+            <circle cx="16" cy="8.2" r="2.5" fill="currentColor" fillOpacity="0.85" />
+            <rect x="3" y="15" width="26" height="14.5" rx="1.5" fill="currentColor" fillOpacity="0.18" />
+            <rect x="3" y="31" width="26" height="6" rx="1.5" fill="currentColor" fillOpacity="0.42" />
+            <circle cx="8" cy="34" r="1.4" fill="currentColor" fillOpacity="0.9" />
+          </svg>
+        );
+      case 'portrait_pip':
+        return (
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" fill="currentColor" fillOpacity="0.12" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <rect x="17" y="5" width="10.5" height="14" rx="2.5" fill="currentColor" fillOpacity="0.42" stroke="currentColor" strokeWidth="1.3" />
+            <circle cx="22.25" cy="10.2" r="2.2" fill="currentColor" fillOpacity="0.92" />
+            <path d="M18.8 16.5c0-1.9 1.5-3 3.45-3s3.45 1.1 3.45 3" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+          </svg>
+        );
+      case 'punch_crop':
+        return (
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" fill="currentColor" fillOpacity="0.14" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <path d="M6 12V7h5M26 12V7h-5M6 28v5h5M26 28v5h-5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+            <circle cx="16" cy="20" r="4.5" fill="currentColor" fillOpacity="0.45" stroke="currentColor" strokeWidth="1.2" />
+          </svg>
+        );
+      case 'side_50_50':
+        return (
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <rect x="3" y="3" width="12" height="34" rx="2" fill="currentColor" fillOpacity="0.28" />
+            <circle cx="9" cy="17" r="2.7" fill="currentColor" fillOpacity="0.85" />
+            <line x1="16" y1="2.5" x2="16" y2="37.5" stroke="currentColor" strokeWidth="1.5" strokeOpacity="0.9" />
+            <rect x="17" y="3" width="12" height="34" rx="2" fill="currentColor" fillOpacity="0.22" />
+            <circle cx="23" cy="17" r="2.7" fill="currentColor" fillOpacity="0.85" />
+          </svg>
         );
       case 'single':
       default:
         return (
-          <div className="w-6 h-8 rounded border border-current/40 flex items-center justify-center p-0.5 opacity-80">
-            <div className="w-3 h-3 rounded-full bg-current/50" />
-          </div>
+          <svg viewBox="0 0 32 40" className={frameShell} fill="none" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="29" height="37" rx="4" fill="currentColor" fillOpacity="0.12" stroke="currentColor" strokeOpacity="0.45" strokeWidth="1.4" />
+            <circle cx="16" cy="14" r="4.5" fill="currentColor" fillOpacity="0.65" />
+            <path d="M9.5 29c0-3.8 2.9-6.2 6.5-6.2s6.5 2.4 6.5 6.2" fill="currentColor" fillOpacity="0.35" />
+            <circle cx="16" cy="14" r="7.5" stroke="currentColor" strokeOpacity="0.35" strokeWidth="1" strokeDasharray="2 2" />
+          </svg>
         );
     }
   };
@@ -332,60 +437,94 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <button
                 type="button"
-                onClick={() => onUpdateClip({ use_cold_open: !clip.use_cold_open })}
-                className={`flex items-center justify-between px-3 py-2 rounded-lg border transition text-left ${
-                  clip.use_cold_open
+                onClick={() => {
+                  const next = !(clip.cold_open ?? clip.use_cold_open);
+                  onUpdateClip({ use_cold_open: next, cold_open: next } as any);
+                }}
+                className={`flex flex-col gap-0.5 px-3 py-2 rounded-lg border transition text-left ${
+                  (clip.cold_open ?? clip.use_cold_open)
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
                     : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                 }`}
               >
-                <span className="flex items-center gap-1.5 font-medium">
-                  <MessageSquareQuote className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                  Cold-Open Climax
-                </span>
-                <span className="text-[10px] font-bold uppercase">
-                  {clip.use_cold_open ? 'ON' : 'OFF'}
-                </span>
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <span className="flex items-center gap-1.5 font-medium">
+                    <MessageSquareQuote className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                    Cold-Open Climax
+                  </span>
+                  <span className="text-[10px] font-bold uppercase">
+                    {(clip.cold_open ?? clip.use_cold_open) ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                {(clip.cold_open ?? clip.use_cold_open) && (
+                  <span className="text-[9px] font-mono text-[var(--text-muted)] truncate">
+                    {timelineFxSummary?.cold_open_label || '2.8s climax hook + 0.2s flash'}
+                  </span>
+                )}
               </button>
 
               <button
                 type="button"
-                onClick={() => onUpdateClip({ auto_trim_dead_air: !clip.auto_trim_dead_air })}
-                className={`flex items-center justify-between px-3 py-2 rounded-lg border transition text-left ${
-                  clip.auto_trim_dead_air
+                onClick={() => {
+                  const next = !(clip.trim_dead_air ?? clip.auto_trim_dead_air);
+                  onUpdateClip({ auto_trim_dead_air: next, trim_dead_air: next } as any);
+                }}
+                className={`flex flex-col gap-0.5 px-3 py-2 rounded-lg border transition text-left ${
+                  (clip.trim_dead_air ?? clip.auto_trim_dead_air)
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
                     : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                 }`}
               >
-                <span className="flex items-center gap-1.5 font-medium">
-                  <Scissors className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                  Trim Dead Air
-                </span>
-                <span className="text-[10px] font-bold uppercase">
-                  {clip.auto_trim_dead_air ? 'ON' : 'OFF'}
-                </span>
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <span className="flex items-center gap-1.5 font-medium">
+                    <Scissors className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                    Trim Dead Air
+                  </span>
+                  <span className="text-[10px] font-bold uppercase">
+                    {(clip.trim_dead_air ?? clip.auto_trim_dead_air) ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                {(clip.trim_dead_air ?? clip.auto_trim_dead_air) && (
+                  <span className="text-[9px] font-mono text-[var(--text-muted)] truncate">
+                    {timelineFxSummary?.dead_air_label || 'Cutting pauses >= 0.55s'}
+                  </span>
+                )}
               </button>
 
               <button
                 type="button"
-                onClick={() => onUpdateClip({ dynamic_punch_zoom: !clip.dynamic_punch_zoom })}
-                className={`flex items-center justify-between px-3 py-2 rounded-lg border transition text-left ${
-                  clip.dynamic_punch_zoom
+                onClick={() => {
+                  const next = !(clip.punch_zoom ?? clip.dynamic_punch_zoom);
+                  onUpdateClip({
+                    dynamic_punch_zoom: next,
+                    punch_zoom: next,
+                    ...(next && !clip.punch_zoom_intensity ? { punch_zoom_intensity: 1.16 } : {}),
+                  } as any);
+                }}
+                className={`flex flex-col gap-0.5 px-3 py-2 rounded-lg border transition text-left ${
+                  (clip.punch_zoom ?? clip.dynamic_punch_zoom)
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
                     : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
                 }`}
               >
-                <span className="flex items-center gap-1.5 font-medium">
-                  <ZoomIn className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                  Punch Zoom FX
-                </span>
-                <span className="text-[10px] font-bold uppercase">
-                  {clip.dynamic_punch_zoom ? 'ON' : 'OFF'}
-                </span>
+                <div className="flex items-center justify-between gap-2 w-full">
+                  <span className="flex items-center gap-1.5 font-medium">
+                    <ZoomIn className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                    Punch Zoom FX
+                  </span>
+                  <span className="text-[10px] font-bold uppercase">
+                    {(clip.punch_zoom ?? clip.dynamic_punch_zoom) ? 'ON' : 'OFF'}
+                  </span>
+                </div>
+                {(clip.punch_zoom ?? clip.dynamic_punch_zoom) && (
+                  <span className="text-[9px] font-mono text-[var(--text-muted)] truncate">
+                    {timelineFxSummary?.punch_zoom_label || 'Peak zoom FX (1.16x)'}
+                  </span>
+                )}
               </button>
             </div>
 
-            {clip.dynamic_punch_zoom && (
+            {(clip.punch_zoom ?? clip.dynamic_punch_zoom) && (
               <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-[var(--border-subtle)]/60">
                 <span className="text-[11px] text-[var(--text-secondary)] font-medium">
                   Punch Intensity (Audio-Peak Triggered)
@@ -393,10 +532,10 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 <div className="flex items-center gap-1">
                   {[
                     { label: 'Subtle 1.08x', val: 1.08 },
-                    { label: 'Standard 1.14x', val: 1.14 },
-                    { label: 'Aggressive 1.22x', val: 1.22 },
+                    { label: 'Standard 1.16x', val: 1.16 },
+                    { label: 'Aggressive 1.24x', val: 1.24 },
                   ].map((opt) => {
-                    const active = Math.abs((clip.punch_zoom_intensity ?? 1.14) - opt.val) < 0.02;
+                    const active = Math.abs((clip.punch_zoom_intensity ?? 1.16) - opt.val) < 0.025;
                     return (
                       <button
                         key={opt.val}
@@ -420,7 +559,9 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
       </div>
 
       {/* Main 2-Column Responsive Inspector Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 items-start">
+        {/* Left Stack: Aspect Ratio + Engine, Clip Targets, Caption Language */}
+        <div className="space-y-4">
         {/* Aspect Ratio Visual Cards */}
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
           <div className="flex items-center justify-between">
@@ -502,6 +643,147 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
           </div>
         </div>
 
+        {/* Clip Length & Clip Count */}
+        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
+          <button
+            type="button"
+            onClick={() => setTargetsCardOpen((v) => !v)}
+            className="w-full flex items-center justify-between text-left"
+          >
+            <span className="font-bold text-xs text-[var(--text-primary)] uppercase tracking-wide">
+              Clip Length &amp; Targets
+            </span>
+            <span className="flex items-center gap-1.5 text-[10px] text-[var(--text-secondary)]">
+              <span>{project?.duration_preset || 'Auto'} • {project?.clip_count || 5} clips</span>
+              {targetsCardOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            </span>
+          </button>
+
+          {targetsCardOpen && (
+          <div className="space-y-3">
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
+                Clip Length Target
+              </span>
+              <span className="text-[10px] text-[var(--text-secondary)]">Duration bound</span>
+            </div>
+            <div className="grid grid-cols-6 gap-1.5 tabular-nums">
+              {clipLengths.map((len) => {
+                const isSelected =
+                  project?.duration_preset === len || (len === 'Auto' && !project?.duration_preset);
+                return (
+                  <button
+                    key={len}
+                    type="button"
+                    onClick={() => {
+                      onUpdateProject?.({ duration_preset: len });
+                      if (len !== 'Auto') {
+                        const targetDur = parseInt(len, 10);
+                        if (Number.isFinite(targetDur) && targetDur >= 2) {
+                          const projMax =
+                            project?.duration && project.duration > clip.start_time + 2
+                              ? project.duration
+                              : undefined;
+                          const nextEnd = projMax
+                            ? Math.min(projMax, clip.start_time + targetDur)
+                            : clip.start_time + targetDur;
+                          onUpdateClip({
+                            end_time: Number(nextEnd.toFixed(2)),
+                            duration: Number((nextEnd - clip.start_time).toFixed(2))
+                          });
+                        }
+                      }
+                    }}
+                    className={`py-1.5 rounded-lg border text-center font-medium transition ${
+                      isSelected
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {len}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="pt-2 border-t border-[var(--border-subtle)]">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="font-bold text-xs text-[var(--text-primary)] uppercase tracking-wide">
+                Number of Clips
+              </span>
+              <span className="text-[10px] text-[var(--text-secondary)]">Generation ceiling</span>
+            </div>
+            <div className="grid grid-cols-4 gap-1.5 tabular-nums">
+              {clipCounts.map((countNum) => {
+                const isSelected =
+                  project?.clip_count === countNum || (!project?.clip_count && countNum === 5);
+                return (
+                  <button
+                    key={countNum}
+                    type="button"
+                    onClick={() => onUpdateProject?.({ clip_count: countNum })}
+                    className={`py-1.5 rounded-lg border text-center font-medium transition ${
+                      isSelected
+                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {countNum} clips
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          </div>
+          )}
+        </div>
+
+        {/* Spoken / Caption Language */}
+        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-2.5">
+          <button
+            type="button"
+            onClick={() => setLangCardOpen((v) => !v)}
+            className="w-full flex items-center justify-between text-left"
+          >
+            <span className="font-bold text-xs text-[var(--text-primary)] uppercase tracking-wide">
+              Caption Language
+            </span>
+            <span className="flex items-center gap-1.5 text-[10px] text-[var(--text-secondary)]">
+              <span>{currentLanguage}</span>
+              {langCardOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            </span>
+          </button>
+          {langCardOpen && (
+          <div className="grid grid-cols-4 gap-1.5">
+            {languages.map((lang) => {
+              const isSelected = currentLanguage === lang;
+              return (
+                <button
+                  key={lang}
+                  type="button"
+                  onClick={() => {
+                    onUpdateClip({ caption_language: lang });
+                    onUpdateProject?.({ caption_language: lang });
+                  }}
+                  className={`py-2 px-2 rounded-lg border text-center font-medium transition truncate ${
+                    isSelected
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  {lang}
+                </button>
+              );
+            })}
+          </div>
+          )}
+        </div>
+        </div>
+
+        {/* Right Stack: Framing Templates with Schematics + Zoom & Pan + Virtual Backdrop */}
+        <div className="space-y-4">
         {/* Framing Templates with Schematics + Zoom & Pan */}
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
           <div className="flex items-center justify-between">
@@ -526,7 +808,13 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 <button
                   key={t.id}
                   type="button"
-                  onClick={() => onUpdateClip({ frame_layout: t.id })}
+                  onClick={() =>
+                    onUpdateClip({
+                      frame_layout: t.id,
+                      framing_template: t.id,
+                      framing_user_locked: true,
+                    } as any)
+                  }
                   className={`flex items-center gap-2.5 p-2 rounded-xl border text-left transition ${
                     active
                       ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
@@ -547,22 +835,26 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
             })}
           </div>
 
-          {/* Framing Telemetry Pill (always visible across all templates) */}
+          {/* Active Framing Telemetry Pill (always reflects selected user layout, never contradicts with AI: fit_blur) */}
           {(() => {
             const ov = clip.framing_override;
-            const summary = framingMap?.visual_map?.summary || clip.visual_map_summary;
             const zoneRaw = webcamRegion?.locked_zone && webcamRegion.locked_zone !== 'auto'
               ? webcamRegion.locked_zone
-              : webcamRegion?.source_zone || 'top_left';
+              : webcamRegion?.source_zone && webcamRegion.source_zone !== 'none'
+                ? webcamRegion.source_zone
+                : 'auto';
             const zoneNice = zoneRaw.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-            const recName = framingMap?.recommended?.frame_layout;
+            const activeTplObj = framingTemplates.find(
+              (ft) => ft.id === clip.frame_layout || (ft.id === 'gameplay_webcam_pip' && clip.frame_layout === 'webcam_gameplay_pip')
+            );
+            const activeTplName = activeTplObj?.label || clip.frame_layout || 'Auto-Track Speaker';
 
             if (ov?.lock_camera && ov.focus_anchor) {
               return (
                 <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-amber-500/12 border border-amber-500/35 text-[10px] text-amber-300 font-semibold">
                   <span className="inline-flex items-center gap-1.5">
                     <Lock className="w-3 h-3" />
-                    Camera locked ({Math.round(ov.focus_anchor.x * 100)}%, {Math.round(ov.focus_anchor.y * 100)}%)
+                    Active Layout: {activeTplName} · Focus ({Math.round(ov.focus_anchor.x * 100)}%, {Math.round(ov.focus_anchor.y * 100)}%)
                   </span>
                   {project && (
                     <button
@@ -580,47 +872,20 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 </div>
               );
             }
-            if (webcamRegion?.webcam_detected) {
-              const locked = Boolean(webcamRegion.locked_zone && webcamRegion.locked_zone !== 'auto');
-              return (
-                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/12 border border-emerald-500/35 text-[10px] text-emerald-400 font-semibold">
-                  <span className="inline-flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3 h-3" />
-                    {locked ? `Webcam locked (${zoneNice})` : `Webcam detected (${zoneNice})`}
-                  </span>
-                  {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
-                </div>
-              );
-            }
-            if (summary?.dominant_scene_type === 'zero_face_action' || (summary && (summary.face_presence_ratio ?? 1) < 0.1)) {
-              return (
-                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-sky-500/12 border border-sky-500/35 text-[10px] text-sky-300 font-semibold">
-                  <span className="inline-flex items-center gap-1.5">
-                    <Zap className="w-3 h-3" />
-                    ⚡ Action Saliency Active (No Face)
-                  </span>
-                  {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
-                </div>
-              );
-            }
-            if (summary?.dominant_scene_type === 'dual_speaker') {
-              return (
-                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-500/12 border border-emerald-500/35 text-[10px] text-emerald-400 font-semibold">
-                  <span className="inline-flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3 h-3" />
-                    Dual-Speaker Tracking Active
-                  </span>
-                  {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
-                </div>
-              );
-            }
             return (
               <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[10px] text-[var(--text-secondary)] font-semibold">
-                <span className="inline-flex items-center gap-1.5">
-                  <CheckCircle2 className="w-3 h-3 text-[var(--accent-primary)]" />
-                  Active Speaker &amp; Shot-Boundary Framing
+                <span className="inline-flex items-center gap-1.5 truncate">
+                  <CheckCircle2 className="w-3 h-3 text-[var(--accent-primary)] shrink-0" />
+                  <span className="truncate">
+                    Active Layout: <span className="text-[var(--text-primary)]">{activeTplName}</span>
+                    {isMultiRegionTemplate ? ` · Source ROI: ${zoneNice}` : ''}
+                  </span>
                 </span>
-                {recName && <span className="font-mono opacity-80">AI: {recName}</span>}
+                {webcamRegion?.webcam_detected ? (
+                  <span className="font-mono text-emerald-400 shrink-0">Cam Locked</span>
+                ) : (
+                  <span className="font-mono text-sky-300 shrink-0">Action ROI</span>
+                )}
               </div>
             );
           })()}
@@ -705,17 +970,15 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
             </div>
           )}
 
-          {/* Webcam Detection, Source Zone & Output Placement for Split / PiP templates */}
-          {(clip.frame_layout === 'webcam_gameplay_split' ||
-            clip.frame_layout === 'gameplay_webcam_pip' ||
-            clip.frame_layout === 'webcam_gameplay_pip') && (
+          {/* Always-Accessible Source Corner & Output Corner Controls for ALL Multi-Region Templates */}
+          {isMultiRegionTemplate && (
             <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2.5">
-              {/* Auto-Detection Status Pill + Re-scan */}
+              {/* Source Region Detection Pill + Re-scan */}
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 {isDetectingWebcam ? (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-[var(--accent-subtle)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40">
                     <Loader2 className="w-3 h-3 animate-spin" />
-                    Scanning 16 frames for webcam...
+                    Scanning 16 frames for source region...
                   </span>
                 ) : webcamRegion?.webcam_detected ? (
                   <span
@@ -723,8 +986,11 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-emerald-500/15 text-emerald-400 border border-emerald-500/40"
                   >
                     <CheckCircle2 className="w-3 h-3" />
-                    Webcam auto-detected (
-                    {(webcamRegion.source_zone || 'top_left')
+                    Webcam region active (
+                    {(webcamRegion.locked_zone && webcamRegion.locked_zone !== 'auto'
+                      ? webcamRegion.locked_zone
+                      : webcamRegion.source_zone || 'top_left'
+                    )
                       .replace(/_/g, ' ')
                       .replace(/\b\w/g, (c) => c.toUpperCase())}
                     {webcamRegion.aspect_ratio
@@ -741,10 +1007,10 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 ) : (
                   <span
                     data-testid="webcam-status-pill"
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/40"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-semibold bg-sky-500/15 text-sky-300 border border-sky-500/40"
                   >
-                    <AlertTriangle className="w-3 h-3" />
-                    No facecam detected — using Action Framing
+                    <Camera className="w-3 h-3" />
+                    Corner crop active ({(webcamRegion?.locked_zone || 'top_left').replace(/_/g, ' ')})
                   </span>
                 )}
                 <button
@@ -759,12 +1025,12 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 </button>
               </div>
 
-              {/* Source Camera Position (where the webcam sits in the original 16:9 video) */}
+              {/* Source Region Corner (where secondary region sits in original 16:9 frame) */}
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)]">
                   <span className="inline-flex items-center gap-1">
                     <Camera className="w-3 h-3 text-[var(--accent-primary)]" />
-                    Source Camera Position
+                    Source Region Corner
                   </span>
                   <span className="font-mono text-[10px] text-[var(--accent-primary)]">
                     {webcamRegion?.locked_zone || 'auto'}
@@ -802,16 +1068,12 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 </div>
               </div>
 
-              {/* Output PiP Placement (where the rounded PiP sits in the 9:16 export) */}
+              {/* Output Overlay Corner (where PiP / overlay badge sits in 9:16 output) */}
               <div className="space-y-1">
                 <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)]">
-                  <span>
-                    {clip.frame_layout === 'gameplay_webcam_pip'
-                      ? 'Output PiP Placement'
-                      : 'Webcam Corner'}
-                  </span>
+                  <span>Output Overlay Corner</span>
                   <span className="font-mono text-[10px] text-[var(--accent-primary)]">
-                    {clip.webcam_corner || 'top_left'}
+                    {clip.webcam_corner && clip.webcam_corner !== 'auto' ? clip.webcam_corner : 'top_right'}
                   </span>
                 </div>
                 <div className="grid grid-cols-4 gap-1.5">
@@ -823,7 +1085,8 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                     { id: 'bottom_right', label: 'Bottom Right' }
                   ] as const
                 ).map((corner) => {
-                  const selected = (clip.webcam_corner || 'top_left') === corner.id;
+                  const activeCorner = clip.webcam_corner && clip.webcam_corner !== 'auto' ? clip.webcam_corner : 'top_right';
+                  const selected = activeCorner === corner.id;
                   return (
                     <button
                       key={corner.id}
@@ -896,8 +1159,8 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
             </button>
           </div>
 
-          {/* Zoom & Pan Sliders */}
-          <div className="grid grid-cols-2 gap-3 pt-2 border-t border-[var(--border-subtle)] tabular-nums">
+          {/* Zoom, Pan & Horizon Tilt Sliders */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-[var(--border-subtle)] tabular-nums">
             <div>
               <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
                 <span>Zoom</span>
@@ -932,6 +1195,43 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
                 className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
               />
             </div>
+            <div>
+              <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
+                <span>Horizon Tilt</span>
+                <button
+                  type="button"
+                  onClick={() => onUpdateClip({ horizon_tilt: 0 })}
+                  title="Reset horizon tilt to 0°"
+                  className="font-mono text-[var(--accent-primary)] font-bold hover:underline"
+                >
+                  {(clip.horizon_tilt || 0) > 0 ? `+${(clip.horizon_tilt || 0).toFixed(1)}°` : `${(clip.horizon_tilt || 0).toFixed(1)}°`}
+                </button>
+              </div>
+              <input
+                type="range"
+                min={-10}
+                max={10}
+                step={0.5}
+                value={clip.horizon_tilt || 0}
+                onChange={(e) => onUpdateClip({ horizon_tilt: parseFloat(e.target.value) })}
+                onDoubleClick={() => onUpdateClip({ horizon_tilt: 0 })}
+                aria-label="Horizon Tilt rotation degrees"
+                className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between pt-2">
+            <span className="text-[10px] text-[var(--text-muted)]">
+              Level horizon rotation auto-zooms to hide black corners on export.
+            </span>
+            <button
+              type="button"
+              onClick={() => window.dispatchEvent(new CustomEvent('lh-toggle-thirds'))}
+              className="px-2.5 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] text-[10px] font-bold text-[var(--text-primary)] transition"
+            >
+              Toggle Rule-of-Thirds Grid
+            </button>
           </div>
 
           {/* Virtual Studio Backdrop (AI Person Segmentation) */}
@@ -1014,116 +1314,6 @@ export const Step1Setup: React.FC<Step1SetupProps> = ({
             )}
           </div>
         </div>
-
-        {/* Clip Length & Clip Count */}
-        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
-          <div>
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="font-bold text-xs text-[var(--text-primary)] uppercase tracking-wide">
-                Clip Length Target
-              </span>
-              <span className="text-[10px] text-[var(--text-secondary)]">Duration bound</span>
-            </div>
-            <div className="grid grid-cols-6 gap-1.5 tabular-nums">
-              {clipLengths.map((len) => {
-                const isSelected =
-                  project?.duration_preset === len || (len === 'Auto' && !project?.duration_preset);
-                return (
-                  <button
-                    key={len}
-                    type="button"
-                    onClick={() => {
-                      onUpdateProject?.({ duration_preset: len });
-                      if (len !== 'Auto') {
-                        const targetDur = parseInt(len, 10);
-                        if (Number.isFinite(targetDur) && targetDur >= 2) {
-                          const projMax =
-                            project?.duration && project.duration > clip.start_time + 2
-                              ? project.duration
-                              : undefined;
-                          const nextEnd = projMax
-                            ? Math.min(projMax, clip.start_time + targetDur)
-                            : clip.start_time + targetDur;
-                          onUpdateClip({
-                            end_time: Number(nextEnd.toFixed(2)),
-                            duration: Number((nextEnd - clip.start_time).toFixed(2))
-                          });
-                        }
-                      }
-                    }}
-                    className={`py-1.5 rounded-lg border text-center font-medium transition ${
-                      isSelected
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                  >
-                    {len}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="pt-2 border-t border-[var(--border-subtle)]">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="font-bold text-xs text-[var(--text-primary)] uppercase tracking-wide">
-                Number of Clips
-              </span>
-              <span className="text-[10px] text-[var(--text-secondary)]">Generation ceiling</span>
-            </div>
-            <div className="grid grid-cols-4 gap-1.5 tabular-nums">
-              {clipCounts.map((countNum) => {
-                const isSelected =
-                  project?.clip_count === countNum || (!project?.clip_count && countNum === 5);
-                return (
-                  <button
-                    key={countNum}
-                    type="button"
-                    onClick={() => onUpdateProject?.({ clip_count: countNum })}
-                    className={`py-1.5 rounded-lg border text-center font-medium transition ${
-                      isSelected
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                        : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
-                  >
-                    {countNum} clips
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-
-        {/* Spoken / Caption Language */}
-        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-2.5">
-          <div className="flex items-center justify-between">
-            <span className="font-bold text-xs text-[var(--text-primary)] uppercase tracking-wide">
-              Caption Language
-            </span>
-            <span className="text-[10px] text-[var(--text-secondary)]">Whisper recognition target</span>
-          </div>
-          <div className="grid grid-cols-4 gap-1.5">
-            {languages.map((lang) => {
-              const isSelected = currentLanguage === lang;
-              return (
-                <button
-                  key={lang}
-                  type="button"
-                  onClick={() => {
-                    onUpdateClip({ caption_language: lang });
-                    onUpdateProject?.({ caption_language: lang });
-                  }}
-                  className={`py-2 px-2 rounded-lg border text-center font-medium transition truncate ${
-                    isSelected
-                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
-                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                  }`}
-                >
-                  {lang}
-                </button>
-              );
-            })}
-          </div>
         </div>
       </div>
     </div>

@@ -4,6 +4,7 @@ import wave
 import logging
 import subprocess
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,6 +15,33 @@ from app.services.proxy import get_ffmpeg_cmd, probe_video
 logger = logging.getLogger(__name__)
 
 FILLER_TOKENS = {"um", "uh", "erm", "ah", "er", "hmm"}
+COLD_OPEN_WINDOW_SEC = 2.80
+COLD_OPEN_FLASH_SEC = 0.20
+DEAD_AIR_MIN_PAUSE_SEC = 0.55
+DEAD_AIR_BREATH_BUFFER_SEC = 0.12
+
+
+@dataclass
+class TimelineEditPlan:
+    """Unified edit plan shared identically between preview_frame.py and renderer.py."""
+
+    keep_intervals: List[Tuple[float, float]]
+    kept_segments_abs: List[Tuple[float, float]]
+    has_cuts: bool
+    main_duration: float
+    effective_duration: float
+    crossfade_sec: float
+    remapped_words: List[Dict[str, Any]]
+    cold_open_active: bool = False
+    climax_window: Optional[Tuple[float, float]] = None
+    climax_rel_start: float = 0.0
+    teaser_duration: float = 0.0
+    flash_duration: float = 0.0
+    punch_timestamps: List[float] = field(default_factory=list)
+    punch_intervals: List[Tuple[float, float, float]] = field(default_factory=list)
+    dead_air_cuts_count: int = 0
+    dead_air_saved_sec: float = 0.0
+    timeline_fx_summary: Dict[str, Any] = field(default_factory=dict)
 
 
 def _compute_heatmap_metrics(
@@ -330,23 +358,23 @@ def select_cold_open_climax_window(
     clip_duration: float,
     words: Optional[List[Dict[str, Any]]] = None,
     cold_open_quote: str = "",
-    window_sec: float = 2.50,
+    window_sec: float = COLD_OPEN_WINDOW_SEC,
 ) -> Optional[Tuple[float, float]]:
     """
-    Pick the highest-excitement `window_sec` (default 2.5s) segment from the SECOND HALF
-    of a clip (only when clip duration >= 8.0s). Combines acoustic RMS energy, vocal
-    emphasis punctuation/speech density, and optional `cold_open_quote` anchor.
+    Pick the highest-excitement `window_sec` (default 2.80s) segment from the latter 65%
+    of a clip (only when clip duration >= 8.0s). Fuses vocal arousal spikes, acoustic RMS energy,
+    emphasis punctuation/speech density, and optional `cold_open_quote` anchor (fallback: 65% mark).
     Returns `(abs_start, abs_end)` in master-video seconds, or `None` if clip < 8.0s.
     """
     dur = float(clip_duration or 0.0)
     if dur < 8.0:
         return None
-    w_len = min(max(1.5, float(window_sec or 2.5)), dur * 0.35)
-    search_start_rel = dur * 0.50
+    w_len = min(max(1.5, float(window_sec or COLD_OPEN_WINDOW_SEC)), dur * 0.40)
+    search_start_rel = dur * 0.35
     search_end_rel = max(search_start_rel + 0.1, dur - w_len)
     abs_anchor = max(0.0, float(clip_start_time or 0.0))
 
-    # Quote match hint if inside second half
+    # Quote match hint if inside search range
     quote_rel_start: Optional[float] = None
     clean_q = re.sub(r"[^\w\s]", "", str(cold_open_quote or "")).lower().strip()
     if clean_q and words:
@@ -357,11 +385,11 @@ def select_cold_open_climax_window(
             for idx in range(len(w_toks) - len(q_toks) + 1):
                 if w_toks[idx:idx + len(q_toks)] == q_toks:
                     cand = float(norm_w[idx].get("start", 0.0))
-                    if cand >= dur * 0.42:
+                    if cand >= dur * 0.35:
                         quote_rel_start = max(search_start_rel, min(search_end_rel, cand))
                         break
 
-    # Extract fine audio RMS profile (10 Hz) over second half via face_tracker helper
+    # Extract fine audio RMS profile (10 Hz) over latter 65% via face_tracker helper
     rms_bins: List[float] = []
     if video_path and os.path.exists(video_path):
         try:
@@ -375,36 +403,50 @@ def select_cold_open_climax_window(
         except Exception:
             rms_bins = []
 
+    rms_arr = np.array(rms_bins, dtype=np.float32) if rms_bins else np.zeros(0, dtype=np.float32)
+    rms_median = float(np.median(rms_arr)) if rms_arr.size > 0 else 0.0
+    rms_span = float(np.max(rms_arr) - np.min(rms_arr)) if rms_arr.size > 0 else 0.0
+
     norm_w = _normalize_word_list(words or [], abs_anchor, dur) if words else []
     step = 0.25
-    best_rel = min(search_end_rel, max(search_start_rel, dur * 0.65))
+    fallback_rel = min(search_end_rel, max(search_start_rel, dur * 0.65))
+    best_rel = fallback_rel
     best_score = -1.0
+    scores_seen: List[float] = []
+
     cur = search_start_rel
     while cur <= search_end_rel + 1e-4:
         win_e = cur + w_len
         score = 0.0
-        # Audio RMS energy component (0..1)
-        if rms_bins:
+        # Audio RMS energy + vocal arousal dynamics component
+        if rms_arr.size > 0 and rms_span > 0.05:
             i0 = max(0, int(round((cur - search_start_rel) * 10.0)))
-            i1 = min(len(rms_bins), max(i0 + 1, int(round((win_e - search_start_rel) * 10.0))))
-            seg_vals = rms_bins[i0:i1]
-            if seg_vals:
-                score += float(np.mean(seg_vals)) * 1.6 + float(np.max(seg_vals)) * 0.8
+            i1 = min(int(rms_arr.size), max(i0 + 1, int(round((win_e - search_start_rel) * 10.0))))
+            seg_vals = rms_arr[i0:i1]
+            if seg_vals.size > 0:
+                arousal = float(np.mean(np.maximum(0.0, seg_vals - rms_median)))
+                score += float(np.mean(seg_vals)) * 1.5 + float(np.max(seg_vals)) * 0.9 + arousal * 1.1
         # Word density & exclamation/question excitement component
         win_words = [
             w for w in norm_w
             if not w.get("deleted") and not w.get("cut_from_video")
             and float(w.get("end", 0.0)) >= cur and float(w.get("start", 0.0)) <= win_e
         ]
-        score += min(1.0, len(win_words) / 8.0) * 0.9
-        if any(any(p in str(w.get("word", "")) for p in ("!", "?")) for w in win_words):
-            score += 0.35
+        if win_words:
+            score += min(1.0, len(win_words) / 8.0) * 0.9
+            if any(any(p in str(w.get("word", "")) for p in ("!", "?")) for w in win_words):
+                score += 0.35
         if quote_rel_start is not None and abs(cur - quote_rel_start) <= 1.2:
             score += 1.25 * max(0.0, 1.0 - abs(cur - quote_rel_start) / 1.2)
+        scores_seen.append(score)
         if score > best_score:
             best_score = score
             best_rel = cur
         cur += step
+
+    # Explicit flat-signal fallback to 65% mark when neither audio peaks nor transcript arousal distinguish any window
+    if not scores_seen or best_score <= 0.05 or (max(scores_seen) - min(scores_seen) < 0.04 and quote_rel_start is None):
+        best_rel = fallback_rel
 
     co_s = round(abs_anchor + best_rel, 3)
     co_e = round(min(abs_anchor + dur, co_s + w_len), 3)
@@ -470,27 +512,63 @@ def compute_kept_segments_and_remapped_words(
             active_spoken.append(w)
 
     # Dead-air silence cuts when auto_trim_dead_air or tighten_pacing is active
+    # Non-speech pauses >= 0.55s are trimmed while preserving 0.12s breathing buffers around spoken words
     thresh = (
-        0.35
+        DEAD_AIR_MIN_PAUSE_SEC
         if (auto_trim_dead_air and not tighten_pacing)
-        else max(0.25, min(1.5, float(silence_threshold or 0.45)))
+        else max(0.25, min(1.5, float(silence_threshold or DEAD_AIR_MIN_PAUSE_SEC)))
     )
     if tighten_pacing or auto_trim_dead_air:
-        cushion = 0.09 if auto_trim_dead_air else 0.08
+        cushion = DEAD_AIR_BREATH_BUFFER_SEC if auto_trim_dead_air else 0.08
         if auto_trim_dead_air and video_path and os.path.exists(video_path):
+            # Combine FFmpeg silencedetect with high-res audio RMS envelope
+            rms_silences: List[Tuple[float, float]] = []
+            try:
+                from app.services.face_tracker import extract_audio_rms_profile
+                rms_fps = 20.0
+                rms_env = extract_audio_rms_profile(
+                    video_path,
+                    clip_start_time,
+                    clip_start_time + clip_dur,
+                    sample_fps=rms_fps,
+                )
+                if rms_env:
+                    env_arr = np.array(rms_env, dtype=np.float32)
+                    low_thr = max(0.06, float(np.percentile(env_arr, 15)) * 1.25)
+                    if low_thr < 0.28:
+                        in_sil = False
+                        s_i = 0
+                        for idx_r, val_r in enumerate(rms_env):
+                            if val_r <= low_thr and not in_sil:
+                                in_sil = True
+                                s_i = idx_r
+                            elif val_r > low_thr and in_sil:
+                                s_t = s_i / rms_fps
+                                e_t = idx_r / rms_fps
+                                if e_t - s_t >= thresh:
+                                    rms_silences.append((round(s_t, 3), round(e_t, 3)))
+                                in_sil = False
+                        if in_sil:
+                            s_t = s_i / rms_fps
+                            e_t = len(rms_env) / rms_fps
+                            if e_t - s_t >= thresh:
+                                rms_silences.append((round(s_t, 3), round(clip_dur, 3)))
+            except Exception:
+                rms_silences = []
+
             ff_silences = detect_ffmpeg_silences(
                 video_path,
                 start_sec=clip_start_time,
                 duration_sec=clip_dur,
                 noise_db=-34.0,
-                min_dur=0.35,
+                min_dur=thresh,
             )
-            for ss, se in ff_silences:
+            for ss, se in (ff_silences + rms_silences):
                 c_s = round(ss + cushion, 3)
                 c_e = round(se - cushion, 3)
                 if c_e <= c_s + 0.08:
                     continue
-                # Protect spoken word intervals against cutting inside speech
+                # Protect spoken word intervals with breathing buffer
                 sub_cuts: List[Tuple[float, float]] = [(c_s, c_e)]
                 for w in active_spoken:
                     ws = max(0.0, float(w["start"]) - cushion * 0.5)
@@ -508,19 +586,19 @@ def compute_kept_segments_and_remapped_words(
                 raw_cuts.extend(sub_cuts)
 
         if active_spoken:
-            # Leading silence
+            # Leading silence >= thresh
             if active_spoken[0]["start"] > thresh + cushion:
                 raw_cuts.append((0.0, round(active_spoken[0]["start"] - cushion, 3)))
-            # Inter-word gaps
+            # Inter-word pauses >= thresh (keeping 0.12s breathing buffer on both sides)
             for idx in range(len(active_spoken) - 1):
                 gap_s = active_spoken[idx]["end"]
                 gap_e = active_spoken[idx + 1]["start"]
-                if gap_e - gap_s > thresh:
+                if gap_e - gap_s >= thresh:
                     c_s = round(gap_s + cushion, 3)
                     c_e = round(gap_e - cushion, 3)
                     if c_e > c_s + 0.08:
                         raw_cuts.append((c_s, c_e))
-            # Trailing silence
+            # Trailing silence >= thresh
             if clip_dur - active_spoken[-1]["end"] > thresh + cushion:
                 raw_cuts.append((round(active_spoken[-1]["end"] + cushion, 3), clip_dur))
 
@@ -553,6 +631,8 @@ def compute_kept_segments_and_remapped_words(
             "effective_duration": max(0.2, eff),
             "remapped_words": norm_words,
             "crossfade_sec": crossfade_sec,
+            "dead_air_cuts_count": 0,
+            "dead_air_saved_sec": 0.0,
         }
 
     # Subtract word/silence cut intervals from each kept base segment
@@ -643,7 +723,227 @@ def compute_kept_segments_and_remapped_words(
         "effective_duration": effective_duration,
         "remapped_words": remapped,
         "crossfade_sec": cf,
+        "dead_air_cuts_count": len(merged_cuts),
+        "dead_air_saved_sec": round(max(0.0, clip_dur - effective_duration), 2),
     }
+
+
+def _map_source_rel_to_output_time(
+    src_rel_t: float,
+    kept_segments: List[Tuple[float, float]],
+    crossfade_sec: float = 0.03,
+) -> float:
+    """Map an un-cut clip-relative timestamp forward onto the post-cut output timeline."""
+    if not kept_segments:
+        return max(0.0, float(src_rel_t))
+    cursor = 0.0
+    cf = max(0.0, float(crossfade_sec or 0.0))
+    for idx, (ks, ke) in enumerate(kept_segments):
+        seg_len = max(0.1, ke - ks)
+        step_cf = min(cf, seg_len * 0.25) if idx < len(kept_segments) - 1 else 0.0
+        if src_rel_t <= ke + 0.05 or idx == len(kept_segments) - 1:
+            local = max(0.0, min(seg_len, src_rel_t - ks))
+            return round(cursor + local, 3)
+        cursor += seg_len - step_cf
+    return round(cursor, 3)
+
+
+def build_timeline_edit_plan(
+    video_path: str,
+    clip_start_time: float,
+    clip_duration: float,
+    words: Optional[List[Dict[str, Any]]] = None,
+    *,
+    cold_open: bool = False,
+    cold_open_quote: str = "",
+    trim_dead_air: bool = False,
+    tighten_pacing: bool = False,
+    silence_threshold: float = DEAD_AIR_MIN_PAUSE_SEC,
+    clean_filler_words: bool = False,
+    punch_zoom: bool = False,
+    punch_zoom_intensity: float = 1.16,
+    explicit_keep_segments: Optional[List[Tuple[float, float]]] = None,
+    crossfade_sec: float = 0.03,
+) -> TimelineEditPlan:
+    """
+    Single Source of Truth planner for:
+      1. `trim_dead_air` (`keep_intervals` + word timestamp remap + pause count / seconds saved)
+      2. `cold_open` (2.8s climax teaser prepended with 0.2s white flash + `+2.8s` word shift + teaser words)
+      3. `punch_zoom` (up to 6 top vocal peaks >= 3.2s apart shifted cleanly onto the final output timeline)
+    """
+    from app.services.face_tracker import detect_punch_zoom_peaks
+
+    anchor_s = max(0.0, float(clip_start_time or 0.0))
+    span_d = max(0.5, float(clip_duration or 1.0))
+    src_words = [dict(w) for w in (words or []) if isinstance(w, dict) and not w.get("muted", False)]
+
+    eff_cf = (
+        max(0.03, float(crossfade_sec or 0.03))
+        if (tighten_pacing or trim_dead_air)
+        else float(crossfade_sec or 0.03)
+    )
+    tl_cuts = compute_kept_segments_and_remapped_words(
+        words=src_words,
+        clip_start_time=anchor_s,
+        clip_duration=span_d,
+        tighten_pacing=tighten_pacing,
+        silence_threshold=silence_threshold,
+        clean_filler_words=clean_filler_words,
+        crossfade_sec=eff_cf,
+        explicit_keep_segments=explicit_keep_segments,
+        auto_trim_dead_air=trim_dead_air,
+        video_path=video_path,
+    )
+    kept_rel: List[Tuple[float, float]] = list(tl_cuts["kept_segments"])
+    kept_abs: List[Tuple[float, float]] = list(
+        tl_cuts.get("kept_segments_abs")
+        or [(round(anchor_s + s, 3), round(anchor_s + e, 3)) for s, e in kept_rel]
+    )
+    has_cuts = bool(tl_cuts.get("has_cuts", False))
+    main_dur = float(tl_cuts.get("effective_duration") or span_d)
+    eff_cf_final = float(tl_cuts.get("crossfade_sec", eff_cf))
+    cuts_count = int(tl_cuts.get("dead_air_cuts_count") or 0)
+    saved_sec = float(tl_cuts.get("dead_air_saved_sec") or 0.0)
+    post_words = [dict(w) for w in (tl_cuts.get("remapped_words") or [])]
+
+    # Cold-Open Climax Teaser (`>= 8.0s` clips): 2.8s climax prepended at t=0.0s with 0.2s white flash
+    co_active = False
+    co_window: Optional[Tuple[float, float]] = None
+    co_rel_start = 0.0
+    teaser_dur = 0.0
+    flash_dur = 0.0
+    if cold_open and main_dur >= 8.0:
+        co_window = select_cold_open_climax_window(
+            video_path,
+            clip_start_time=anchor_s,
+            clip_duration=span_d,
+            words=src_words,
+            cold_open_quote=cold_open_quote,
+            window_sec=COLD_OPEN_WINDOW_SEC,
+        )
+        if co_window is not None:
+            co_s, co_e = co_window
+            teaser_dur = max(0.8, round(co_e - co_s, 3))
+            flash_dur = min(COLD_OPEN_FLASH_SEC, round(teaser_dur * 0.25, 3))
+            co_rel_start = max(0.0, round(co_s - anchor_s, 3))
+            co_active = True
+
+            # Teaser captions rendered over [0.0, teaser_dur] from words inside the climax window
+            norm_src = _normalize_word_list(src_words, anchor_s, span_d)
+            teaser_words: List[Dict[str, Any]] = []
+            for tw in norm_src:
+                ws = float(tw.get("start", 0.0))
+                we = float(tw.get("end", ws + 0.15))
+                if we > co_rel_start and ws < co_rel_start + teaser_dur:
+                    nw = dict(tw)
+                    ns = max(0.0, round(ws - co_rel_start, 3))
+                    ne = min(teaser_dur, round(max(ns + 0.06, we - co_rel_start), 3))
+                    nw["start"] = ns
+                    nw["end"] = ne
+                    nw["is_climax_teaser"] = True
+                    nw["timeline_relative"] = True
+                    teaser_words.append(nw)
+
+            shifted_main: List[Dict[str, Any]] = []
+            for pw in post_words:
+                npw = dict(pw)
+                npw["start"] = round(float(npw.get("start", 0.0)) + teaser_dur, 3)
+                npw["end"] = round(float(npw.get("end", 0.0)) + teaser_dur, 3)
+                npw["timeline_relative"] = True
+                shifted_main.append(npw)
+            post_words = teaser_words + shifted_main
+
+    eff_dur = round(main_dur + teaser_dur, 3)
+
+    # Punch Zoom peaks: up to 6 vocal peaks >= 3.2s apart mapped cleanly onto output timeline
+    p_times: List[float] = []
+    p_intervals: List[Tuple[float, float, float]] = []
+    if punch_zoom and video_path:
+        pz = detect_punch_zoom_peaks(
+            video_path,
+            start_sec=anchor_s,
+            end_sec=anchor_s + span_d,
+            base_zoom=1.0,
+            punch_intensity=float(punch_zoom_intensity or 1.16),
+            max_peaks=6,
+            min_spacing=3.2,
+        )
+        raw_intervals = list(pz.get("punch_intervals") or [])
+        mapped_intervals: List[Tuple[float, float, float]] = []
+        mapped_times: List[float] = []
+        last_pt = -3.2
+        for t0, t1, pz_fac in raw_intervals:
+            mid_src = 0.5 * (float(t0) + float(t1))
+            if has_cuts:
+                mid_out = _map_source_rel_to_output_time(mid_src, kept_rel, eff_cf_final)
+            else:
+                mid_out = mid_src
+            mid_final = round(mid_out + teaser_dur, 3)
+            if mid_final - last_pt < 3.2 or mid_final > eff_dur - 0.15:
+                continue
+            p0 = round(max(teaser_dur, mid_final - 0.15), 3)
+            p1 = round(min(eff_dur, p0 + 0.45), 3)
+            if p1 > p0 + 0.12:
+                mapped_intervals.append((p0, p1, float(pz_fac)))
+                mapped_times.append(round(mid_final, 2))
+                last_pt = mid_final
+            if len(mapped_intervals) >= 6:
+                break
+        p_intervals = mapped_intervals
+        p_times = mapped_times
+
+    # Build diagnostic summary badges for UI toggle pills
+    mmss = f"{int(co_rel_start // 60)}:{int(co_rel_start % 60):02d}"
+    co_label = (
+        f"{teaser_dur:.1f}s climax @ {mmss}"
+        if co_active
+        else ("Clip < 8s" if cold_open else "")
+    )
+    if trim_dead_air:
+        da_label = (
+            f"{cuts_count} pause{'s' if cuts_count != 1 else ''} cut (-{saved_sec:.1f}s)"
+            if cuts_count > 0
+            else "0 pauses >= 0.55s"
+        )
+    else:
+        da_label = ""
+    pz_label = f"{len(p_intervals)} vocal peak{'s' if len(p_intervals) != 1 else ''}" if punch_zoom else ""
+
+    summary = {
+        "cold_open_active": co_active,
+        "cold_open_label": co_label,
+        "teaser_duration": teaser_dur,
+        "climax_start": round(co_window[0], 3) if co_window else None,
+        "climax_end": round(co_window[1], 3) if co_window else None,
+        "trim_dead_air_active": bool(trim_dead_air),
+        "dead_air_label": da_label,
+        "dead_air_cuts_count": cuts_count,
+        "dead_air_saved_sec": saved_sec,
+        "punch_zoom_active": bool(punch_zoom),
+        "punch_zoom_label": pz_label,
+        "punch_peaks_count": len(p_intervals),
+        "effective_duration": eff_dur,
+    }
+
+    return TimelineEditPlan(
+        keep_intervals=kept_rel,
+        kept_segments_abs=kept_abs,
+        has_cuts=has_cuts,
+        main_duration=main_dur,
+        effective_duration=eff_dur,
+        crossfade_sec=eff_cf_final,
+        remapped_words=post_words,
+        cold_open_active=co_active,
+        climax_window=co_window,
+        climax_rel_start=co_rel_start,
+        teaser_duration=teaser_dur,
+        flash_duration=flash_dur,
+        punch_timestamps=p_times,
+        punch_intervals=p_intervals,
+        dead_air_cuts_count=cuts_count,
+        dead_air_saved_sec=saved_sec,
+        timeline_fx_summary=summary,
+    )
 
 
 def build_timeline_trim_concat_filter(

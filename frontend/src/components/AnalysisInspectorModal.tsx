@@ -1,16 +1,20 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   Camera,
   CheckCircle2,
   Crosshair,
+  Eye,
   Film,
   Image as ImageIcon,
   Loader2,
+  Music,
   Play,
   RefreshCw,
   Scissors,
   Sparkles,
+  Users,
   Volume2,
   X,
 } from 'lucide-react';
@@ -27,6 +31,7 @@ interface AnalysisInspectorModalProps {
   onSetThumbnailCover: (frame: BestFrameItem) => void;
   onSnapClipStart: (frame: BestFrameItem) => Promise<void> | void;
   onCalibrateCamera: (frame: BestFrameItem) => Promise<void> | void;
+  onClipUpdated?: (updatedClip: ViralClip) => void;
 }
 
 const EMOTION_COLORS: Record<string, string> = {
@@ -78,10 +83,12 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
   onSetThumbnailCover,
   onSnapClipStart,
   onCalibrateCamera,
+  onClipUpdated,
 }) => {
   const [data, setData] = useState<BestFramesResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isReanalyzing, setIsReanalyzing] = useState(false);
+  const [isApplyingFixes, setIsApplyingFixes] = useState(false);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -125,6 +132,7 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
   const emotionShifts = data?.emotion_shifts || [];
   const acousticEvents = data?.acoustic_events || [];
   const emotionBreakdown = data?.clip_emotion_breakdown;
+  const retentionDiag = data?.retention_diagnostics;
 
   const winStart = useMemo(() => {
     if (timeline.length > 0) return timeline[0].t;
@@ -161,6 +169,8 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
     const audioPath = buildPath((p) => p.audio_prosody_score);
     const visualPath = buildPath((p) => p.visual_emotion_action_score);
     const combinedPath = buildPath((p) => p.combined_engagement_score);
+    const eyeContactPath = buildPath((p) => p.eye_contact_score ?? p.gaze_engagement_score ?? 0);
+    const noveltyPath = buildPath((p) => p.visual_novelty_score ?? 0);
     const arousalPath = buildPath((p) => p.fused_arousal ?? p.emotion_intensity ?? 35);
     const areaPath = timeline.length
       ? `${combinedPath} L ${toX(timeline[timeline.length - 1].t).toFixed(1)} ${(padY + innerH).toFixed(1)} L ${toX(timeline[0].t).toFixed(1)} ${(padY + innerH).toFixed(1)} Z`
@@ -181,6 +191,8 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
       audioPath,
       visualPath,
       combinedPath,
+      eyeContactPath,
+      noveltyPath,
       areaPath,
       arousalPath,
       arousalAreaPath,
@@ -337,6 +349,191 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
                 </div>
               )}
 
+              {/* Retention Grade & Smart Diagnostics Panel */}
+              {retentionDiag && (
+                <div className="p-4 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2.5">
+                    <div className="flex items-center gap-2.5">
+                      <span
+                        className={`w-9 h-9 rounded-xl flex items-center justify-center font-black text-base border tabular-nums ${
+                          retentionDiag.retention_grade === 'S'
+                            ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40'
+                            : retentionDiag.retention_grade === 'A'
+                              ? 'bg-sky-500/20 text-sky-400 border-sky-500/40'
+                              : retentionDiag.retention_grade === 'B'
+                                ? 'bg-amber-500/20 text-amber-400 border-amber-500/40'
+                                : 'bg-rose-500/20 text-rose-400 border-rose-500/40'
+                        }`}
+                        title={`Retention Score ${Math.round(retentionDiag.retention_score)}/100`}
+                      >
+                        {retentionDiag.retention_grade}
+                      </span>
+                      <div>
+                        <div className="text-xs font-bold text-[var(--text-primary)] flex items-center gap-2">
+                          <span>Retention Grade &amp; Smart Diagnostics</span>
+                          <span className="text-[10px] font-mono text-[var(--text-secondary)]">
+                            ({Math.round(retentionDiag.retention_score)}/100)
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-1.5 mt-1 text-[10px] font-semibold tabular-nums">
+                          <span className="px-2 py-0.5 rounded-full bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-primary)]">
+                            Fluency: {Math.round(retentionDiag.speech_fluency.avg_fluency_score)}%
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full bg-[var(--bg-input)] border border-[var(--border-subtle)] text-sky-400 flex items-center gap-1">
+                            <Eye className="w-3 h-3" />
+                            Eye-Contact: {Math.round(retentionDiag.avg_eye_contact_score)}%
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full bg-[var(--bg-input)] border border-[var(--border-subtle)] text-fuchsia-400">
+                            Visual Novelty: {Math.round(retentionDiag.avg_visual_novelty)}%
+                          </span>
+                          {retentionDiag.music_bed_summary.has_existing_music && (
+                            <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/35 text-emerald-300 flex items-center gap-1">
+                              <Music className="w-3 h-3" />
+                              Source Music Detected
+                              {retentionDiag.music_bed_summary.estimated_bpm > 0
+                                ? ` · ${Math.round(retentionDiag.music_bed_summary.estimated_bpm)} BPM`
+                                : ''}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {retentionDiag.smart_fixes.length > 0 && effProjectId && (
+                      <button
+                        type="button"
+                        disabled={isApplyingFixes || busyAction !== null}
+                        onClick={async () => {
+                          setIsApplyingFixes(true);
+                          setErrorMsg(null);
+                          try {
+                            const res = await api.applyRetentionFixes(effProjectId, clip.id);
+                            if (res?.retention_diagnostics) {
+                              setData((prev) =>
+                                prev ? { ...prev, retention_diagnostics: res.retention_diagnostics } : prev
+                              );
+                            }
+                            if (res?.clip && onClipUpdated) {
+                              onClipUpdated(res.clip);
+                            }
+                            const count = res?.applied_fixes?.length || 0;
+                            setStatusNote(
+                              count > 0
+                                ? `Applied ${count} smart retention optimization${count > 1 ? 's' : ''}.`
+                                : 'All smart retention checks are already optimized.'
+                            );
+                          } catch (err: any) {
+                            setErrorMsg(err?.message || 'Failed to apply smart retention fixes.');
+                          } finally {
+                            setIsApplyingFixes(false);
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold flex items-center gap-1.5 hover:opacity-90 transition disabled:opacity-50"
+                      >
+                        {isApplyingFixes ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Sparkles className="w-3.5 h-3.5" />
+                        )}
+                        <span>✨ Apply Smart Retention Fixes ({retentionDiag.smart_fixes.length})</span>
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Speaker Breakdown Bar + Cross-Talk Overlap Pins */}
+                  {Object.keys(retentionDiag.speaker_breakdown.dominance_ratios || {}).length > 0 && (
+                    <div className="p-2.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-[10px]">
+                        <span className="font-bold text-[var(--text-primary)] flex items-center gap-1.5">
+                          <Users className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                          <span>Speaker Dominance Breakdown</span>
+                        </span>
+                        <span className="font-mono text-[var(--text-secondary)]">
+                          {Object.entries(retentionDiag.speaker_breakdown.dominance_ratios)
+                            .map(([sp, ratio]) => `${sp} ${Math.round(Number(ratio) * 100)}%`)
+                            .join(' · ')}
+                        </span>
+                      </div>
+                      <div className="h-2 w-full rounded-full overflow-hidden flex bg-[var(--bg-card)] border border-[var(--border-subtle)]">
+                        {Object.entries(retentionDiag.speaker_breakdown.dominance_ratios).map(([sp, ratio], idx) => {
+                          const colors = ['var(--accent-primary)', '#38BDF8', '#F472B6', '#FBBF24'];
+                          return (
+                            <div
+                              key={sp}
+                              style={{
+                                width: `${Math.max(4, Math.round(Number(ratio) * 100))}%`,
+                                backgroundColor: colors[idx % colors.length],
+                              }}
+                              title={`${sp}: ${Math.round(Number(ratio) * 100)}%`}
+                            />
+                          );
+                        })}
+                      </div>
+                      {retentionDiag.speaker_breakdown.crosstalk_overlaps.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                          <span className="text-[10px] font-semibold text-amber-400">Cross-Talk Overlaps:</span>
+                          {retentionDiag.speaker_breakdown.crosstalk_overlaps.slice(0, 6).map((ov, i) => (
+                            <button
+                              key={`ct-ov-${i}`}
+                              type="button"
+                              onClick={() => onSeekToMasterTime(ov.t)}
+                              className="px-2 py-0.5 rounded-full bg-amber-500/15 border border-amber-500/35 text-amber-300 text-[10px] font-bold hover:brightness-110 transition tabular-nums"
+                            >
+                              Clash {ov.t.toFixed(1)}s–{ov.end.toFixed(1)}s
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* HUD Collision Alert & Retention Risk Zones */}
+                  {(retentionDiag.hud_obstruction.hud_collision ||
+                    retentionDiag.hud_obstruction.bottom_hud_occupied ||
+                    retentionDiag.risk_zones.length > 0 ||
+                    retentionDiag.smart_fixes.length > 0) && (
+                    <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                      {retentionDiag.hud_obstruction.hud_collision ? (
+                        <div className="px-2.5 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-300 font-semibold flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          <span>
+                            HUD / Burned-in Subtitle Collision Detected — recommended Caption Y ={' '}
+                            {retentionDiag.hud_obstruction.recommended_caption_y.toFixed(2)}
+                          </span>
+                        </div>
+                      ) : retentionDiag.hud_obstruction.bottom_hud_occupied ? (
+                        <div className="px-2.5 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 font-semibold flex items-center gap-1.5">
+                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                          <span>Bottom HUD detected — captions safely cleared to Top Zone</span>
+                        </div>
+                      ) : null}
+
+                      {retentionDiag.risk_zones.map((rz, idx) => (
+                        <button
+                          key={`rz-${idx}`}
+                          type="button"
+                          onClick={() => onSeekToMasterTime(rz.start)}
+                          className="px-2.5 py-1 rounded-lg bg-rose-500/15 border border-rose-500/35 text-rose-300 font-semibold hover:brightness-110 transition tabular-nums"
+                          title={rz.reason}
+                        >
+                          Drop-Off Risk {rz.start.toFixed(1)}s–{rz.end.toFixed(1)}s ({rz.duration.toFixed(1)}s)
+                        </button>
+                      ))}
+
+                      {retentionDiag.smart_fixes.map((fx) => (
+                        <span
+                          key={fx.id}
+                          className="px-2 py-0.5 rounded-full bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-secondary)]"
+                          title={fx.reason}
+                        >
+                          Recommended: {fx.label}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Synchronized Multi-Track Telemetry Graph */}
               <div className="p-4 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2.5">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -355,6 +552,12 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
                     </span>
                     <span className="flex items-center gap-1 text-amber-400">
                       <span className="w-2.5 h-0.5 bg-amber-400 inline-block" /> Motion &amp; Emotion
+                    </span>
+                    <span className="flex items-center gap-1 text-sky-400">
+                      <span className="w-2.5 h-0.5 bg-sky-400 inline-block" /> Eye-Contact
+                    </span>
+                    <span className="flex items-center gap-1 text-fuchsia-400">
+                      <span className="w-2.5 h-0.5 bg-fuchsia-400 inline-block" /> Visual Novelty
                     </span>
                     <span className="flex items-center gap-1 text-rose-400">
                       <span className="w-0.5 h-2.5 bg-rose-400 inline-block" /> Scene Cut
@@ -419,6 +622,29 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
                         fill="none"
                         stroke="#fbbf24"
                         strokeWidth={2}
+                        strokeLinejoin="round"
+                      />
+                    )}
+
+                    {/* Eye-Contact Engagement */}
+                    {svgGeometry.eyeContactPath && (
+                      <path
+                        d={svgGeometry.eyeContactPath}
+                        fill="none"
+                        stroke="#38bdf8"
+                        strokeWidth={1.7}
+                        strokeDasharray="4 2"
+                        strokeLinejoin="round"
+                      />
+                    )}
+
+                    {/* Visual Novelty */}
+                    {svgGeometry.noveltyPath && (
+                      <path
+                        d={svgGeometry.noveltyPath}
+                        fill="none"
+                        stroke="#e879f9"
+                        strokeWidth={1.7}
                         strokeLinejoin="round"
                       />
                     )}
@@ -529,9 +755,11 @@ export const AnalysisInspectorModal: React.FC<AnalysisInspectorModalProps> = ({
                     {hoveredPoint ? (
                       <span className="text-[var(--text-primary)] font-semibold">
                         t={hoveredPoint.t.toFixed(2)}s · Comb {hoveredPoint.combined_engagement_score} · Aud{' '}
-                        {hoveredPoint.audio_prosody_score} · Vis {hoveredPoint.visual_emotion_action_score} ·{' '}
-                        {formatTagLabel(hoveredPoint.dominant_emotion)} / {formatTagLabel(hoveredPoint.vocal_emotion)}{' '}
-                        (Arousal {Math.round(hoveredPoint.fused_arousal ?? hoveredPoint.emotion_intensity)}%)
+                        {hoveredPoint.audio_prosody_score} · Vis {hoveredPoint.visual_emotion_action_score} · Eye{' '}
+                        {Math.round(hoveredPoint.eye_contact_score ?? 0)}% · Nov{' '}
+                        {Math.round(hoveredPoint.visual_novelty_score ?? 0)}% · Flu{' '}
+                        {Math.round(hoveredPoint.fluency_score ?? 78)}% ·{' '}
+                        {hoveredPoint.speaker_id || formatTagLabel(hoveredPoint.dominant_emotion)}
                       </span>
                     ) : (
                       <span>Hover or click timeline to inspect exact 0.25s prosody &amp; quality</span>

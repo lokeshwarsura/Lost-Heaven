@@ -119,10 +119,13 @@ def test_all_9_presets_distinct_histograms_and_linear_strength(tmp_path: Path):
     mp4 = _make_rich_color_mp4(tmp_path / "clip_src.mp4")
     base_png = tmp_path / "base_frame.png"
 
-    assert len(STUDIO_COLOR_PRESETS) == 9
+    assert len(STUDIO_COLOR_PRESETS) == 18
     expected_ids = [
         "none", "kodak_portra_400", "teal_orange", "cyberpunk_neon",
         "moody_noir", "golden_hour", "bw_16mm", "gaming_pop", "clean_rec709",
+        "fuji_velvia_50", "cinestill_800t", "bleach_bypass", "pastel_dream",
+        "tokyo_midnight", "warm_podcast_studio", "vhs_90s_tape", "arctic_crisp",
+        "emerald_gold",
     ]
     assert [p["id"] for p in STUDIO_COLOR_PRESETS] == expected_ids
 
@@ -268,7 +271,7 @@ def test_cube_lut_windows_escaping_preset_previews_endpoint_and_compare_bypass(
 
         # Call preset-previews endpoint twice (render + cache hit)
         resp1 = main_mod.get_clip_preset_previews_endpoint(proj.id, clip.id, session=session)
-        assert len(resp1["presets"]) == 9
+        assert len(resp1["presets"]) == 18
         assert resp1["lut_preview"] is not None
         presets_dir = storage_dir / "previews" / "presets" / f"{proj.id}_{clip.id}"
         for item in resp1["presets"]:

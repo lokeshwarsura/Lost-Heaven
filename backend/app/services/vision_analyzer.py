@@ -557,7 +557,11 @@ def analyze_clip_visuals(
         has_corner_webcam = False
     else:
         face_ratio = sum(1 for k in keyframes if k["face_count"] > 0) / float(max(1, len(keyframes)))
-        has_corner_webcam = bool(webcam.get("detected"))
+        has_corner_webcam = bool(
+            webcam.get("detected")
+            and webcam.get("webcam_detected", True)
+            and webcam.get("source_zone") not in (None, "", "none", "center")
+        )
 
     # Group contiguous keyframes into discrete semantic shots
     shots: List[Dict[str, Any]] = []

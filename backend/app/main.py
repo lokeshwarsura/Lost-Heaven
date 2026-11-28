@@ -9,7 +9,7 @@ import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, Body
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,7 +30,7 @@ from app.models import (
     CreateBrandPresetRequest, CreateCaptionStyleRequest,
     ProvideKeyRequest, RetryProjectRequest, TestGeminiRequest,
     BulkDeleteProjectsRequest, ProjectCleanupRequest,
-    InstallPrerequisitesRequest, CompleteOnboardingRequest
+    InstallPrerequisitesRequest, CompleteOnboardingRequest, ProExportRequest
 )
 from app.services.proxy import probe_video, create_gemini_proxy, get_ffmpeg_cmd
 from app.services.gemini_clipper import (
@@ -52,6 +52,7 @@ from app.services.preview_frame import render_exact_preview_frame
 from app.services.timeline_editor import extract_waveform_bins
 from app.services.broll_engine import suggest_broll_cutaways
 from app.services.nle_exporter import export_clip_nle
+from app.services.exporter import export_pro_master, export_full_res_cover_png, export_multi_aspect_batch_zip
 from app.services.hook_generator import generate_hook_variants
 from app.services.social_copywriter import generate_multi_platform_copy
 from app.services.publish_pack import build_publish_pack_zip
@@ -70,7 +71,16 @@ from app.services.hardware import detect_hardware_specs
 from app.services.diagnostics import get_system_check, get_machine_specs, update_ytdlp_package
 from app.services.model_manager import list_whisper_models, download_whisper_model, delete_whisper_model
 from app.services.captions import CAPTION_STYLES_DEF, FONT_MAP
-from app.services.youtube_uploader import publish_video_to_youtube, is_youtube_authenticated
+from app.services.youtube_publisher import (
+    YouTubeAuthError,
+    YouTubeConfigError,
+    connect_youtube_account,
+    disconnect_youtube_account,
+    get_youtube_status,
+    is_youtube_authenticated,
+    save_youtube_client_secrets,
+    upload_clip_to_youtube,
+)
 from app.services.job_manager import job_manager, get_persisted_settings, save_persisted_settings
 
 logging.basicConfig(level=logging.INFO)
@@ -173,6 +183,17 @@ def _hydrate_settings_from_disk() -> None:
         settings.VIDEO_ENCODER = str(persisted["video_encoder"])
     if persisted.get("default_resolution"):
         settings.DEFAULT_RESOLUTION = str(persisted["default_resolution"])
+    if persisted.get("default_fps"):
+        settings.DEFAULT_FPS = str(persisted["default_fps"])
+    if persisted.get("loudness_target"):
+        settings.LOUDNESS_TARGET = str(persisted["loudness_target"])
+    if "audio_normalization_enabled" in persisted:
+        settings.AUDIO_NORMALIZATION_ENABLED = bool(persisted["audio_normalization_enabled"])
+    if "auto_cleanup_days" in persisted:
+        try:
+            settings.AUTO_CLEANUP_DAYS = int(persisted["auto_cleanup_days"])
+        except Exception:
+            pass
     if persisted.get("vision_scan_fps"):
         try:
             settings.VISION_SCAN_FPS = float(persisted["vision_scan_fps"])
@@ -464,6 +485,7 @@ def get_system_settings():
     except Exception:
         RUNTIME_SETTINGS["whisper_badge"] = "CPU int8"
     RUNTIME_SETTINGS["active_theme"] = persisted.get("active_theme", RUNTIME_SETTINGS.get("active_theme", "Hicksfield"))
+    RUNTIME_SETTINGS["custom_themes"] = persisted.get("custom_themes") if isinstance(persisted.get("custom_themes"), list) else []
     RUNTIME_SETTINGS["pexels_api_key"] = persisted.get("pexels_api_key", "")
     RUNTIME_SETTINGS["watch_folder_path"] = persisted.get("watch_folder_path", "")
     RUNTIME_SETTINGS["watch_folder_enabled"] = bool(persisted.get("watch_folder_enabled", False))
@@ -473,6 +495,10 @@ def get_system_settings():
     RUNTIME_SETTINGS["whisper_batch_size"] = settings.WHISPER_BATCH_SIZE
     RUNTIME_SETTINGS["video_encoder"] = persisted.get("video_encoder", settings.VIDEO_ENCODER)
     RUNTIME_SETTINGS["default_resolution"] = persisted.get("default_resolution", settings.DEFAULT_RESOLUTION)
+    RUNTIME_SETTINGS["default_fps"] = persisted.get("default_fps", settings.DEFAULT_FPS)
+    RUNTIME_SETTINGS["loudness_target"] = persisted.get("loudness_target", settings.LOUDNESS_TARGET)
+    RUNTIME_SETTINGS["audio_normalization_enabled"] = bool(persisted.get("audio_normalization_enabled", settings.AUDIO_NORMALIZATION_ENABLED))
+    RUNTIME_SETTINGS["auto_cleanup_days"] = int(persisted.get("auto_cleanup_days", settings.AUTO_CLEANUP_DAYS) or 30)
     RUNTIME_SETTINGS["vision_scan_fps"] = persisted.get("vision_scan_fps", settings.VISION_SCAN_FPS)
     RUNTIME_SETTINGS["model_cascade"] = DEFAULT_MODEL_CASCADE
     return RUNTIME_SETTINGS
@@ -497,6 +523,37 @@ def update_system_settings(req: Dict[str, Any]):
         theme = str(req["active_theme"])
         RUNTIME_SETTINGS["active_theme"] = theme
         persisted["active_theme"] = theme
+    if "custom_themes" in req and isinstance(req["custom_themes"], list):
+        clean_themes = [t for t in req["custom_themes"] if isinstance(t, dict) and t.get("id") and t.get("name")]
+        persisted["custom_themes"] = clean_themes
+        RUNTIME_SETTINGS["custom_themes"] = clean_themes
+    if "video_encoder" in req:
+        ve = str(req["video_encoder"])
+        settings.VIDEO_ENCODER = ve
+        persisted["video_encoder"] = ve
+    if "default_resolution" in req:
+        dr = str(req["default_resolution"])
+        settings.DEFAULT_RESOLUTION = dr
+        persisted["default_resolution"] = dr
+    if "default_fps" in req:
+        dfps = str(req["default_fps"])
+        settings.DEFAULT_FPS = dfps
+        persisted["default_fps"] = dfps
+    if "loudness_target" in req:
+        lt = str(req["loudness_target"])
+        settings.LOUDNESS_TARGET = lt
+        persisted["loudness_target"] = lt
+    if "audio_normalization_enabled" in req:
+        ane = bool(req["audio_normalization_enabled"])
+        settings.AUDIO_NORMALIZATION_ENABLED = ane
+        persisted["audio_normalization_enabled"] = ane
+    if "auto_cleanup_days" in req:
+        try:
+            acd = max(0, min(365, int(req["auto_cleanup_days"])))
+            settings.AUTO_CLEANUP_DAYS = acd
+            persisted["auto_cleanup_days"] = acd
+        except (TypeError, ValueError):
+            pass
     if "hardware_acceleration" in req:
         hw = str(req["hardware_acceleration"])
         RUNTIME_SETTINGS["hardware_acceleration"] = hw
@@ -715,6 +772,7 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "lut_path": req.lut_path if req.lut_path is not None else clip_opts.get("lut_path"),
         "chroma_split": req.chroma_split if req.chroma_split is not None else clip_opts.get("chroma_split", 0.0),
         "letterbox": req.letterbox if req.letterbox is not None else clip_opts.get("letterbox", "none"),
+        "horizon_tilt": req.horizon_tilt if req.horizon_tilt is not None else clip_opts.get("horizon_tilt", 0.0),
         "bypass_color": bool(req.bypass_color),
     }
 
@@ -736,6 +794,11 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "position_y": req.pos_y if req.pos_y is not None else req.position_y,
         "caption_x": req.caption_x if req.caption_x is not None else clip_opts.get("caption_x"),
         "caption_y": req.caption_y if req.caption_y is not None else clip_opts.get("caption_y"),
+        "caption_custom_position": (
+            req.caption_custom_position
+            if req.caption_custom_position is not None
+            else bool(clip_opts.get("caption_custom_position", False))
+        ),
         "caption_rotation": req.caption_rotation if req.caption_rotation is not None else clip_opts.get("caption_rotation", 0.0),
         "caption_max_width": req.caption_max_width if req.caption_max_width is not None else clip_opts.get("caption_max_width", 0.82),
         "outline_width": req.outline if req.outline is not None else req.outline_width,
@@ -804,6 +867,9 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             custom_height=req.custom_height,
             frame_layout=req.framing_template or req.frame_layout,
             webcam_corner=req.webcam_corner,
+            source_corner=req.source_corner or (
+                (clip_webcam_region or {}).get("locked_zone") if isinstance(clip_webcam_region, dict) else None
+            ) or "auto",
             webcam_split_ratio=req.webcam_split_ratio,
             source_webcam_region=clip_webcam_region,
             visual_map=clip_visual_map,
@@ -1275,18 +1341,21 @@ def _delete_single_project_and_files(project_id: int, session: Session) -> int:
             except Exception:
                 pass
 
-    # Protect source file only if another remaining project shares the exact same path
+    # Protect source/proxy files if another remaining project shares the exact same path
     other_projects_same_source = False
-    if project.source_path:
-        src_real = _norm_real_path(project.source_path)
+    other_projects_same_proxy = False
+    src_real = _norm_real_path(project.source_path) if project.source_path else ""
+    prx_real = _norm_real_path(project.proxy_path) if project.proxy_path else ""
+    if src_real or prx_real:
         for other in session.exec(select(Project).where(Project.id != project_id)).all():
-            if other.source_path and _norm_real_path(other.source_path) == src_real:
+            if src_real and other.source_path and _norm_real_path(other.source_path) == src_real:
                 other_projects_same_source = True
-                break
+            if prx_real and other.proxy_path and _norm_real_path(other.proxy_path) == prx_real:
+                other_projects_same_proxy = True
     if not other_projects_same_source:
         _unlink_file(project.source_path)
-
-    _unlink_file(project.proxy_path)
+    if not other_projects_same_proxy:
+        _unlink_file(project.proxy_path)
 
     clips = session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
     for c in clips:
@@ -1483,6 +1552,8 @@ def list_projects(session: Session = Depends(get_session)):
         p_dict["ai_mode"] = proj_ai_mode
         p_dict["error_message"] = err_msg
         p_dict["default_framing"] = getattr(p, "default_framing", "smart_auto") or "smart_auto"
+        p_dict["tags"] = p.get_tags()
+        p_dict["podcast_mode"] = bool(getattr(p, "podcast_mode", False))
         project_list.append(p_dict)
 
     # Include unattributed temporary preview/temp/proxy cache on SSD
@@ -1759,6 +1830,7 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     for k_opt, k_def in (
         ("caption_x", None),
         ("caption_y", None),
+        ("caption_custom_position", False),
         ("caption_rotation", 0.0),
         ("caption_max_width", 0.82),
         ("preset_intensity", 100.0),
@@ -1774,16 +1846,23 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
         ("voice_eq_preset", "Raw"),
         ("de_esser", False),
         ("loudness_target", "-14 LUFS"),
+        ("voice_enhancer", False),
+        ("horizon_tilt", 0.0),
         ("speed_ramp", 1.0),
         ("chroma_split", 0.0),
         ("letterbox", "none"),
+        ("framing_user_locked", False),
         ("outro_cta_headline", ""),
         ("outro_cta_handle", ""),
         ("outro_logo_path", None),
     ):
         cdict[k_opt] = opts.get(k_opt, k_def)
+    cdict["cold_open"] = bool(getattr(clip, "use_cold_open", False))
+    cdict["trim_dead_air"] = bool(getattr(clip, "auto_trim_dead_air", False))
+    cdict["punch_zoom"] = bool(getattr(clip, "dynamic_punch_zoom", False))
     cdict["caption_x"] = float(opts["caption_x"]) if opts.get("caption_x") is not None else round(float(clip.position_x or 50.0) / 100.0, 4)
-    cdict["caption_y"] = float(opts["caption_y"]) if opts.get("caption_y") is not None else round(float(clip.position_y or 76.0) / 100.0, 4)
+    cdict["caption_y"] = float(opts["caption_y"]) if opts.get("caption_y") is not None else round(float(clip.position_y or 78.0) / 100.0, 4)
+    cdict["caption_custom_position"] = bool(opts.get("caption_custom_position", False))
     cdict["narrative_arc"] = opts.get("narrative_arc")
     cdict["arc_label"] = opts.get("arc_label")
     cdict["dominant_emotion"] = opts.get("dominant_emotion")
@@ -1791,10 +1870,17 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     cdict["emotion_arousal"] = opts.get("emotion_arousal")
     cdict["emotion_valence"] = opts.get("emotion_valence")
     cdict["acoustic_events"] = opts.get("acoustic_events") or []
+    mm_proj = project.get_multimodal_analysis() if project is not None else None
+    mm_proj_sum = mm_proj.get("summary") if isinstance(mm_proj, dict) else {}
+    cdict["has_existing_music"] = bool(
+        opts["has_existing_music"]
+        if "has_existing_music" in opts
+        else (mm_proj_sum.get("has_existing_music", False) if isinstance(mm_proj_sum, dict) else False)
+    )
     vmap = clip.get_visual_map()
     cdict["visual_map_summary"] = vmap.get("summary") if isinstance(vmap, dict) else None
     if project is not None:
-        mm = project.get_multimodal_analysis()
+        mm = mm_proj
         if isinstance(mm, dict):
             cdict["multimodal_summary"] = mm.get("summary")
             cdict["emotion_summary"] = mm.get("emotion_summary")
@@ -1868,11 +1954,76 @@ def update_project(
         project.caption_language = str(req["caption_language"])
     if "hardware_mode" in req and req["hardware_mode"] is not None:
         project.hardware_mode = str(req["hardware_mode"])
+    if "tags" in req and isinstance(req["tags"], list):
+        project.set_tags(req["tags"])
+    if "podcast_mode" in req and req["podcast_mode"] is not None:
+        project.podcast_mode = bool(req["podcast_mode"])
 
     session.add(project)
     session.commit()
     session.refresh(project)
-    return {"status": "updated", "project": project}
+    out_p = project.model_dump()
+    out_p["tags"] = project.get_tags()
+    out_p["podcast_mode"] = bool(getattr(project, "podcast_mode", False))
+    return {"status": "updated", "project": out_p}
+
+
+@app.post("/api/projects/{project_id}/duplicate")
+def duplicate_project_endpoint(project_id: int, session: Session = Depends(get_session)):
+    """Clone an existing project and its ViralClip timeline rows in SQLite sharing the source media file."""
+    src_proj = session.get(Project, project_id)
+    if not src_proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    src_clips = session.exec(select(ViralClip).where(ViralClip.project_id == project_id)).all()
+    # Snapshot clip dumps BEFORE session.commit() expires loaded ORM instances in SQLModel
+    src_clip_dumps = [sc.model_dump() for sc in src_clips]
+    cloned_proj = Project(
+        title=f"{src_proj.title} (Copy)",
+        source_type=src_proj.source_type,
+        source_filename=src_proj.source_filename,
+        source_path=src_proj.source_path,
+        proxy_path=src_proj.proxy_path,
+        duration=src_proj.duration,
+        resolution_w=src_proj.resolution_w,
+        resolution_h=src_proj.resolution_h,
+        fps=src_proj.fps,
+        status=src_proj.status if src_proj.status in ("analyzed", "ready", "finished", "completed") else "created",
+        default_aspect_ratio=src_proj.default_aspect_ratio,
+        duration_preset=src_proj.duration_preset,
+        clip_count=src_proj.clip_count,
+        clip_length_target=src_proj.clip_length_target,
+        caption_language=src_proj.caption_language,
+        hardware_mode=src_proj.hardware_mode,
+        default_framing=src_proj.default_framing,
+        ai_mode=src_proj.ai_mode,
+        topic_focus=src_proj.topic_focus,
+        multimodal_analysis_json=src_proj.multimodal_analysis_json,
+        tags_json=getattr(src_proj, "tags_json", "[]") or "[]",
+        podcast_mode=bool(getattr(src_proj, "podcast_mode", False)),
+    )
+    session.add(cloned_proj)
+    session.commit()
+    session.refresh(cloned_proj)
+
+    cloned_count = 0
+    for cdata in src_clip_dumps:
+        cdata.pop("id", None)
+        cdata["project_id"] = cloned_proj.id
+        cdata["rendered_video_path"] = None
+        cdata["rendered_path"] = None
+        cdata["render_status"] = "idle"
+        cdata["render_progress"] = 0
+        cdata["status"] = "draft"
+        session.add(ViralClip(**cdata))
+        cloned_count += 1
+    session.commit()
+    session.refresh(cloned_proj)
+
+    res_proj = cloned_proj.model_dump()
+    res_proj["tags"] = cloned_proj.get_tags()
+    res_proj["clips_count"] = cloned_count
+    return {"status": "duplicated", "project": res_proj, "clips_cloned": cloned_count}
 
 @app.delete("/api/projects/{project_id}")
 def delete_project(project_id: int, session: Session = Depends(get_session)):
@@ -1964,7 +2115,8 @@ def retry_project_job_endpoint(
     force_offline = bool(req.force_offline) if req else False
     if req and req.ai_mode == "offline":
         force_offline = True
-    job = job_manager.retry_pipeline(project_id, background_tasks, force_offline=force_offline)
+    req_stage = req.stage if req else None
+    job = job_manager.retry_pipeline(project_id, background_tasks, force_offline=force_offline, stage=req_stage)
     return {
         "status": "processing",
         "project_id": project_id,
@@ -2136,6 +2288,7 @@ async def upload_video(
     framing_template: Optional[str] = Form(None),
     ai_mode: Optional[str] = Form(None),
     batch_queue: Optional[bool] = Form(False),
+    podcast_mode: Optional[bool] = Form(False),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     session: Session = Depends(get_session)
 ):
@@ -2170,6 +2323,7 @@ async def upload_video(
     framing_template = _uf(framing_template, None)
     ai_mode = _uf(ai_mode, None)
     batch_queue = bool(_uf(batch_queue, False))
+    podcast_mode = bool(_uf(podcast_mode, False)) or Path(file.filename or "").suffix.lower() in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")
 
     from app.services.job_manager import resolve_ai_mode
     clean_ai_mode = ai_mode if ai_mode in ("gemini", "offline") else None
@@ -2196,7 +2350,8 @@ async def upload_video(
         hardware_mode=hardware_mode or "gpu",
         default_framing=framing_choice,
         ai_mode=stored_ai_mode,
-        topic_focus=eff_topic
+        topic_focus=eff_topic,
+        podcast_mode=podcast_mode,
     )
     session.add(project)
     session.commit()
@@ -2216,6 +2371,7 @@ async def upload_video(
         hardware_mode=hardware_mode or "gpu",
         ai_mode=clean_ai_mode,
         default_framing=framing_choice,
+        podcast_mode=podcast_mode,
     )
 
     if batch_queue:
@@ -2280,6 +2436,29 @@ async def import_youtube(
         logger.error(f"yt-dlp metadata/import failed for '{clean_url}': {e}")
         raise HTTPException(status_code=400, detail=f"Failed to import YouTube video: {str(e)}")
 
+    def _parse_yt_sec(raw_str: Optional[str], raw_num: Optional[float]) -> Optional[float]:
+        if raw_num is not None:
+            return max(0.0, float(raw_num))
+        if not raw_str or not str(raw_str).strip():
+            return None
+        txt = str(raw_str).strip()
+        try:
+            if ":" in txt:
+                parts = [float(p) for p in txt.split(":")]
+                if len(parts) == 2:
+                    return max(0.0, parts[0] * 60.0 + parts[1])
+                if len(parts) == 3:
+                    return max(0.0, parts[0] * 3600.0 + parts[1] * 60.0 + parts[2])
+            return max(0.0, float(txt))
+        except Exception:
+            return None
+
+    start_sec = _parse_yt_sec(getattr(req, "start_time", None), getattr(req, "start_seconds", None))
+    end_sec = _parse_yt_sec(getattr(req, "end_time", None), getattr(req, "end_seconds", None))
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
+        raise HTTPException(status_code=400, detail="YouTube End time must be greater than Start time.")
+    podcast_mode = bool(getattr(req, "podcast_mode", False))
+
     from app.services.job_manager import resolve_ai_mode
     clean_ai_mode = req.ai_mode if req.ai_mode in ("gemini", "offline") else None
     resolved_mode = resolve_ai_mode(get_persisted_settings(), explicit_ai_mode=clean_ai_mode)
@@ -2304,7 +2483,8 @@ async def import_youtube(
         hardware_mode=req.hardware_mode or "gpu",
         default_framing=framing_choice,
         ai_mode=stored_ai_mode,
-        topic_focus=eff_topic
+        topic_focus=eff_topic,
+        podcast_mode=podcast_mode,
     )
     session.add(project)
     session.commit()
@@ -2325,6 +2505,9 @@ async def import_youtube(
         ai_mode=clean_ai_mode,
         default_framing=framing_choice,
         source_url=clean_url,
+        start_sec=start_sec,
+        end_sec=end_sec,
+        podcast_mode=podcast_mode,
     )
 
     if req.batch_queue:
@@ -2337,6 +2520,9 @@ async def import_youtube(
             "ai_mode": stored_ai_mode,
             "default_framing": framing_choice,
             "normalized_url": clean_url,
+            "podcast_mode": podcast_mode,
+            "start_sec": start_sec,
+            "end_sec": end_sec,
         }
 
     background_tasks.add_task(job_manager.run_pipeline, project.id)
@@ -2349,6 +2535,9 @@ async def import_youtube(
         "ai_mode": stored_ai_mode,
         "default_framing": framing_choice,
         "normalized_url": clean_url,
+        "podcast_mode": podcast_mode,
+        "start_sec": start_sec,
+        "end_sec": end_sec,
     }
 
 # -------------------------------------------------------------
@@ -2458,6 +2647,11 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.dynamic_punch_zoom = bool(req.punch_zoom)
     elif req.dynamic_punch_zoom is not None:
         clip.dynamic_punch_zoom = bool(req.dynamic_punch_zoom)
+    clip.set_options({
+        "cold_open": bool(clip.use_cold_open),
+        "trim_dead_air": bool(clip.auto_trim_dead_air),
+        "punch_zoom": bool(clip.dynamic_punch_zoom),
+    })
     if req.options is not None and isinstance(req.options, dict):
         clip.set_options(req.options)
 
@@ -2470,8 +2664,12 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.custom_height = req.custom_height
     if req.frame_layout is not None:
         clip.frame_layout = req.frame_layout
+        clip.set_options({"framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
     elif req.framing_template is not None:
         clip.frame_layout = req.framing_template
+        clip.set_options({"framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
+    elif req.framing_user_locked is not None:
+        clip.set_options({"framing_user_locked": bool(req.framing_user_locked)})
     if req.webcam_corner is not None:
         clip.webcam_corner = req.webcam_corner
     if req.webcam_split_ratio is not None:
@@ -2544,6 +2742,10 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         py = max(8.0, min(92.0, float(req.position_y)))
         clip.position_y = py
         clip.set_options({"caption_y": round(py / 100.0, 4)})
+    if req.caption_custom_position is not None:
+        clip.set_options({"caption_custom_position": bool(req.caption_custom_position)})
+        if bool(req.caption_custom_position) and req.face_safe_captions is None:
+            clip.face_safe_captions = False
     if req.caption_rotation is not None:
         clip.set_options({"caption_rotation": max(-15.0, min(15.0, float(req.caption_rotation)))})
     if req.caption_max_width is not None:
@@ -2635,6 +2837,8 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         "voice_eq_preset",
         "de_esser",
         "loudness_target",
+        "voice_enhancer",
+        "horizon_tilt",
         "outro_cta_headline",
         "outro_cta_handle",
         "outro_logo_path",
@@ -3619,6 +3823,37 @@ def update_clip_framing_override_endpoint(
         ay = max(0.05, min(0.95, float(req.focus_anchor.get("y", 0.42))))
         updated["focus_anchor"] = {"x": round(ax, 4), "y": round(ay, 4)}
 
+    def _sanitize_crop_box(raw_box: Dict[str, Any]) -> Dict[str, float]:
+        cw = max(0.10, min(1.0, float(raw_box.get("w", 0.50))))
+        ch = max(0.10, min(1.0, float(raw_box.get("h", 0.90))))
+        cx = max(0.0, min(1.0 - cw, float(raw_box.get("x", 0.25))))
+        cy = max(0.0, min(1.0 - ch, float(raw_box.get("y", 0.05))))
+        return {"x": round(cx, 4), "y": round(cy, 4), "w": round(cw, 4), "h": round(ch, 4)}
+
+    if req.frame_crop is not None and isinstance(req.frame_crop, dict):
+        updated["frame_crop"] = _sanitize_crop_box(req.frame_crop)
+    elif any(
+        getattr(req, k) is not None
+        for k in ("frame_crop_x", "frame_crop_y", "frame_crop_w", "frame_crop_h")
+    ):
+        prev_fc = updated.get("frame_crop") or {"x": 0.25, "y": 0.05, "w": 0.50, "h": 0.90}
+        updated["frame_crop"] = _sanitize_crop_box({
+            "x": req.frame_crop_x if req.frame_crop_x is not None else prev_fc.get("x", 0.25),
+            "y": req.frame_crop_y if req.frame_crop_y is not None else prev_fc.get("y", 0.05),
+            "w": req.frame_crop_w if req.frame_crop_w is not None else prev_fc.get("w", 0.50),
+            "h": req.frame_crop_h if req.frame_crop_h is not None else prev_fc.get("h", 0.90),
+        })
+
+    if req.keyframe_start_crop is not None and isinstance(req.keyframe_start_crop, dict):
+        updated["keyframe_start_crop"] = _sanitize_crop_box(req.keyframe_start_crop)
+    elif "keyframe_start_crop" in (req.model_fields_set or set()) and req.keyframe_start_crop is None:
+        updated.pop("keyframe_start_crop", None)
+
+    if req.keyframe_end_crop is not None and isinstance(req.keyframe_end_crop, dict):
+        updated["keyframe_end_crop"] = _sanitize_crop_box(req.keyframe_end_crop)
+    elif "keyframe_end_crop" in (req.model_fields_set or set()) and req.keyframe_end_crop is None:
+        updated.pop("keyframe_end_crop", None)
+
     if req.lock_camera is not None:
         updated["lock_camera"] = bool(req.lock_camera)
 
@@ -3655,6 +3890,8 @@ def auto_frame_all_clips_endpoint(
     ).all()
     updated_count = 0
     for c in project_clips:
+        if bool((c.get_options() or {}).get("framing_user_locked", False)):
+            continue
         vmap = analyze_clip_visuals(
             video_path=project.source_path,
             start_time=float(c.start_time or 0.0),
@@ -3803,6 +4040,21 @@ def _ensure_clip_multimodal_and_best_frames(
     facial_dist_clip = {k: round(v / float(n_tl), 3) for k, v in sorted(f_dist.items(), key=lambda x: -x[1])}
     vocal_dist_clip = {k: round(v / float(n_tl), 3) for k, v in sorted(v_dist.items(), key=lambda x: -x[1])}
     opts = clip.get_options()
+    cur_cap_y = (
+        float(opts["caption_y"])
+        if opts.get("caption_y") is not None
+        else round(float(clip.position_y or 78.0) / 100.0, 4)
+    )
+    from app.services.multimodal_fusion import diagnose_clip_retention
+    ret_diag = diagnose_clip_retention(
+        mm_data,
+        clip_s,
+        clip_e,
+        current_caption_y=cur_cap_y,
+        dynamic_punch_zoom=bool(clip.dynamic_punch_zoom),
+        auto_trim_dead_air=bool(clip.auto_trim_dead_air),
+        clip_words=clip.get_transcript(),
+    )
 
     return {
         "clip_id": clip_id,
@@ -3815,6 +4067,7 @@ def _ensure_clip_multimodal_and_best_frames(
         "emotion_summary": mm_data.get("emotion_summary") or {},
         "emotion_shifts": clip_shifts,
         "acoustic_events": clip_ac_events,
+        "retention_diagnostics": ret_diag,
         "clip_emotion_breakdown": {
             "dominant_facial_emotion": win_emo.get("dominant_facial_emotion") or opts.get("dominant_emotion") or "neutral",
             "dominant_vocal_emotion": win_emo.get("dominant_vocal_emotion") or opts.get("vocal_emotion") or "calm_storytelling",
@@ -3834,6 +4087,92 @@ def _ensure_clip_multimodal_and_best_frames(
         ],
         "black_intervals": mm_data.get("black_intervals") or [],
         "peak_moments": mm_data.get("peak_moments") or [],
+    }
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/apply-retention-fixes")
+def apply_retention_fixes_endpoint(
+    project_id: int,
+    clip_id: int,
+    session: Session = Depends(get_session),
+):
+    """Apply all AI-recommended Smart Retention Fixes for the clip in one click."""
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    project = session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    mm_data = project.get_multimodal_analysis()
+    if (not mm_data or not mm_data.get("multimodal_timeline")) and project.source_path and os.path.exists(project.source_path):
+        ensured = _ensure_clip_multimodal_and_best_frames(project, clip, session, force_reanalyze=False)
+        diag = ensured.get("retention_diagnostics") or {}
+    else:
+        from app.services.multimodal_fusion import diagnose_clip_retention
+        opts = clip.get_options()
+        cur_cap_y = (
+            float(opts["caption_y"])
+            if opts.get("caption_y") is not None
+            else round(float(clip.position_y or 78.0) / 100.0, 4)
+        )
+        diag = diagnose_clip_retention(
+            mm_data,
+            float(clip.start_time or 0.0),
+            float(clip.end_time or 0.0),
+            current_caption_y=cur_cap_y,
+            dynamic_punch_zoom=bool(clip.dynamic_punch_zoom),
+            auto_trim_dead_air=bool(clip.auto_trim_dead_air),
+            clip_words=clip.get_transcript(),
+        )
+
+    applied_ids: List[str] = []
+    for fix in diag.get("smart_fixes") or []:
+        fid = str(fix.get("id") or "")
+        if fid == "shift_captions_clear_hud":
+            rec_y = max(0.08, min(0.92, float(fix.get("target_caption_y", 0.22))))
+            clip.position_y = round(rec_y * 100.0, 2)
+            clip.position_grid = "top_center" if rec_y <= 0.30 else ("middle_center" if rec_y <= 0.56 else "bottom_center")
+            clip.face_safe_captions = False
+            clip.set_options({
+                "caption_y": round(rec_y, 4),
+                "caption_custom_position": True,
+                "bottom_hud_occupied": bool((diag.get("hud_obstruction") or {}).get("bottom_hud_occupied", False)),
+                "top_hud_occupied": bool((diag.get("hud_obstruction") or {}).get("top_hud_occupied", False)),
+                "recommended_caption_y": round(rec_y, 4),
+            })
+            applied_ids.append(fid)
+        elif fid == "enable_punch_zoom_on_peaks":
+            clip.dynamic_punch_zoom = True
+            clip.punch_zoom_intensity = max(1.14, float(clip.punch_zoom_intensity or 1.14))
+            applied_ids.append(fid)
+        elif fid == "trim_hesitation_dead_air":
+            clip.auto_trim_dead_air = True
+            clip.silence_threshold = min(0.40, float(clip.silence_threshold or 0.45))
+            applied_ids.append(fid)
+
+    session.add(clip)
+    session.commit()
+    session.refresh(clip)
+
+    from app.services.multimodal_fusion import diagnose_clip_retention
+    opts_after = clip.get_options()
+    cur_y_after = float(opts_after["caption_y"]) if opts_after.get("caption_y") is not None else round(float(clip.position_y or 78.0) / 100.0, 4)
+    updated_diag = diagnose_clip_retention(
+        project.get_multimodal_analysis(),
+        float(clip.start_time or 0.0),
+        float(clip.end_time or 0.0),
+        current_caption_y=cur_y_after,
+        dynamic_punch_zoom=bool(clip.dynamic_punch_zoom),
+        auto_trim_dead_air=bool(clip.auto_trim_dead_air),
+        clip_words=clip.get_transcript(),
+    )
+
+    return {
+        "status": "applied",
+        "applied_fixes": applied_ids,
+        "clip": _serialize_clip(clip, project),
+        "retention_diagnostics": updated_diag,
     }
 
 
@@ -3969,7 +4308,7 @@ def export_clip_nle_endpoint(
     format: str = "fcpxml",
     session: Session = Depends(get_session),
 ):
-    """Export clip timeline & captions to `.fcpxml`, Premiere `.xml`, `.srt`, or `.zip` Studio Bundle."""
+    """Export clip timeline & captions to `.fcpxml`, Premiere `.xml`, `.edl`, `.srt`, `.vtt`, `.ass`, or `.zip` Studio Bundle."""
     clip = session.get(ViralClip, clip_id)
     if not clip or clip.project_id != project_id:
         raise HTTPException(status_code=404, detail="Clip not found")
@@ -3983,6 +4322,95 @@ def export_clip_nle_endpoint(
         media_type=res["media_type"],
         headers={"Content-Disposition": f'attachment; filename="{res["filename"]}"'},
     )
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/export-pro")
+def export_clip_pro_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: Optional[ProExportRequest] = Body(default=None),
+    session: Session = Depends(get_session),
+):
+    """Mastering deliverable exporter (MP4 H.264/HEVC, MOV ProRes 422 LT, WebM VP9, WAV 24-bit, MP3 320k, Cover PNG)."""
+    clip = session.get(ViralClip, clip_id)
+    project = session.get(Project, project_id)
+    if not clip or not project or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    body = req or ProExportRequest()
+    try:
+        res = export_pro_master(
+            clip=clip,
+            project=project,
+            format_id=body.format,
+            resolution=body.resolution,
+            fps=body.fps,
+            quality_preset=body.quality_preset,
+            burn_captions=body.burn_captions,
+            hardware_mode=clip.hardware_mode or "gpu",
+        )
+        return FileResponse(
+            path=res["file_path"],
+            filename=res["filename"],
+            media_type=res["media_type"],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to export deliverable: {exc}")
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/export-cover")
+def export_clip_cover_endpoint(
+    project_id: int,
+    clip_id: int,
+    resolution: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    """Export full target-resolution cover PNG frame."""
+    clip = session.get(ViralClip, clip_id)
+    project = session.get(Project, project_id)
+    if not clip or not project or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    try:
+        res = export_full_res_cover_png(clip, project, resolution=resolution)
+        return FileResponse(
+            path=res["file_path"],
+            filename=res["filename"],
+            media_type=res["media_type"],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to export cover PNG: {exc}")
+
+
+@app.post("/api/clips/{project_id}/{clip_id}/export-batch-aspects")
+def export_clip_batch_aspects_endpoint(
+    project_id: int,
+    clip_id: int,
+    req: Optional[ProExportRequest] = Body(default=None),
+    session: Session = Depends(get_session),
+):
+    """Render multi-aspect MP4 batch (9:16, 4:5, 1:1, 16:9) + SRT/VTT captions into a downloadable .zip archive."""
+    clip = session.get(ViralClip, clip_id)
+    project = session.get(Project, project_id)
+    if not clip or not project or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    body = req or ProExportRequest()
+    try:
+        res = export_multi_aspect_batch_zip(
+            clip=clip,
+            project=project,
+            aspects=body.aspects,
+            resolution=body.resolution or clip.clip_size or "720p",
+            fps=body.fps,
+            quality_preset=body.quality_preset,
+            burn_captions=bool(clip.burn_captions) if body.burn_captions is None else bool(body.burn_captions),
+            hardware_mode=clip.hardware_mode or "gpu",
+        )
+        return FileResponse(
+            path=res["file_path"],
+            filename=res["filename"],
+            media_type=res["media_type"],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to export multi-aspect batch: {exc}")
 
 
 def _resolve_gemini_runtime() -> tuple[Optional[str], Optional[str]]:
@@ -4616,6 +5044,11 @@ def trigger_render(
             clip.dynamic_punch_zoom = bool(req.dynamic_punch_zoom); dirty_req = True
         if req.punch_zoom_intensity is not None:
             clip.punch_zoom_intensity = max(1.04, min(1.35, float(req.punch_zoom_intensity))); dirty_req = True
+        clip.set_options({
+            "cold_open": bool(clip.use_cold_open),
+            "trim_dead_air": bool(clip.auto_trim_dead_air),
+            "punch_zoom": bool(clip.dynamic_punch_zoom),
+        })
         if req.silence_threshold is not None:
             clip.silence_threshold = max(0.25, min(2.0, float(req.silence_threshold))); dirty_req = True
         if req.caption_animation is not None:
@@ -4630,13 +5063,14 @@ def trigger_render(
             clip.set_options({"text_case": req.text_case})
             clip.all_caps = req.text_case.strip().lower() in ("all caps", "all_caps", "uppercase")
             dirty_req = True
-        for opt_r in ("color_preset", "outro_cta_enabled"):
+        for opt_r in ("color_preset", "outro_cta_enabled", "face_safe_captions"):
             rv = getattr(req, opt_r, None)
             if rv is not None:
                 setattr(clip, opt_r, rv); dirty_req = True
         for opt_o in (
             "caption_x",
             "caption_y",
+            "caption_custom_position",
             "caption_rotation",
             "caption_max_width",
             "preset_intensity",
@@ -4647,6 +5081,8 @@ def trigger_render(
             "voice_eq_preset",
             "de_esser",
             "loudness_target",
+            "voice_enhancer",
+            "horizon_tilt",
             "speed_ramp",
             "chroma_split",
             "letterbox",
@@ -4654,6 +5090,34 @@ def trigger_render(
             ov = getattr(req, opt_o, None)
             if ov is not None:
                 clip.set_options({opt_o: ov}); dirty_req = True
+        if req.framing_template is not None:
+            clip.frame_layout = canonicalize_framing_template(req.framing_template)
+            clip.set_options({"framing_template": clip.frame_layout, "framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
+            dirty_req = True
+        elif req.frame_layout is not None:
+            clip.frame_layout = canonicalize_framing_template(req.frame_layout)
+            clip.set_options({"framing_template": clip.frame_layout, "framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
+            dirty_req = True
+        elif req.framing_user_locked is not None:
+            clip.set_options({"framing_user_locked": bool(req.framing_user_locked)})
+            dirty_req = True
+        if req.webcam_corner is not None:
+            clip.webcam_corner = req.webcam_corner; dirty_req = True
+        if req.webcam_split_ratio is not None:
+            clip.webcam_split_ratio = float(req.webcam_split_ratio); dirty_req = True
+        if req.pip_border_color is not None:
+            clip.pip_border_color = req.pip_border_color; dirty_req = True
+        if req.source_corner is not None:
+            src_reg = clip.get_source_webcam_region() or {"detected": False}
+            src_reg["locked_zone"] = req.source_corner
+            clip.set_source_webcam_region(src_reg)
+            dirty_req = True
+        if req.caption_x is not None:
+            clip.position_x = round(max(5.0, min(95.0, float(req.caption_x) * 100.0)), 2)
+        if req.caption_y is not None:
+            clip.position_y = round(max(8.0, min(92.0, float(req.caption_y) * 100.0)), 2)
+        if req.caption_custom_position and req.face_safe_captions is None:
+            clip.face_safe_captions = False
         if req.options is not None and isinstance(req.options, dict):
             clip.set_options(req.options); dirty_req = True
         if dirty_req:
@@ -4826,10 +5290,51 @@ def download_by_clip(clip_id: int, session: Session = Depends(get_session)):
     return serve_download_file(clip)
 
 # -------------------------------------------------------------
-# YouTube Publishing Endpoints
+# YouTube OAuth 2.0 & Publishing Endpoints
 # -------------------------------------------------------------
 
-def handle_youtube_publish(clip: ViralClip, title: Optional[str], description: Optional[str], privacy: Optional[str], session: Session):
+@app.get("/api/youtube/auth/status")
+def youtube_auth_status_endpoint():
+    return get_youtube_status()
+
+
+@app.post("/api/youtube/auth/client-secrets")
+async def upload_youtube_client_secrets_endpoint(
+    request: Request,
+    file: Optional[UploadFile] = File(default=None),
+):
+    try:
+        raw_bytes = await file.read() if file is not None else await request.body()
+        return save_youtube_client_secrets(raw_bytes)
+    except YouTubeConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to save YouTube client secrets: {exc}")
+
+
+@app.post("/api/youtube/auth/connect")
+def connect_youtube_endpoint():
+    try:
+        return connect_youtube_account()
+    except YouTubeConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"YouTube OAuth connection failed: {exc}")
+
+
+@app.post("/api/youtube/auth/disconnect")
+def disconnect_youtube_endpoint():
+    return disconnect_youtube_account()
+
+
+def handle_youtube_publish(
+    clip: ViralClip,
+    title: Optional[str],
+    description: Optional[str],
+    privacy: Optional[str],
+    session: Session,
+    tags: Optional[List[str]] = None,
+):
     if not clip.rendered_video_path or not os.path.exists(clip.rendered_video_path):
         raise HTTPException(status_code=400, detail="Render the clip before publishing to YouTube.")
 
@@ -4838,22 +5343,22 @@ def handle_youtube_publish(clip: ViralClip, title: Optional[str], description: O
     final_privacy = privacy or clip.privacy_status or "private"
 
     try:
-        result = publish_video_to_youtube(
+        result = upload_clip_to_youtube(
             video_path=clip.rendered_video_path,
             title=final_title,
             description=final_desc,
+            tags=tags,
             privacy_status=final_privacy,
-            aspect_ratio=clip.aspect_ratio
+            aspect_ratio=clip.aspect_ratio,
         )
-    except FileNotFoundError as fnf:
-        raise HTTPException(
-            status_code=400,
-            detail=str(fnf)
-        )
+    except YouTubeAuthError as auth_err:
+        raise HTTPException(status_code=401, detail=str(auth_err))
+    except (YouTubeConfigError, FileNotFoundError) as cfg_err:
+        raise HTTPException(status_code=400, detail=str(cfg_err))
     except Exception as exc:
         raise HTTPException(
             status_code=400,
-            detail=f"YouTube publishing error: {str(exc)}"
+            detail=f"YouTube publishing error: {str(exc)}",
         )
 
     clip.youtube_video_id = result.get("video_id")
@@ -4863,11 +5368,33 @@ def handle_youtube_publish(clip: ViralClip, title: Optional[str], description: O
 
     return result
 
+
+@app.post("/api/clips/{project_id}/{clip_id}/publish/youtube")
+def publish_clip_to_youtube_scoped(
+    project_id: int,
+    clip_id: int,
+    req: PublishYouTubeRequest = Body(default_factory=PublishYouTubeRequest),
+    session: Session = Depends(get_session),
+):
+    clip = session.get(ViralClip, clip_id)
+    if not clip or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    privacy = req.privacy or req.privacy_status or "private"
+    return handle_youtube_publish(
+        clip=clip,
+        title=req.title,
+        description=req.description,
+        privacy=privacy,
+        session=session,
+        tags=req.tags,
+    )
+
+
 @app.post("/api/publish/youtube")
 def publish_to_youtube_generic(
     req: PublishYouTubeRequest,
     clip_id: Optional[int] = None,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
 ):
     target_clip_id = clip_id or req.clip_id
     if not target_clip_id:
@@ -4879,18 +5406,34 @@ def publish_to_youtube_generic(
         if not clip:
             raise HTTPException(status_code=404, detail="Clip not found")
     privacy = req.privacy or req.privacy_status or "private"
-    return handle_youtube_publish(clip, req.title, req.description, privacy, session)
+    return handle_youtube_publish(
+        clip=clip,
+        title=req.title,
+        description=req.description,
+        privacy=privacy,
+        session=session,
+        tags=req.tags,
+    )
+
 
 @app.post("/api/clips/{clip_id}/publish-youtube")
 def publish_to_youtube_clip(
     clip_id: int,
     req: PublishYouTubeRequest,
-    session: Session = Depends(get_session)
+    session: Session = Depends(get_session),
 ):
     clip = session.get(ViralClip, clip_id)
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
-    return handle_youtube_publish(clip, req.title, req.description, req.privacy_status, session)
+    privacy = req.privacy or req.privacy_status or "private"
+    return handle_youtube_publish(
+        clip=clip,
+        title=req.title,
+        description=req.description,
+        privacy=privacy,
+        session=session,
+        tags=req.tags,
+    )
 
 # -------------------------------------------------------------
 # Settings API
@@ -4938,11 +5481,16 @@ def get_studio_settings():
         "whisper_batch_size": settings.WHISPER_BATCH_SIZE,
         "video_encoder": persisted.get("video_encoder", settings.VIDEO_ENCODER),
         "default_resolution": persisted.get("default_resolution", settings.DEFAULT_RESOLUTION),
+        "default_fps": str(persisted.get("default_fps", settings.DEFAULT_FPS)),
+        "loudness_target": str(persisted.get("loudness_target", settings.LOUDNESS_TARGET) or "-14 LUFS"),
+        "audio_normalization_enabled": bool(persisted.get("audio_normalization_enabled", settings.AUDIO_NORMALIZATION_ENABLED)),
+        "auto_cleanup_days": int(persisted.get("auto_cleanup_days", settings.AUTO_CLEANUP_DAYS)),
         "first_run_completed": bool(persisted.get("first_run_completed", False)),
         "youtube_authenticated": has_youtube,
         "hardware_acceleration": settings.HARDWARE_ACCELERATION,
         "ffmpeg_path": get_ffmpeg_cmd(),
         "active_theme": persisted.get("active_theme", RUNTIME_SETTINGS.get("active_theme", "Hicksfield")),
+        "custom_themes": persisted.get("custom_themes", []) if isinstance(persisted.get("custom_themes"), list) else [],
         "model_cascade": DEFAULT_MODEL_CASCADE
     }
 
@@ -5000,9 +5548,93 @@ def update_studio_settings(req: SettingsUpdateRequest):
     if req.active_theme is not None:
         persisted["active_theme"] = req.active_theme
         RUNTIME_SETTINGS["active_theme"] = req.active_theme
+    if req.custom_themes is not None:
+        persisted["custom_themes"] = req.custom_themes
     if req.hardware_acceleration is not None:
         settings.HARDWARE_ACCELERATION = req.hardware_acceleration
         persisted["hardware_acceleration"] = req.hardware_acceleration
+    if req.video_encoder is not None:
+        settings.VIDEO_ENCODER = req.video_encoder
+        persisted["video_encoder"] = req.video_encoder
+    if req.default_resolution is not None:
+        settings.DEFAULT_RESOLUTION = req.default_resolution
+        persisted["default_resolution"] = req.default_resolution
+    if req.default_fps is not None:
+        settings.DEFAULT_FPS = str(req.default_fps)
+        persisted["default_fps"] = str(req.default_fps)
+        RUNTIME_SETTINGS["default_fps"] = settings.DEFAULT_FPS
+    if req.loudness_target is not None:
+        lt_str = str(req.loudness_target).strip()
+        if lt_str and "lufs" not in lt_str.lower():
+            lt_str = f"{lt_str} LUFS"
+        lt_val = lt_str or "-14 LUFS"
+        settings.LOUDNESS_TARGET = lt_val
+        persisted["loudness_target"] = lt_val
+        RUNTIME_SETTINGS["loudness_target"] = lt_val
+    if req.audio_normalization_enabled is not None:
+        settings.AUDIO_NORMALIZATION_ENABLED = bool(req.audio_normalization_enabled)
+        persisted["audio_normalization_enabled"] = bool(req.audio_normalization_enabled)
+    if req.auto_cleanup_days is not None:
+        acd = max(0, min(365, int(req.auto_cleanup_days)))
+        settings.AUTO_CLEANUP_DAYS = acd
+        persisted["auto_cleanup_days"] = acd
+        RUNTIME_SETTINGS["auto_cleanup_days"] = acd
+    if req.pexels_api_key is not None:
+        pk = str(req.pexels_api_key or "").strip()
+        persisted["pexels_api_key"] = pk
+        RUNTIME_SETTINGS["pexels_api_key"] = pk
+    if req.watch_folder_path is not None:
+        wf = str(req.watch_folder_path or "").strip()
+        persisted["watch_folder_path"] = wf
+        RUNTIME_SETTINGS["watch_folder_path"] = wf
+    if req.watch_folder_enabled is not None:
+        we = bool(req.watch_folder_enabled)
+        persisted["watch_folder_enabled"] = we
+        RUNTIME_SETTINGS["watch_folder_enabled"] = we
 
     save_persisted_settings(persisted)
     return {"status": "saved", "settings": get_studio_settings()}
+
+
+@app.post("/api/settings/reset")
+def reset_studio_settings():
+    """Reset render, audio mastering, AI preference, and theme selection to clean defaults (preserving API keys & custom themes)."""
+    persisted = get_persisted_settings()
+    defaults = {
+        "active_theme": "Hicksfield",
+        "hardware_acceleration": "auto",
+        "video_encoder": "auto",
+        "default_resolution": "1080x1920",
+        "default_fps": "30",
+        "loudness_target": "-14 LUFS",
+        "audio_normalization_enabled": True,
+        "auto_cleanup_days": 30,
+        "whisper_model": "base",
+        "gemini_analysis_mode": "balanced",
+        "auto_fallback_offline": True,
+        "watch_folder_enabled": False,
+    }
+    persisted.update(defaults)
+
+    settings.HARDWARE_ACCELERATION = defaults["hardware_acceleration"]
+    settings.VIDEO_ENCODER = defaults["video_encoder"]
+    settings.DEFAULT_RESOLUTION = defaults["default_resolution"]
+    settings.DEFAULT_FPS = defaults["default_fps"]
+    settings.LOUDNESS_TARGET = defaults["loudness_target"]
+    settings.AUDIO_NORMALIZATION_ENABLED = defaults["audio_normalization_enabled"]
+    settings.AUTO_CLEANUP_DAYS = defaults["auto_cleanup_days"]
+    settings.WHISPER_MODEL = defaults["whisper_model"]
+    settings.GEMINI_ANALYSIS_MODE = defaults["gemini_analysis_mode"]
+    settings.AUTO_FALLBACK_OFFLINE = defaults["auto_fallback_offline"]
+    RUNTIME_SETTINGS["watch_folder_enabled"] = defaults["watch_folder_enabled"]
+    RUNTIME_SETTINGS["default_fps"] = defaults["default_fps"]
+    RUNTIME_SETTINGS["loudness_target"] = defaults["loudness_target"]
+    RUNTIME_SETTINGS["auto_cleanup_days"] = defaults["auto_cleanup_days"]
+    RUNTIME_SETTINGS["active_theme"] = defaults["active_theme"]
+
+    save_persisted_settings(persisted)
+    return {
+        "status": "reset",
+        "settings": get_studio_settings(),
+        "system_settings": get_system_settings(),
+    }

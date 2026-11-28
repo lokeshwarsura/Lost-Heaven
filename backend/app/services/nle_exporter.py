@@ -186,13 +186,87 @@ def build_premiere_xmeml(
 """
 
 
+def _fmt_vtt_time(seconds: float) -> str:
+    ms_total = max(0, int(round(float(seconds) * 1000.0)))
+    hrs = ms_total // 3600000
+    mins = (ms_total % 3600000) // 60000
+    secs = (ms_total % 60000) // 1000
+    ms = ms_total % 1000
+    return f"{hrs:02d}:{mins:02d}:{secs:02d}.{ms:03d}"
+
+
+def build_vtt_content(
+    words: List[Dict[str, Any]],
+    max_words_per_cue: int = 5,
+    bilingual: bool = False,
+) -> str:
+    """Group remapped spoken words into WebVTT (.vtt) captions."""
+    clean_words = [
+        w for w in (words or [])
+        if isinstance(w, dict) and not w.get("deleted") and not w.get("cut_from_video") and str(w.get("word", "")).strip()
+    ]
+    if not clean_words:
+        return "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\n[No spoken captions]\n"
+
+    cues: List[str] = ["WEBVTT\n"]
+    for i in range(0, len(clean_words), max_words_per_cue):
+        chunk = clean_words[i:i + max_words_per_cue]
+        t0 = float(chunk[0].get("start", 0.0))
+        t1 = max(t0 + 0.35, float(chunk[-1].get("end", t0 + 0.5)))
+        txt = " ".join(str(w.get("word", "")).strip() for w in chunk)
+        sec_txt = ""
+        if bilingual:
+            for cw in chunk:
+                ph = str(cw.get("translated_phrase") or "").strip()
+                if ph:
+                    sec_txt = ph
+                    break
+        body = f"{txt}\n{sec_txt}" if (bilingual and sec_txt) else txt
+        cues.append(f"{_fmt_vtt_time(t0)} --> {_fmt_vtt_time(t1)}\n{body}\n")
+    return "\n".join(cues)
+
+
+def _fmt_smpte(seconds: float, fps: int = 30) -> str:
+    tot_f = max(0, int(round(float(seconds) * fps)))
+    f = tot_f % fps
+    tot_s = tot_f // fps
+    s = tot_s % 60
+    m = (tot_s // 60) % 60
+    h = tot_s // 3600
+    return f"{h:02d}:{m:02d}:{s:02d}:{f:02d}"
+
+
+def build_edl_content(
+    clip: ViralClip,
+    project: Project,
+    effective_duration: float,
+    media_path: str,
+) -> str:
+    """Generate CMX 3600 EDL cut list for Premiere / Resolve / Avid import."""
+    title = (clip.selected_title or clip.hook_headline or f"LOST_HEAVEN_CLIP_{clip.id}").upper()
+    reel = Path(media_path).stem[:16] if media_path else f"CLIP_{clip.id}"
+    src_in = _fmt_smpte(float(clip.start_time or 0.0), 30)
+    src_out = _fmt_smpte(float(clip.start_time or 0.0) + max(0.5, effective_duration), 30)
+    rec_in = "01:00:00:00"
+    rec_out = _fmt_smpte(3600.0 + max(0.5, effective_duration), 30)
+    return "\n".join([
+        f"TITLE: {title}",
+        "FCM: NON-DROP FRAME",
+        "",
+        f"001  {reel:<8} V     C        {src_in} {src_out} {rec_in} {rec_out}",
+        f"* FROM CLIP NAME: {Path(media_path).name if media_path else f'clip_{clip.id}.mp4'}",
+        f"001  {reel:<8} A     C        {src_in} {src_out} {rec_in} {rec_out}",
+        "",
+    ])
+
+
 def export_clip_nle(
     clip: ViralClip,
     project: Project,
     format_name: str,
 ) -> Dict[str, Any]:
     """
-    Export clip timeline & captions into `.fcpxml`, Premiere `.xml`, `.srt`, or `.zip` Studio Bundle.
+    Export clip timeline & captions into `.fcpxml`, Premiere `.xml`, `.edl`, `.srt`, `.vtt`, `.ass`, or `.zip` Studio Bundle.
     """
     fmt = (format_name or "fcpxml").strip().lower()
     raw_words = clip.get_transcript()
@@ -223,6 +297,51 @@ def export_clip_nle(
     if fmt == "srt":
         return {"filename": f"{safe_stem}.srt", "media_type": "text/plain; charset=utf-8", "content": srt_txt.encode("utf-8")}
 
+    vtt_txt = build_vtt_content(
+        words,
+        bilingual=bool(getattr(clip, "bilingual_enabled", False)),
+    )
+    if fmt == "vtt":
+        return {"filename": f"{safe_stem}.vtt", "media_type": "text/vtt; charset=utf-8", "content": vtt_txt.encode("utf-8")}
+
+    import tempfile
+    from app.services.captions_ass import generate_ass_script
+
+    tw, th = resolve_target_dimensions(clip.aspect_ratio, clip.custom_width, clip.custom_height)
+    ass_dir = tempfile.mkdtemp(prefix="lost_heaven_ass_")
+    try:
+        ass_path = os.path.join(ass_dir, f"{safe_stem}.ass")
+        generate_ass_script(
+            words=words,
+            output_ass_path=ass_path,
+            caption_style=getattr(clip, "caption_style", "Karaoke pop") or "Karaoke pop",
+            caption_font=getattr(clip, "caption_font", "Montserrat") or "Montserrat",
+            caption_animation=getattr(clip, "caption_animation", "Karaoke") or "Karaoke",
+            font_size_percent=int(getattr(clip, "font_size_percent", 100) or 100),
+            base_color=getattr(clip, "base_color", "#FFFFFF") or "#FFFFFF",
+            active_color=getattr(clip, "active_color", "#C6F32F") or "#C6F32F",
+            outline_color=getattr(clip, "outline_color", "#000000") or "#000000",
+            position_grid=getattr(clip, "position_grid", "bottom_center") or "bottom_center",
+            position_x=float(getattr(clip, "position_x", 50.0) or 50.0),
+            position_y=float(getattr(clip, "position_y", 78.0) or 78.0),
+            video_width=tw,
+            video_height=th,
+            clip_start_time=0.0,
+            clip_duration=eff_dur,
+            project_id=project.id,
+        )
+        ass_txt = Path(ass_path).read_text(encoding="utf-8") if os.path.exists(ass_path) else ""
+    finally:
+        import shutil
+        shutil.rmtree(ass_dir, ignore_errors=True)
+
+    if fmt == "ass":
+        return {"filename": f"{safe_stem}.ass", "media_type": "text/plain; charset=utf-8", "content": ass_txt.encode("utf-8")}
+
+    edl_txt = build_edl_content(clip, project, eff_dur, media_path)
+    if fmt == "edl":
+        return {"filename": f"{safe_stem}.edl", "media_type": "text/plain; charset=utf-8", "content": edl_txt.encode("utf-8")}
+
     fcpxml_txt = build_fcpxml(clip, project, words, eff_dur, media_path)
     if fmt in ("fcpxml", "resolve"):
         return {"filename": f"{safe_stem}.fcpxml", "media_type": "application/xml", "content": fcpxml_txt.encode("utf-8")}
@@ -236,7 +355,11 @@ def export_clip_nle(
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{safe_stem}.fcpxml", fcpxml_txt.encode("utf-8"))
         zf.writestr(f"{safe_stem}_premiere.xml", premiere_txt.encode("utf-8"))
+        zf.writestr(f"{safe_stem}.edl", edl_txt.encode("utf-8"))
         zf.writestr(f"{safe_stem}.srt", srt_txt.encode("utf-8"))
+        zf.writestr(f"{safe_stem}.vtt", vtt_txt.encode("utf-8"))
+        if ass_txt:
+            zf.writestr(f"{safe_stem}.ass", ass_txt.encode("utf-8"))
         meta = {
             "clip_id": clip.id,
             "project_id": project.id,

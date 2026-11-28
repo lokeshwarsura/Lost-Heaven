@@ -332,3 +332,123 @@ def analyze_facial_emotions(
         "is_micro_expression_spike": emotion_delta >= 26.0,
         "state": next_state,
     }
+
+
+def compute_head_pose_and_eye_contact(
+    landmarks: Any = None,
+    primary_face: Optional[Dict[str, float]] = None,
+    prev_head_state: Optional[Dict[str, Any]] = None,
+    *,
+    timestamp: Optional[float] = None,
+    haar_gaze_proxy: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    Estimate 3D head pose (`yaw`, `pitch`, `roll` in degrees), iris gaze alignment,
+    `eye_contact_score` (0..100), `head_emphasis_spike` (nod / lean-in detection), and
+    `gaze_engagement_score` (0..100) from MediaPipe 468/478 landmarks or geometric fallback.
+    """
+    if not primary_face and not landmarks:
+        return {
+            "eye_contact_score": 0.0,
+            "gaze_engagement_score": 0.0,
+            "head_yaw_deg": 0.0,
+            "head_pitch_deg": 0.0,
+            "head_roll_deg": 0.0,
+            "iris_alignment": 0.0,
+            "head_emphasis_spike": False,
+        }
+
+    lms = landmarks
+    if (
+        isinstance(landmarks, (list, tuple))
+        and landmarks
+        and len(landmarks) < 16
+        and isinstance(landmarks[0], (list, tuple))
+        and len(landmarks[0]) >= 264
+    ):
+        lms = landmarks[0]
+
+    yaw_deg = 0.0
+    pitch_deg = 0.0
+    roll_deg = 0.0
+    iris_align = 0.88
+
+    if isinstance(lms, (list, tuple)) and len(lms) >= 264:
+        l_out = _lm_xy(lms, 33)
+        r_out = _lm_xy(lms, 263)
+        nose = _lm_xy(lms, 1)
+        chin = _lm_xy(lms, 152)
+        forehead = _lm_xy(lms, 10)
+        if l_out and r_out and nose:
+            eye_mid_x = 0.5 * (l_out[0] + r_out[0])
+            eye_mid_y = 0.5 * (l_out[1] + r_out[1])
+            eye_span = max(0.02, abs(r_out[0] - l_out[0]))
+            yaw_rad = math.atan2(nose[0] - eye_mid_x, 0.55 * eye_span)
+            yaw_deg = max(-60.0, min(60.0, math.degrees(yaw_rad)))
+            roll_deg = max(-45.0, min(45.0, math.degrees(math.atan2(r_out[1] - l_out[1], max(1e-3, r_out[0] - l_out[0])))))
+            if chin and forehead:
+                face_h_lm = max(0.04, abs(chin[1] - forehead[1]))
+                vert_ratio = (nose[1] - eye_mid_y) / face_h_lm
+                # Anatomical straight-ahead nose bridge to eye-line ratio is ~0.22 of forehead..chin span
+                pitch_deg = max(-45.0, min(45.0, (vert_ratio - 0.22) * 145.0))
+
+        # MediaPipe 478 iris landmarks (#468 left iris, #473 right iris)
+        if len(lms) >= 474:
+            l_in, r_in = _lm_xy(lms, 133), _lm_xy(lms, 362)
+            l_iris, r_iris = _lm_xy(lms, 468), _lm_xy(lms, 473)
+            ratios = []
+            if l_out and l_in and l_iris and abs(l_in[0] - l_out[0]) > 1e-3:
+                ratios.append((l_iris[0] - l_out[0]) / (l_in[0] - l_out[0]))
+            if r_in and r_out and r_iris and abs(r_out[0] - r_in[0]) > 1e-3:
+                ratios.append((r_iris[0] - r_in[0]) / (r_out[0] - r_in[0]))
+            if ratios:
+                avg_r = sum(ratios) / len(ratios)
+                iris_align = max(0.0, min(1.0, 1.0 - abs(avg_r - 0.5) * 2.4))
+
+        yaw_pen = max(0.0, abs(yaw_deg) - 4.0) * 1.85
+        pitch_pen = max(0.0, abs(pitch_deg) - 6.0) * 1.45
+        roll_pen = max(0.0, abs(roll_deg) - 10.0) * 0.65
+        iris_pen = max(0.0, 1.0 - iris_align) * 30.0
+        eye_contact = round(max(0.0, min(100.0, 100.0 - yaw_pen - pitch_pen - roll_pen - iris_pen)), 1)
+    else:
+        # Geometric eye-symmetry fallback when MediaPipe landmarks are absent
+        g_base = float(haar_gaze_proxy) if haar_gaze_proxy is not None else 75.0
+        cx_f = float((primary_face or {}).get("cx", 0.5))
+        cy_f = float((primary_face or {}).get("cy", 0.42))
+        yaw_deg = round(max(-45.0, min(45.0, (100.0 - g_base) * 0.48)), 1)
+        pitch_deg = round(max(-35.0, min(35.0, (cy_f - 0.42) * 45.0)), 1)
+        roll_deg = 0.0
+        eye_contact = round(max(15.0, min(100.0, g_base - max(0.0, abs(cx_f - 0.5) - 0.35) * 35.0)), 1)
+
+    # Head-Nod / Lean-In Emphasis tracking over trailing 1.2s history
+    fh_now = float((primary_face or {}).get("h", 0.25))
+    t_now = float(timestamp) if timestamp is not None else 0.0
+    hist: List[Tuple[float, float, float, float]] = []
+    if isinstance(prev_head_state, dict):
+        hist = list(prev_head_state.get("history") or [])
+    recent = [h for h in hist if 0.0 <= (t_now - h[0]) <= 1.25]
+
+    head_emphasis_spike = False
+    if len(recent) >= 2:
+        prev_h_med = sorted(h[3] for h in recent)[len(recent) // 2]
+        lean_in = (fh_now / max(0.04, prev_h_med)) >= 1.12
+        pitch_vals = [h[1] for h in recent] + [pitch_deg]
+        nod_swing = (max(pitch_vals) - min(pitch_vals)) >= 7.5
+        head_emphasis_spike = bool(lean_in or (nod_swing and abs(yaw_deg) <= 22.0))
+
+    if isinstance(prev_head_state, dict):
+        prev_head_state["history"] = (recent + [(t_now, pitch_deg, yaw_deg, fh_now)])[-12:]
+
+    gaze_engagement = round(
+        max(0.0, min(100.0, 0.86 * eye_contact + (14.0 if head_emphasis_spike else 0.0))),
+        1,
+    )
+    return {
+        "eye_contact_score": eye_contact,
+        "gaze_engagement_score": gaze_engagement,
+        "head_yaw_deg": round(yaw_deg, 1),
+        "head_pitch_deg": round(pitch_deg, 1),
+        "head_roll_deg": round(roll_deg, 1),
+        "iris_alignment": round(iris_align, 3),
+        "head_emphasis_spike": head_emphasis_spike,
+    }

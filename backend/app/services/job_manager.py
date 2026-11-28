@@ -17,7 +17,7 @@ from app.config import settings
 from app.database import engine
 from app.models import Project, ViralClip
 from app.services.proxy import probe_video, create_gemini_proxy, get_ffmpeg_cmd, detect_hardware_encoder
-from app.services.renderer import render_clip_ultra
+from app.services.renderer import RenderSupersededError, render_clip_ultra
 
 _DEFAULT_ENGINE = engine
 from app.services.transcriber import (
@@ -328,6 +328,10 @@ def _normalize_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
     fbytes = int(job.get("file_size_bytes") or 0)
     job["file_size_mb"] = round(fbytes / (1024 ** 2), 2) if fbytes > 0 else float(job.get("file_size_mb") or 0.0)
     job["duration_sec"] = round(float(job.get("duration_sec") or 0.0), 2)
+    if job["duration_sec"] > 0 and elapsed > 0:
+        job["throughput_speed"] = round(job["duration_sec"] / max(1.0, float(elapsed)), 1)
+    elif job.get("throughput_speed") is None:
+        job["throughput_speed"] = None
     job["default_framing"] = str(job.get("default_framing") or "smart_auto")
 
     lm = job.get("live_metrics")
@@ -417,6 +421,9 @@ class JobManager:
         ai_mode: Optional[str] = None,
         default_framing: str = "smart_auto",
         source_url: Optional[str] = None,
+        start_sec: Optional[float] = None,
+        end_sec: Optional[float] = None,
+        podcast_mode: bool = False,
     ) -> Dict[str, Any]:
         with self._lock:
             cancel_event = threading.Event()
@@ -493,6 +500,9 @@ class JobManager:
                 "eta_seconds": 45,
                 "source_path": source_path,
                 "source_url": source_url,
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "podcast_mode": bool(podcast_mode),
                 "source_filename": source_filename or os.path.basename(source_path),
                 "file_size_bytes": file_size,
                 "file_size_formatted": format_size(file_size),
@@ -903,7 +913,13 @@ class JobManager:
 
         return job
 
-    def retry_pipeline(self, project_id: int, background_tasks: Optional[Any] = None, force_offline: bool = False) -> Dict[str, Any]:
+    def retry_pipeline(
+        self,
+        project_id: int,
+        background_tasks: Optional[Any] = None,
+        force_offline: bool = False,
+        stage: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Retry a failed, cancelled, or paused pipeline job.
         Checks for existing intermediate artifacts and resumes directly at the failed stage:
@@ -998,6 +1014,28 @@ class JobManager:
             start_percent = 5
             stage_label = "Restarting pipeline from Media Prep"
             cached_words_count = 0
+
+            target_stage = str(stage or "").strip().lower() or None
+            if target_stage == "ingest":
+                for p_clean in (audio_path, proxy_path, transcript_path):
+                    try:
+                        if p_clean.exists():
+                            p_clean.unlink()
+                    except OSError:
+                        pass
+            elif target_stage == "audio":
+                for p_clean in (audio_path, proxy_path, transcript_path):
+                    try:
+                        if p_clean.exists():
+                            p_clean.unlink()
+                    except OSError:
+                        pass
+            elif target_stage == "transcribe":
+                try:
+                    if transcript_path.exists():
+                        transcript_path.unlink()
+                except OSError:
+                    pass
 
             if transcript_path.exists() and transcript_path.stat().st_size > 50:
                 try:
@@ -1404,6 +1442,8 @@ class JobManager:
                                     eta_seconds=50,
                                 )
 
+                dl_start_sec = self._jobs.get(project_id, {}).get("start_sec")
+                dl_end_sec = self._jobs.get(project_id, {}).get("end_sec")
                 ydl_opts = {
                     "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
                     "outtmpl": str(masters_dir / "%(id)s.%(ext)s"),
@@ -1411,6 +1451,16 @@ class JobManager:
                     "no_warnings": True,
                     "progress_hooks": [_ydl_hook],
                 }
+                if dl_start_sec is not None or dl_end_sec is not None:
+                    try:
+                        s_val = max(0.0, float(dl_start_sec or 0.0))
+                        e_val = float(dl_end_sec) if (dl_end_sec is not None and float(dl_end_sec) > s_val) else float("inf")
+                        range_fn = getattr(getattr(yt_dlp, "utils", None), "download_range_func", None)
+                        if range_fn is not None:
+                            ydl_opts["download_ranges"] = range_fn(None, [(s_val, e_val)])
+                            ydl_opts["force_keyframes_at_cuts"] = True
+                    except Exception:
+                        pass
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     dl_info = ydl.extract_info(src_url, download=True)
                     actual_path = ydl.prepare_filename(dl_info)
@@ -1453,9 +1503,42 @@ class JobManager:
             duration = float(meta.get("duration", 0.0))
             width = int(meta.get("width", 1920))
             height = int(meta.get("height", 1080))
+            is_podcast = bool(getattr(project, "podcast_mode", False) or self._jobs.get(project_id, {}).get("podcast_mode", False) or width <= 0 or height <= 0)
+            if is_podcast and (width <= 0 or height <= 0 or Path(project.source_path).suffix.lower() in (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg")):
+                try:
+                    ffmpeg_bin = get_ffmpeg_cmd()
+                    p_dir_pod = self._get_project_dir(project_id)
+                    pod_mp4 = str((p_dir_pod / "podcast_visualizer_source.mp4").resolve())
+                    pod_cmd = [
+                        ffmpeg_bin, "-y",
+                        "-f", "lavfi", "-i", "color=c=#0B0D14:s=1920x1080:r=30",
+                        "-i", os.path.abspath(project.source_path),
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "192k", "-shortest",
+                        pod_mp4,
+                    ]
+                    subprocess.run(pod_cmd, capture_output=True, text=True, timeout=60, check=True)
+                    if os.path.exists(pod_mp4) and os.path.getsize(pod_mp4) > 1000:
+                        active_pod_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+                        with Session(active_pod_engine) as psess:
+                            pr = psess.get(Project, project_id)
+                            if pr:
+                                pr.source_path = pod_mp4
+                                pr.podcast_mode = True
+                                psess.add(pr)
+                                psess.commit()
+                                psess.refresh(pr)
+                                project = pr
+                        meta = probe_video(pod_mp4)
+                        duration = float(meta.get("duration", duration))
+                        width = int(meta.get("width", 1920))
+                        height = int(meta.get("height", 1080))
+                except Exception as pod_err:
+                    logger.warning(f"Podcast visualizer video wrapper skipped: {pod_err}")
             fps = float(meta.get("fps", 30.0))
 
-            with Session(engine) as session:
+            active_meta_engine = app_db.engine if app_db.engine is not _DEFAULT_ENGINE else engine
+            with Session(active_meta_engine) as session:
                 p = session.get(Project, project_id)
                 if p:
                     p.duration = duration
@@ -1949,6 +2032,12 @@ class JobManager:
             except Exception as snap_err:
                 logger.warning(f"Scene boundary snapping skipped: {snap_err}")
 
+            aud_fluency_info = (mm_analysis or {}).get("speech_fluency") or {}
+            clean_hook_cands = aud_fluency_info.get("clean_hook_candidates") or []
+            has_existing_music_flag = bool(((mm_analysis or {}).get("summary") or {}).get("has_existing_music", False))
+
+            from app.services.multimodal_fusion import evaluate_clip_obstruction_zones
+
             saved_clips = []
             with Session(engine) as session:
                 for idx, item in enumerate(raw_clips):
@@ -1956,6 +2045,20 @@ class JobManager:
                     start_t = float(item["start_time"])
                     dur_t = float(item["duration"])
                     end_t = float(item["end_time"])
+
+                    # Snap clip start boundary onto nearby clean hesitation-free hook opening when available
+                    if clean_hook_cands:
+                        near_hooks = [
+                            ch for ch in clean_hook_cands
+                            if (start_t - 0.5) <= float(ch.get("t", -9.0)) <= (start_t + 2.5)
+                            and (end_t - float(ch.get("t", 0.0))) >= 8.0
+                        ]
+                        if near_hooks:
+                            best_hk = max(near_hooks, key=lambda c: float(c.get("fluency_score", 0.0)))
+                            cand_t = round(float(best_hk["t"]), 2)
+                            if cand_t != round(start_t, 2):
+                                start_t = cand_t
+                                dur_t = round(max(1.0, end_t - start_t), 2)
 
                     # Slice words from master transcript_words
                     clip_words = []
@@ -1968,6 +2071,7 @@ class JobManager:
                                     "word": w.get("word", ""),
                                     "start": round(max(0.0, w_start - start_t), 3),
                                     "end": round(max(0.0, w_end - start_t), 3),
+                                    "probability": w.get("probability", 0.9),
                                     "is_filler": w.get("is_filler", False),
                                     "deleted": False
                                 })
@@ -1983,6 +2087,11 @@ class JobManager:
                             )
                         except Exception as ce:
                             logger.warning(f"Clip-segment fallback transcription failed ({ce})")
+
+                    hud_win = evaluate_clip_obstruction_zones(mm_analysis, start_t, end_t)
+                    rec_cap_y = float(hud_win.get("recommended_caption_y", 0.78))
+                    init_pos_y = round(rec_cap_y * 100.0, 2)
+                    init_pos_grid = "top_center" if rec_cap_y <= 0.30 else ("middle_center" if rec_cap_y <= 0.56 else "bottom_center")
 
                     clip = ViralClip(
                         project_id=project_id,
@@ -2020,9 +2129,9 @@ class JobManager:
                         italic=False,
                         all_caps=True,
                         text_align="Centre",
-                        position_grid="bottom_center",
+                        position_grid=init_pos_grid,
                         position_x=50.0,
-                        position_y=78.0,
+                        position_y=init_pos_y,
                         hold_back_alpha=1.0,
                         highlight_shape="Colour only",
                         emoji_enabled=False,
@@ -2054,11 +2163,18 @@ class JobManager:
                         status="draft",
                         render_status="idle",
                         render_progress=0,
+                        spectrum_enabled=bool(getattr(project, "podcast_mode", False)),
+                        spectrum_position="center" if bool(getattr(project, "podcast_mode", False)) else "bottom",
                         analysis_source=item.get("analysis_source", "gemini")
                     )
                     clip.set_titles(item.get("youtube_titles", []))
                     clip.set_transcript(clip_words)
-                    affect_opts = {}
+                    affect_opts = {
+                        "has_existing_music": has_existing_music_flag,
+                        "recommended_caption_y": rec_cap_y,
+                        "top_hud_occupied": bool(hud_win.get("top_hud_occupied", False)),
+                        "bottom_hud_occupied": bool(hud_win.get("bottom_hud_occupied", False)),
+                    }
                     for k in (
                         "narrative_arc",
                         "arc_label",
@@ -2070,9 +2186,10 @@ class JobManager:
                     ):
                         if item.get(k) is not None:
                             affect_opts[k] = item[k]
-                    if affect_opts:
-                        affect_opts["offline_multimodal_active"] = str(item.get("analysis_source", "")).startswith("offline")
-                        clip.set_options(affect_opts)
+                    affect_opts["offline_multimodal_active"] = str(item.get("analysis_source", "")).startswith("offline")
+                    if has_existing_music_flag:
+                        clip.bgm_path = None
+                    clip.set_options(affect_opts)
 
                     # Stage 5 Smart Auto-Frame AI Router (corner cam / dual podcast / talking head / pure gameplay)
                     if project.source_path and os.path.exists(project.source_path):
@@ -2095,12 +2212,19 @@ class JobManager:
                                 "webcam_gameplay_split",
                                 "split_podcast",
                                 "fit_blur",
+                                "cinema_letterbox_blur",
+                                "triple_gaming_hud",
+                                "portrait_pip_badge",
+                                "dynamic_punch_crop",
+                                "side_by_side_50_50",
                             }
                             if proj_framing != "smart_auto" and proj_framing in explicit_layouts:
                                 clip.frame_layout = proj_framing
+                                clip.set_options({"framing_user_locked": True})
+                                clip.webcam_corner = rec["webcam_corner"] if rec.get("webcam_corner") != "auto" else "top_right"
                             else:
                                 clip.frame_layout = rec["frame_layout"]
-                            clip.webcam_corner = rec["webcam_corner"]
+                                clip.webcam_corner = rec["webcam_corner"]
                             clip.set_visual_map(vmap)
                             if rec.get("source_webcam_region"):
                                 clip.set_source_webcam_region(rec["source_webcam_region"])
@@ -2122,6 +2246,8 @@ class JobManager:
                         bf_dir = Path(settings.STORAGE_DIR) / "assets" / "best_frames" / str(project_id)
                         bf_dir.mkdir(parents=True, exist_ok=True)
                         for c_obj in saved_clips:
+                            if self.is_cancelled(project_id):
+                                return
                             bf_res = extract_best_frames(
                                 video_path=project.source_path,
                                 video_analysis=vid_analysis,
@@ -2241,11 +2367,48 @@ class JobManager:
                             "censor_profanity": c_row.censor_profanity,
                             "clip_size": c_row.clip_size,
                             "color_preset": c_row.color_preset,
+                            "exposure": float(getattr(c_row, "exposure", 0.0) or 0.0),
+                            "brightness": float(getattr(c_row, "brightness", 0.0) or 0.0),
+                            "contrast": float(getattr(c_row, "contrast", 1.0) or 1.0),
+                            "lift_mids": float(getattr(c_row, "lift_mids", 0.0) or 0.0),
+                            "warmth": float(getattr(c_row, "warmth", 0.0) or 0.0),
+                            "saturation": float(getattr(c_row, "saturation", 1.0) or 1.0),
+                            "black_and_white": float(getattr(c_row, "black_and_white", 0.0) or 0.0),
+                            "vintage": float(getattr(c_row, "vintage", 0.0) or 0.0),
+                            "tint_color": str(getattr(c_row, "tint_color", "none") or "none"),
+                            "tint_strength": float(getattr(c_row, "tint_strength", 0.0) or 0.0),
+                            "glow": float(getattr(c_row, "glow", 0.0) or 0.0),
+                            "smooth": float(getattr(c_row, "smooth", 0.0) or 0.0),
+                            "sharpness": float(getattr(c_row, "sharpness", 0.0) or 0.0),
+                            "blur": float(getattr(c_row, "blur", 0.0) or 0.0),
+                            "film_grain": float(getattr(c_row, "film_grain", 0.0) or 0.0),
+                            "vignette": float(getattr(c_row, "vignette", 0.0) or 0.0),
+                            "bottom_fade": float(getattr(c_row, "bottom_fade", 0.0) or 0.0),
+                            "watermark_path": getattr(c_row, "watermark_path", None),
+                            "watermark_corner": str(getattr(c_row, "watermark_corner", "top_right") or "top_right"),
+                            "watermark_opacity": float(getattr(c_row, "watermark_opacity", 0.85) or 0.85),
+                            "watermark_size": float(getattr(c_row, "watermark_size", 0.15) or 0.15),
+                            "outro_path": getattr(c_row, "outro_path", None),
+                            "bgm_path": getattr(c_row, "bgm_path", None),
+                            "bgm_volume": float(getattr(c_row, "bgm_volume", 0.20) or 0.20),
+                            "audio_volume": float(getattr(c_row, "audio_volume", 1.0) or 1.0),
+                            "normalize_audio": bool(getattr(c_row, "normalize_audio", True)),
+                            "vocal_clarity": bool(getattr(c_row, "vocal_clarity", False)),
+                            "voice_isolation": bool(getattr(c_row, "voice_isolation", False)),
+                            "auto_sfx": bool(getattr(c_row, "auto_sfx", False)),
+                            "retention_bar_enabled": bool(getattr(c_row, "retention_bar_enabled", False)),
+                            "retention_bar_color": str(getattr(c_row, "retention_bar_color", "#C6F32F") or "#C6F32F"),
+                            "outro_cta_enabled": bool(getattr(c_row, "outro_cta_enabled", False)),
+                            "outro_cta_text": str(getattr(c_row, "outro_cta_text", "Subscribe for More") or "Subscribe for More"),
+                            "broll_segments": json.loads(getattr(c_row, "broll_json", "[]") or "[]"),
                             "hardware_mode": c_row.hardware_mode or "gpu",
                             "hook_headline": c_row.hook_headline,
                             "show_hook_banner": c_row.show_hook_banner,
                             "cold_open_quote": c_row.cold_open_quote,
                             "use_cold_open": c_row.use_cold_open,
+                            "auto_trim_dead_air": bool(getattr(c_row, "auto_trim_dead_air", False)),
+                            "dynamic_punch_zoom": bool(getattr(c_row, "dynamic_punch_zoom", False)),
+                            "punch_zoom_intensity": float(getattr(c_row, "punch_zoom_intensity", 1.14) or 1.14),
                             "keep_segments": c_row.get_keep_segments(),
                             "merge_crossfade_sec": float(getattr(c_row, "merge_crossfade_sec", 0.03) or 0.03),
                             "speakers": c_row.get_speakers(),
@@ -2278,6 +2441,7 @@ class JobManager:
                             "handle_corner": str(getattr(c_row, "handle_corner", "bottom_right") or "bottom_right"),
                             "handle_opacity": float(getattr(c_row, "handle_opacity", 0.65) or 0.65),
                             "handle_display_mode": str(getattr(c_row, "handle_display_mode", "always") or "always"),
+                            "options": c_row.get_options(),
                         }
 
                     pct = 90 + int(9 * (clip_idx - 1) / max(1, total_to_render))
@@ -2318,19 +2482,24 @@ class JobManager:
                             level="SUCCESS",
                             eta_seconds=max(1, (total_to_render - clip_idx) * 3),
                         )
+                    except RenderSupersededError:
+                        logger.info(
+                            f"Stage 5 preview render for clip {cid} superseded cleanly by newer editor render."
+                        )
                     except Exception as clip_render_err:
+                        err_tail = str(clip_render_err).strip()[-400:]
                         logger.warning(f"Stage 5 preview render failed for clip {cid}: {clip_render_err}")
                         self.update_progress(
                             project_id,
                             pct,
                             "ready",
                             f"Preview warning {clip_idx}/{total_to_render}",
-                            message=f"Preview render deferred for '{clip_label}': {str(clip_render_err)[:100]}",
+                            message=f"Preview render deferred for '{clip_label}': {err_tail}",
                             level="WARN",
                         )
                         with Session(active_db_engine) as esession:
                             c_err = esession.get(ViralClip, cid)
-                            if c_err:
+                            if c_err and c_err.render_status != "completed" and c_err.status != "ready":
                                 c_err.status = "draft"
                                 c_err.render_status = "idle"
                                 c_err.render_progress = 0

@@ -104,6 +104,51 @@ COLOR_PRESETS = {
         "description": "HUD-crisp highlights, punchy vibrance, razor sharpness",
         "filter": "eq=contrast=1.28:saturation=1.38:gamma=1.04,vibrance=intensity=0.35,unsharp=5:5:1.10:5:5:0.0",
     },
+    "fuji_velvia_50": {
+        "name": "Fuji Velvia 50",
+        "description": "Lush slide-film greens, deep punchy contrast, vivid chromatic saturation",
+        "filter": "eq=contrast=1.22:saturation=1.34:gamma=0.95,colorbalance=rs=-0.04:gs=0.06:bs=0.08:rm=0.05:gm=0.08:bm=-0.04:rh=0.08:bh=-0.06,vibrance=intensity=0.28",
+    },
+    "cinestill_800t": {
+        "name": "CineStill 800T",
+        "description": "Tungsten cinema stock with cool cyan shadows and warm red halation",
+        "filter": "eq=contrast=1.10:saturation=1.08:gamma=1.03,colorbalance=rs=-0.08:gs=0.02:bs=0.14:rm=-0.04:bm=0.10:rh=0.14:gh=0.02:bh=-0.06,curves=m='0/0.04 0.5/0.51 1/1'",
+    },
+    "bleach_bypass": {
+        "name": "Bleach Bypass",
+        "description": "High-contrast silver-retention look with muted grit and razor crispness",
+        "filter": "eq=contrast=1.38:saturation=0.42:gamma=0.92,colorbalance=rs=-0.04:gs=0.02:bs=0.04:rh=0.04:bh=-0.04,curves=m='0/0 0.25/0.16 0.75/0.86 1/1',unsharp=5:5:0.90:5:5:0.0",
+    },
+    "pastel_dream": {
+        "name": "Pastel Dream",
+        "description": "Airy pastel highlights, soft lifted shadows, dreamy rose bloom",
+        "filter": "eq=brightness=0.07:contrast=0.88:saturation=0.88:gamma=1.08,colorbalance=rs=0.08:gs=0.02:bs=0.09:rh=0.10:gh=0.04:bh=0.06,curves=m='0/0.07 0.5/0.54 1/0.96'",
+    },
+    "tokyo_midnight": {
+        "name": "Tokyo Midnight",
+        "description": "Electric indigo night shadows, violet-blue street glow, deep mood",
+        "filter": "eq=brightness=-0.06:contrast=1.24:saturation=1.28:gamma=0.96,colorbalance=rs=0.04:gs=-0.08:bs=0.22:rm=-0.02:bm=0.20:rh=0.08:bh=0.24,vibrance=intensity=0.26",
+    },
+    "warm_podcast_studio": {
+        "name": "Warm Podcast Studio",
+        "description": "Inviting key-lit skin warmth, lifted shadow detail, balanced studio clarity",
+        "filter": "eq=brightness=0.03:contrast=1.08:saturation=1.12:gamma=1.04,colorbalance=rs=0.07:gs=0.03:bs=-0.05:rm=0.09:gm=0.03:bm=-0.07:rh=0.06:bh=-0.04,vibrance=intensity=0.22,unsharp=5:5:0.45:5:5:0.0",
+    },
+    "vhs_90s_tape": {
+        "name": "VHS 90s Tape",
+        "description": "Retro analog tape wash with faded blacks, warm nostalgia, and soft grain",
+        "filter": "eq=contrast=0.94:saturation=1.18:gamma=1.05,colorbalance=rs=0.08:gs=0.06:bs=-0.09:rm=0.05:gm=0.07:bm=-0.08:rh=0.09:bh=-0.10,curves=m='0/0.09 0.5/0.52 1/0.94',noise=alls=8:allf=t+u",
+    },
+    "arctic_crisp": {
+        "name": "Arctic Crisp",
+        "description": "Bright cool-white highlights, clean slate clarity, razor daylight edge",
+        "filter": "eq=brightness=0.05:contrast=1.16:saturation=1.06:gamma=1.02,colorbalance=rs=-0.10:gs=0.02:bs=0.14:rm=-0.08:gm=0.03:bm=0.12:rh=-0.06:bh=0.14,unsharp=5:5:0.75:5:5:0.0",
+    },
+    "emerald_gold": {
+        "name": "Emerald & Gold",
+        "description": "Deep emerald shadow tone paired with rich gilded highlights",
+        "filter": "eq=contrast=1.22:saturation=1.24:gamma=0.97,colorbalance=rs=-0.10:gs=0.14:bs=-0.02:rm=-0.04:gm=0.10:bm=-0.10:rh=0.18:gh=0.10:bh=-0.16,vibrance=intensity=0.32",
+    },
 }
 
 
@@ -208,7 +253,127 @@ STUDIO_COLOR_PRESETS: List[Dict[str, Any]] = [
             "warmth": 0, "brightness": 0, "lift_mids": 1.0, "black_and_white": 0, "vintage": 0,
         },
     },
+    {
+        "id": "fuji_velvia_50",
+        "name": "Fuji Velvia 50",
+        "description": "Lush slide-film greens, deep punchy contrast, vivid chromatic saturation",
+        "values": {
+            "exposure": -0.02, "contrast": 1.22, "highlights": 12, "shadows": -18,
+            "sharpness": 0.22, "vignette": 0.25, "color_temp": -8, "tint_shift": -14,
+            "vibrance": 28, "saturation": 1.34, "matte_fade": 0, "halation_glow": 8,
+            "warmth": -0.04, "brightness": -0.02, "lift_mids": 0.95, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "cinestill_800t",
+        "name": "CineStill 800T",
+        "description": "Tungsten cinema stock with cool cyan shadows and warm red halation",
+        "values": {
+            "exposure": -0.04, "contrast": 1.10, "highlights": 15, "shadows": 14,
+            "sharpness": 0.08, "vignette": 0.35, "color_temp": -42, "tint_shift": 12,
+            "vibrance": 14, "saturation": 1.08, "matte_fade": 24, "halation_glow": 58,
+            "warmth": -0.18, "brightness": 0.0, "lift_mids": 1.03, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "bleach_bypass",
+        "name": "Bleach Bypass",
+        "description": "High-contrast silver-retention look with muted grit and razor crispness",
+        "values": {
+            "exposure": -0.05, "contrast": 1.38, "highlights": 26, "shadows": -32,
+            "sharpness": 0.45, "vignette": 0.48, "color_temp": -10, "tint_shift": -8,
+            "vibrance": -35, "saturation": 0.42, "matte_fade": 0, "halation_glow": 0,
+            "warmth": -0.05, "brightness": -0.03, "lift_mids": 0.92, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "pastel_dream",
+        "name": "Pastel Dream",
+        "description": "Airy pastel highlights, soft lifted shadows, dreamy rose bloom",
+        "values": {
+            "exposure": 0.14, "contrast": 0.88, "highlights": -14, "shadows": 34,
+            "sharpness": 0.0, "vignette": 0.0, "color_temp": 10, "tint_shift": 32,
+            "vibrance": 18, "saturation": 0.88, "matte_fade": 38, "halation_glow": 45,
+            "warmth": 0.06, "brightness": 0.07, "lift_mids": 1.08, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "tokyo_midnight",
+        "name": "Tokyo Midnight",
+        "description": "Electric indigo night shadows, violet-blue street glow, deep mood",
+        "values": {
+            "exposure": -0.10, "contrast": 1.24, "highlights": 10, "shadows": -22,
+            "sharpness": 0.28, "vignette": 0.45, "color_temp": -55, "tint_shift": 42,
+            "vibrance": 26, "saturation": 1.28, "matte_fade": 10, "halation_glow": 36,
+            "warmth": -0.25, "brightness": -0.06, "lift_mids": 0.96, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "warm_podcast_studio",
+        "name": "Warm Podcast Studio",
+        "description": "Inviting key-lit skin warmth, lifted shadow detail, balanced studio clarity",
+        "values": {
+            "exposure": 0.04, "contrast": 1.08, "highlights": -10, "shadows": 26,
+            "sharpness": 0.25, "vignette": 0.14, "color_temp": 24, "tint_shift": 4,
+            "vibrance": 22, "saturation": 1.12, "matte_fade": 0, "halation_glow": 4,
+            "warmth": 0.14, "brightness": 0.03, "lift_mids": 1.04, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "vhs_90s_tape",
+        "name": "VHS 90s Tape",
+        "description": "Retro analog tape wash with faded blacks, warm nostalgia, and soft grain",
+        "values": {
+            "exposure": 0.0, "contrast": 0.94, "highlights": -18, "shadows": 18,
+            "sharpness": 0.0, "vignette": 0.42, "color_temp": 16, "tint_shift": -18,
+            "vibrance": -10, "saturation": 1.18, "matte_fade": 46, "halation_glow": 18,
+            "warmth": 0.10, "brightness": 0.01, "lift_mids": 1.05, "black_and_white": 0, "vintage": 65,
+        },
+    },
+    {
+        "id": "arctic_crisp",
+        "name": "Arctic Crisp",
+        "description": "Bright cool-white highlights, clean slate clarity, razor daylight edge",
+        "values": {
+            "exposure": 0.14, "contrast": 1.16, "highlights": 24, "shadows": 20,
+            "sharpness": 0.40, "vignette": 0.0, "color_temp": -38, "tint_shift": -8,
+            "vibrance": 16, "saturation": 1.06, "matte_fade": 0, "halation_glow": 0,
+            "warmth": -0.22, "brightness": 0.05, "lift_mids": 1.02, "black_and_white": 0, "vintage": 0,
+        },
+    },
+    {
+        "id": "emerald_gold",
+        "name": "Emerald & Gold",
+        "description": "Deep emerald shadow tone paired with rich gilded highlights",
+        "values": {
+            "exposure": -0.02, "contrast": 1.22, "highlights": 16, "shadows": -14,
+            "sharpness": 0.24, "vignette": 0.28, "color_temp": 36, "tint_shift": -42,
+            "vibrance": 32, "saturation": 1.24, "matte_fade": 4, "halation_glow": 12,
+            "warmth": 0.20, "brightness": -0.01, "lift_mids": 0.97, "black_and_white": 0, "vintage": 0,
+        },
+    },
 ]
+
+PRESET_CATEGORIES: Dict[str, str] = {
+    "none": "creator",
+    "kodak_portra_400": "film",
+    "teal_orange": "film",
+    "cyberpunk_neon": "gaming",
+    "moody_noir": "film",
+    "golden_hour": "creator",
+    "bw_16mm": "film",
+    "gaming_pop": "gaming",
+    "clean_rec709": "creator",
+    "fuji_velvia_50": "film",
+    "cinestill_800t": "film",
+    "bleach_bypass": "film",
+    "pastel_dream": "creator",
+    "tokyo_midnight": "gaming",
+    "warm_podcast_studio": "creator",
+    "vhs_90s_tape": "gaming",
+    "arctic_crisp": "creator",
+    "emerald_gold": "gaming",
+}
 
 
 def _norm_signed(val: float) -> float:
@@ -275,6 +440,7 @@ def build_advanced_color_filter(
     film_grain: float = 0.0,
     vignette: float = 0.0,
     bottom_fade: float = 0.0,
+    horizon_tilt: float = 0.0,
     target_w: int = 1080,
     target_h: int = 1920,
 ) -> str:
@@ -307,6 +473,19 @@ def build_advanced_color_filter(
     grain_val = _norm_unit(film_grain)
     vignette_val = _norm_unit(vignette)
     fade_val = _norm_unit(bottom_fade)
+    tilt_deg = max(-10.0, min(10.0, float(horizon_tilt or 0.0)))
+    if abs(tilt_deg) > 0.05:
+        import math
+        rad = math.radians(tilt_deg)
+        # Scale smoothly before crop so tilted corners never reveal black wedges
+        scale_fix = 1.0 + abs(math.sin(rad)) * 1.45
+        sw_tilt = int(round(target_w * scale_fix / 2) * 2)
+        sh_tilt = int(round(target_h * scale_fix / 2) * 2)
+        filters.append(
+            f"rotate={rad:.5f}:ow=iw:oh=ih:fillcolor=black,"
+            f"scale={sw_tilt}:{sh_tilt}:flags=lanczos,"
+            f"crop={target_w}:{target_h}:(iw-{target_w})/2:(ih-{target_h})/2,setsar=1"
+        )
 
     raw_lm = float(lift_mids or 0.0)
     use_legacy_curve = 0.01 < raw_lm <= 0.55
@@ -584,6 +763,7 @@ def generate_clip_preset_previews(
                     "id": pid,
                     "name": p["name"],
                     "description": p["description"],
+                    "category": PRESET_CATEGORIES.get(pid, "creator"),
                     "thumbnail_url": f"{base_url}/{pid}.jpg?v={version_tag}" if jpg_file.exists() else None,
                     "values": p["values"],
                 }

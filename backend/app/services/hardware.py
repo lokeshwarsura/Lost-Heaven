@@ -3,7 +3,7 @@ import shutil
 import platform
 import subprocess
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -112,3 +112,66 @@ def detect_hardware_specs() -> Dict[str, Any]:
         "gemini_configured": gemini_configured,
         "gemini_enabled": persisted.get("gemini_enabled", True)
     }
+
+
+def build_video_encoder_args(
+    encoder: str,
+    quality_mode: str = "final_hq",
+    hardware_mode: str = "gpu",
+    codec_family: str = "h264",
+    quality_preset: str = "social_balanced",
+) -> List[str]:
+    """
+    Build strictly isolated video encoder CLI arguments for the active codec and container.
+    Supports H.264 (NVENC/VideoToolbox/QSV/AMF/libx264), HEVC/H.265 (hevc_nvenc/libx265),
+    Apple ProRes 422 LT (prores_ks), and WebM VP9 (libvpx-vp9).
+    """
+    is_fast = (quality_mode or "final_hq").strip().lower() == "fast_preview"
+    q_preset = (quality_preset or ("compact" if is_fast else "social_balanced")).strip().lower()
+    hw = (hardware_mode or "gpu").strip().lower()
+    cf = (codec_family or "h264").strip().lower()
+    raw_enc = (encoder or "libx264").strip().lower()
+
+    if cf in ("prores", "mov_prores", "prores_ks"):
+        return ["-c:v", "prores_ks", "-profile:v", "1", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
+
+    if cf in ("vp9", "webm_vp9", "libvpx-vp9"):
+        vp9_crf = "18" if q_preset == "master_high" else ("34" if (q_preset == "compact" or is_fast) else "26")
+        return ["-c:v", "libvpx-vp9", "-crf", vp9_crf, "-b:v", "0", "-deadline", "realtime" if is_fast else "good", "-cpu-used", "4" if is_fast else "2", "-row-mt", "1"]
+
+    if cf in ("hevc", "h265", "mp4_hevc", "hevc_nvenc", "libx265"):
+        if hw == "gpu" and "nvenc" in raw_enc:
+            nv_cq = "18" if q_preset == "master_high" else ("28" if (q_preset == "compact" or is_fast) else "22")
+            return ["-c:v", "hevc_nvenc", "-preset", "p1" if is_fast else "p4", "-cq", nv_cq, "-tag:v", "hvc1"]
+        x265_crf = "18" if q_preset == "master_high" else ("28" if (q_preset == "compact" or is_fast) else "22")
+        return ["-c:v", "libx265", "-preset", "ultrafast" if is_fast else "medium", "-crf", x265_crf, "-tag:v", "hvc1"]
+
+    active_enc = raw_enc if hw == "gpu" else "libx264"
+    nv_cq = "16" if q_preset == "master_high" else ("26" if (q_preset == "compact" or is_fast) else "20")
+    x264_crf = "16" if q_preset == "master_high" else ("26" if (q_preset == "compact" or is_fast) else "20")
+
+    if active_enc == "h264_nvenc":
+        if is_fast:
+            return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-cq", nv_cq]
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", nv_cq]
+
+    if active_enc == "h264_videotoolbox":
+        return ["-c:v", "h264_videotoolbox", "-q:v", "65" if (is_fast or q_preset == "compact") else "78"]
+
+    if active_enc == "h264_qsv":
+        return [
+            "-c:v",
+            "h264_qsv",
+            "-preset",
+            "veryfast" if is_fast else "medium",
+            "-global_quality",
+            x264_crf,
+        ]
+
+    if active_enc == "h264_amf":
+        return ["-c:v", "h264_amf", "-quality", "speed" if is_fast else "balanced"]
+
+    if is_fast:
+        return ["-c:v", "libx264", "-preset", "ultrafast", "-crf", x264_crf]
+    return ["-c:v", "libx264", "-preset", "slow" if q_preset == "master_high" else "fast", "-crf", x264_crf]
+

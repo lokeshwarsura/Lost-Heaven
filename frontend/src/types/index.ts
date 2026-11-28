@@ -156,6 +156,15 @@ export interface PreviewFrameResponse {
   frame_url: string;
   render_time_ms: number;
   timestamp: number;
+  timeline_fx_summary?: {
+    cold_open_active?: boolean;
+    cold_open_label?: string | null;
+    dead_air_cuts_count?: number;
+    dead_air_saved_sec?: number;
+    dead_air_label?: string | null;
+    punch_zoom_count?: number;
+    punch_zoom_label?: string | null;
+  } | null;
 }
 
 export interface PresetPreviewItem {
@@ -196,9 +205,19 @@ export interface SourceWebcamRegion {
   face_cy?: number;
 }
 
+export interface FramingBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface FramingOverride {
-  webcam_box?: { x: number; y: number; w: number; h: number } | null;
+  webcam_box?: FramingBox | null;
   focus_anchor?: { x: number; y: number } | null;
+  frame_crop?: FramingBox | null;
+  keyframe_start_crop?: FramingBox | null;
+  keyframe_end_crop?: FramingBox | null;
   lock_camera?: boolean;
 }
 
@@ -301,15 +320,30 @@ export interface ViralClip {
   show_hook_banner: boolean;
   cold_open_quote: string;
   use_cold_open: boolean;
+  cold_open?: boolean;
   auto_trim_dead_air: boolean;
+  trim_dead_air?: boolean;
   dynamic_punch_zoom: boolean;
+  punch_zoom?: boolean;
   punch_zoom_intensity?: number;
+  framing_user_locked?: boolean;
 
   // Step 1: Multi-format & layouts
   aspect_ratio: '9:16' | '16:9' | '1:1' | '4:5' | '4:3' | 'custom';
   custom_width: number;
   custom_height: number;
-  frame_layout: 'auto_track' | 'webcam_gameplay_split' | 'webcam_gameplay_pip' | 'gameplay_webcam_pip' | 'split_podcast' | 'fit_blur';
+  frame_layout:
+    | 'auto_track'
+    | 'fit_blur'
+    | 'webcam_gameplay_split'
+    | 'webcam_gameplay_pip'
+    | 'gameplay_webcam_pip'
+    | 'split_podcast'
+    | 'cinema_letterbox_blur'
+    | 'triple_gaming_hud'
+    | 'portrait_pip_badge'
+    | 'dynamic_punch_crop'
+    | 'side_by_side_50_50';
   webcam_corner: 'auto' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right';
   webcam_split_ratio: number;
   source_webcam_region?: SourceWebcamRegion | null;
@@ -350,6 +384,7 @@ export interface ViralClip {
   position_y: number;
   caption_x?: number;
   caption_y?: number;
+  caption_custom_position?: boolean;
   caption_rotation?: number;
   caption_max_width?: number;
   hold_back_alpha: number;
@@ -368,7 +403,7 @@ export interface ViralClip {
   censor_profanity?: boolean;
 
   // Step 3: Color grading & filters
-  clip_size: 'Auto' | '1080p' | '720p' | '540p' | '480p';
+  clip_size: 'Auto' | '4k' | '2160p' | '1080p' | '720p' | '540p' | '480p';
   export_fps?: 'source' | '60' | string;
   color_preset: string;
   preset_intensity?: number;
@@ -400,8 +435,10 @@ export interface ViralClip {
   chroma_split?: number;
   letterbox?: string;
   speed_ramp?: number;
+  horizon_tilt?: number;
   voice_eq_preset?: string;
   de_esser?: boolean;
+  voice_enhancer?: boolean;
   loudness_target?: string;
 
   // Step 4: Branding, Outro & Audio
@@ -460,6 +497,7 @@ export interface ViralClip {
   handle_display_mode?: 'always' | 'pulse_12s' | string;
   best_frames?: BestFrameItem[];
   multimodal_summary?: MultimodalSummary;
+  has_existing_music?: boolean;
   narrative_arc?: string;
   arc_label?: string;
   dominant_emotion?: string;
@@ -523,6 +561,8 @@ export interface Project {
   cache_bytes?: number;
   source_missing?: boolean;
   clips_count?: number;
+  tags?: string[];
+  podcast_mode?: boolean;
 }
 
 export interface StorageBreakdown {
@@ -717,7 +757,71 @@ export interface MultimodalTimelinePoint {
   micro_expression_spike?: boolean;
   shot_scale?: string;
   acoustic_event?: string | null;
+  speaker_id?: string | null;
+  is_crosstalk?: boolean;
+  fluency_score?: number;
+  music_bed_intensity?: number;
+  eye_contact_score?: number;
+  gaze_engagement_score?: number;
+  head_emphasis_spike?: boolean;
+  visual_novelty_score?: number;
+  top_hud_occupied?: boolean;
+  bottom_hud_occupied?: boolean;
   is_cut?: boolean;
+}
+
+export interface RetentionRiskZone {
+  start: number;
+  end: number;
+  duration: number;
+  avg_novelty: number;
+  avg_arousal: number;
+  avg_fluency: number;
+  reason: string;
+}
+
+export interface SmartRetentionFix {
+  id: 'shift_captions_clear_hud' | 'enable_punch_zoom_on_peaks' | 'trim_hesitation_dead_air' | string;
+  label: string;
+  reason: string;
+  target_caption_y?: number;
+  max_gap_sec?: number;
+  applied?: boolean;
+}
+
+export interface RetentionDiagnostics {
+  retention_grade: 'S' | 'A' | 'B' | 'C' | string;
+  retention_score: number;
+  risk_zones: RetentionRiskZone[];
+  risk_zone_count: number;
+  smart_fixes: SmartRetentionFix[];
+  speaker_breakdown: {
+    speaker_count: number;
+    dominance_ratios: Record<string, number>;
+    crosstalk_overlaps: Array<{ t: number; end: number; confidence?: number; spectral_entropy?: number }>;
+    crosstalk_count: number;
+  };
+  speech_fluency: {
+    avg_fluency_score: number;
+    filler_count: number;
+    clean_hook_candidates: Array<{ t: number; end: number; text: string; fluency_score: number; speaker_id?: string }>;
+    hesitation_intervals: Array<{ t: number; end: number; duration: number; reason?: string }>;
+    max_hesitation_sec: number;
+  };
+  music_bed_summary: {
+    has_existing_music: boolean;
+    avg_music_intensity: number;
+    estimated_bpm: number;
+  };
+  hud_obstruction: {
+    top_hud_occupied: boolean;
+    bottom_hud_occupied: boolean;
+    recommended_caption_y: number;
+    current_caption_y: number;
+    hud_collision: boolean;
+  };
+  avg_eye_contact_score: number;
+  avg_visual_novelty: number;
 }
 
 export interface MultimodalSummary {
@@ -740,6 +844,14 @@ export interface MultimodalSummary {
   peak_arousal?: number;
   avg_valence?: number;
   speaker_switch_rate?: number;
+  speaker_count?: number;
+  dominance_ratios?: Record<string, number>;
+  crosstalk_count?: number;
+  avg_fluency_score?: number;
+  has_existing_music?: boolean;
+  avg_eye_contact_score?: number;
+  avg_visual_novelty?: number;
+  recommended_caption_y?: number;
   acoustic_event_counts?: Record<string, number>;
 }
 
@@ -756,6 +868,7 @@ export interface BestFramesResponse {
   emotion_shifts?: EmotionShiftItem[];
   acoustic_events?: AcousticEventItem[];
   clip_emotion_breakdown?: ClipEmotionBreakdown;
+  retention_diagnostics?: RetentionDiagnostics;
   multimodal_timeline: MultimodalTimelinePoint[];
   scene_cuts: Array<{ t: number; score: number }>;
   black_intervals?: Array<{ start: number; end: number; duration: number }>;
@@ -807,6 +920,10 @@ export interface StudioSettings {
   whisper_batch_size?: number;
   video_encoder?: string;
   default_resolution?: string;
+  default_fps?: string;
+  loudness_target?: string;
+  audio_normalization_enabled?: boolean;
+  auto_cleanup_days?: number;
   vision_scan_fps?: number;
   first_run_completed?: boolean;
   youtube_authenticated: boolean;
@@ -814,6 +931,7 @@ export interface StudioSettings {
   ffmpeg_path: string;
   gemini_boost_enabled?: boolean;
   active_theme?: string;
+  custom_themes?: Array<Record<string, any>>;
   pexels_api_key?: string;
   watch_folder_path?: string;
   watch_folder_enabled?: boolean;
@@ -909,6 +1027,8 @@ export interface JobProgress {
   default_framing?: string;
   topic_focus?: string;
   hardware_mode?: string;
+  podcast_mode?: boolean;
+  throughput_speed?: number | null;
   live_metrics?: JobLiveMetrics;
   stages: PipelineStage[];
   logs: PipelineLog[];

@@ -284,6 +284,7 @@ def detect_webcam_in_frames(
     )
 
     zone_detections: Dict[str, List[Dict[str, float]]] = {z: [] for z in scan_zones}
+    zone_frame_indices: Dict[str, set[int]] = {z: set() for z in scan_zones}
     face_frame_indices: set[int] = set()
 
     for f_idx, frame in enumerate(valid_frames):
@@ -305,6 +306,7 @@ def detect_webcam_in_frames(
                     "w": float(ff["w"]),
                     "h": float(ff["h"]),
                 })
+                zone_frame_indices[z_hit].add(f_idx)
                 face_frame_indices.add(f_idx)
                 matched_in_frame = True
 
@@ -343,25 +345,81 @@ def detect_webcam_in_frames(
                             "w": abs_fw,
                             "h": abs_fh,
                         })
+                    zone_frame_indices[z_name].add(f_idx)
                     face_frame_indices.add(f_idx)
 
-    # Rank zones by temporal consensus count and average face prominence
+    # Strict temporal persistence (>= 45%), stationarity (bbox_std_dev < 0.04),
+    # and rectangular border / corner-anchor validation so moving gameplay NPCs never trigger false positives.
+    corner_zones_only = {"top_left", "top_right", "bottom_left", "bottom_right"}
+    total_frames_cnt = max(1, len(valid_frames))
+    min_persistent_frames = max(2, int(np.ceil(total_frames_cnt * 0.45))) if len(valid_frames) >= 2 else 1
+
     best_zone: Optional[str] = None
     best_zone_score = 0.0
+    best_meta: Optional[Dict[str, Any]] = None
+
     for z_name, dets in zone_detections.items():
         if not dets:
             continue
+        zone_frames = len(zone_frame_indices[z_name])
+        persistence = zone_frames / float(total_frames_cnt)
+        if norm_lock == "auto" and (persistence < 0.45 or zone_frames < min_persistent_frames):
+            continue
+
+        std_cx = float(np.std([d["cx"] for d in dets])) if len(dets) > 1 else 0.0
+        std_cy = float(np.std([d["cy"] for d in dets])) if len(dets) > 1 else 0.0
+        std_w = float(np.std([d["w"] for d in dets])) if len(dets) > 1 else 0.0
+        std_h = float(np.std([d["h"] for d in dets])) if len(dets) > 1 else 0.0
+        bbox_std_dev = max(std_cx, std_cy, std_w, std_h)
+
+        if norm_lock == "auto" and z_name != "center" and bbox_std_dev >= 0.04:
+            continue
+
+        cand_cx = float(np.median([d["cx"] for d in dets]))
+        cand_cy = float(np.median([d["cy"] for d in dets]))
+        cand_fw = float(np.median([d["w"] for d in dets]))
+        cand_fh = float(np.median([d["h"] for d in dets]))
+        cand_erg = _ergonomic_portrait_box(cand_cx, cand_cy, cand_fw, cand_fh, eff_w, eff_h)
+        cand_snapped = _snap_to_persistent_overlay_border(
+            valid_frames, z_name, cand_erg, cand_cx, cand_cy, eff_w, eff_h
+        )
+
+        # Unbordered edge/mid-screen gameplay faces without a static rectangular overlay are rejected;
+        # unbordered true corner overlays (e.g. green-screen) require >=65% persistence & tight stationarity.
+        if norm_lock == "auto" and z_name != "center" and cand_snapped is None:
+            if z_name not in corner_zones_only:
+                continue
+            if persistence < 0.65 or bbox_std_dev >= 0.025:
+                continue
+            if cand_fw > 0.22 or cand_fh > 0.30:
+                continue
+
         mean_area = float(np.mean([d["w"] * d["h"] for d in dets]))
-        z_score = len(dets) * 10.0 + mean_area * 120.0
-        # Slight preference for streamer corner overlays vs accidental center when tied
-        if z_name != "center":
-            z_score += 2.0
+        z_score = zone_frames * 10.0 + mean_area * 120.0
+        if cand_snapped is not None:
+            z_score += 8.0
+        if z_name in corner_zones_only:
+            z_score += 3.0
+        elif z_name != "center":
+            z_score += 1.0
+
         if z_score > best_zone_score:
             best_zone_score = z_score
             best_zone = z_name
+            best_meta = {
+                "avg_cx": cand_cx,
+                "avg_cy": cand_cy,
+                "avg_fw": cand_fw,
+                "avg_fh": cand_fh,
+                "erg_box": cand_erg,
+                "snapped": cand_snapped,
+                "persistence": persistence,
+                "bbox_std_dev": bbox_std_dev,
+                "zone_frames": zone_frames,
+            }
 
-    # Smart "No Webcam Detected" Guard when auto mode finds zero confirmed faces
-    if best_zone is None:
+    # Smart "No Webcam Detected" Guard when auto mode finds zero confirmed persistent webcams
+    if best_zone is None or best_meta is None:
         if norm_lock != "auto":
             return compute_zone_crop_box(norm_lock, eff_w, eff_h)
         mid_fr = valid_frames[len(valid_frames) // 2]
@@ -380,18 +438,15 @@ def detect_webcam_in_frames(
             "action_cy": acy,
             "frames_sampled": len(valid_frames),
             "face_frames": 0,
+            "persistence": 0.0,
+            "bbox_std_dev": 0.0,
+            "border_detected": False,
         }
 
-    dets = zone_detections[best_zone]
-    avg_cx = float(np.median([d["cx"] for d in dets]))
-    avg_cy = float(np.median([d["cy"] for d in dets]))
-    avg_fw = float(np.median([d["w"] for d in dets]))
-    avg_fh = float(np.median([d["h"] for d in dets]))
-
-    erg_box = _ergonomic_portrait_box(avg_cx, avg_cy, avg_fw, avg_fh, eff_w, eff_h)
-    snapped = _snap_to_persistent_overlay_border(
-        valid_frames, best_zone, erg_box, avg_cx, avg_cy, eff_w, eff_h
-    )
+    avg_cx = float(best_meta["avg_cx"])
+    avg_cy = float(best_meta["avg_cy"])
+    erg_box = best_meta["erg_box"]
+    snapped = best_meta["snapped"]
     nx, ny, nw, nh = snapped if snapped is not None else erg_box
     pix_ar = round((nw * eff_w) / max(1e-4, nh * eff_h), 4)
 
@@ -410,7 +465,10 @@ def detect_webcam_in_frames(
         "action_cx": 0.5,
         "action_cy": 0.48,
         "frames_sampled": len(valid_frames),
-        "face_frames": len(face_frame_indices),
+        "face_frames": int(best_meta["zone_frames"]),
+        "persistence": round(float(best_meta["persistence"]), 4),
+        "bbox_std_dev": round(float(best_meta["bbox_std_dev"]), 4),
+        "border_detected": snapped is not None,
     }
 
 

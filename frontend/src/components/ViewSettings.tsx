@@ -1,16 +1,31 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  CheckCircle2, AlertTriangle, RefreshCw, Copy, Check, 
-  Palette, Cpu, HardDrive, Download, Trash2, Shield, 
-  Sparkles, Terminal, Settings as SettingsIcon, Zap, 
-  Eye, EyeOff, Radio, ExternalLink, ArrowUpRight
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import {
+  CheckCircle2, AlertTriangle, XCircle, RefreshCw, Copy, Check,
+  Palette, Cpu, HardDrive, Download, Trash2, Shield,
+  Sparkles, Terminal, Settings as SettingsIcon, Zap,
+  Eye, EyeOff, Radio, ExternalLink, ArrowUpRight,
+  RotateCcw, Upload, Plus, Sliders, Volume2, Film
 } from 'lucide-react';
 import { 
   SystemCheckReport, MachineSpecs, ModelsStatusReport, 
   StudioSettings, GeminiModelTestResult, GeminiModelInfo
 } from '../types';
 import { api } from '../api/client';
-import { THEMES, applyTheme, getActiveTheme, ThemeDefinition } from '../themes/themes';
+import {
+  THEMES,
+  THEME_CATEGORIES_META,
+  applyTheme,
+  getActiveTheme,
+  getAllThemes,
+  getCustomThemes,
+  setCustomThemes,
+  getThemeCategory,
+  buildCustomTheme,
+  normalizeCustomTheme,
+  computeContrastRatio,
+  ThemeCategory,
+  ThemeDefinition,
+} from '../themes/themes';
 
 interface ViewSettingsProps {
   onOpenSetupWizard?: () => void;
@@ -22,8 +37,39 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
   const [checkingSystem, setCheckingSystem] = useState(false);
   const [copiedReport, setCopiedReport] = useState(false);
 
-  // Themes
-  const [activeTheme, setActiveTheme] = useState<ThemeDefinition>(getActiveTheme());
+  // 4-Tab Studio Preferences Navigation
+  type SettingsTabId = 'appearance' | 'ai' | 'render' | 'diagnostics';
+  const [activeTab, setActiveTab] = useState<SettingsTabId>('appearance');
+  const [resettingDefaults, setResettingDefaults] = useState(false);
+
+  // Themes & Custom Theme Studio
+  const [customThemesState, setCustomThemesState] = useState<ThemeDefinition[]>(() => getCustomThemes());
+  const [activeTheme, setActiveTheme] = useState<ThemeDefinition>(() => getActiveTheme());
+  const [themeCategoryFilter, setThemeCategoryFilter] = useState<'all' | ThemeCategory>('all');
+  const [showCustomStudio, setShowCustomStudio] = useState<boolean>(false);
+  const [editingCustomId, setEditingCustomId] = useState<string | null>(null);
+  const [themeStudioNotice, setThemeStudioNotice] = useState<string | null>(null);
+  const [customDraft, setCustomDraft] = useState({
+    name: 'Midnight Obsidian',
+    description: 'Custom high-contrast studio palette',
+    bgCanvas: '#09090E',
+    bgSurface: '#12131A',
+    bgElevated: '#1B1D28',
+    accentPrimary: '#8B5CF6',
+    accentSecondary: '#06B6D4',
+    textPrimary: '#F8FAFC',
+    borderSubtle: '#272A3A',
+  });
+
+  // Default Render & Audio Mastering Settings
+  const [videoEncoder, setVideoEncoder] = useState<string>('auto');
+  const [defaultResolution, setDefaultResolution] = useState<string>('1080x1920');
+  const [defaultFps, setDefaultFps] = useState<string>('30');
+  const [loudnessTarget, setLoudnessTarget] = useState<number>(-14.0);
+  const [audioNormalizationEnabled, setAudioNormalizationEnabled] = useState<boolean>(true);
+  const [autoCleanupDays, setAutoCleanupDays] = useState<number>(30);
+  const [savingRenderDefaults, setSavingRenderDefaults] = useState<boolean>(false);
+  const [renderDefaultsNotice, setRenderDefaultsNotice] = useState<string | null>(null);
 
   // Whisper Models
   const [modelsData, setModelsData] = useState<ModelsStatusReport | null>(null);
@@ -135,11 +181,27 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
         if (typeof sysSettings.watch_folder_enabled === 'boolean') {
           setWatchFolderEnabled(sysSettings.watch_folder_enabled);
         }
+        if (sysSettings.custom_themes && Array.isArray(sysSettings.custom_themes)) {
+          const synced = setCustomThemes(sysSettings.custom_themes);
+          setCustomThemesState(synced);
+        }
+        if (sysSettings.video_encoder) setVideoEncoder(sysSettings.video_encoder);
+        if (sysSettings.default_resolution) setDefaultResolution(sysSettings.default_resolution);
+        if (sysSettings.default_fps) setDefaultFps(String(sysSettings.default_fps));
+        if (sysSettings.loudness_target !== undefined && sysSettings.loudness_target !== null) {
+          const parsedLt = parseFloat(String(sysSettings.loudness_target).replace(/[^0-9.-]/g, ''));
+          if (Number.isFinite(parsedLt)) setLoudnessTarget(parsedLt);
+        }
+        if (typeof sysSettings.audio_normalization_enabled === 'boolean') setAudioNormalizationEnabled(sysSettings.audio_normalization_enabled);
+        if (typeof sysSettings.auto_cleanup_days === 'number') setAutoCleanupDays(sysSettings.auto_cleanup_days);
         if (sysSettings.active_theme) {
-          const matched = THEMES.find((t) => t.id === sysSettings.active_theme);
+          const allList = getAllThemes(
+            Array.isArray(sysSettings.custom_themes) ? sysSettings.custom_themes : undefined
+          );
+          const matched = allList.find((t) => t.id === sysSettings.active_theme);
           if (matched) {
             setActiveTheme(matched);
-            applyTheme(matched.id);
+            applyTheme(matched.id, allList.filter((t) => t.isCustom));
           }
         }
       }
@@ -190,8 +252,237 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
 
   const handleSelectTheme = (theme: ThemeDefinition) => {
     setActiveTheme(theme);
-    applyTheme(theme.id);
-    api.updateSystemSettings({ active_theme: theme.id }).catch(() => {});
+    applyTheme(theme.id, customThemesState);
+    Promise.all([
+      api.updateSystemSettings({ active_theme: theme.id }),
+      api.updateSettings({ active_theme: theme.id }),
+    ]).catch(() => {});
+  };
+
+  const allThemesList = useMemo(() => getAllThemes(customThemesState), [customThemesState]);
+
+  const filteredThemes = useMemo(() => {
+    if (themeCategoryFilter === 'all') return allThemesList;
+    return allThemesList.filter((t) => getThemeCategory(t) === themeCategoryFilter);
+  }, [allThemesList, themeCategoryFilter]);
+
+  const previewDraftTheme = useMemo(
+    () =>
+      buildCustomTheme({
+        id: editingCustomId || undefined,
+        ...customDraft,
+      }),
+    [editingCustomId, customDraft]
+  );
+
+  const primaryContrastRatio = useMemo(
+    () => computeContrastRatio(customDraft.textPrimary, customDraft.bgCanvas),
+    [customDraft.textPrimary, customDraft.bgCanvas]
+  );
+
+  const surfaceContrastRatio = useMemo(
+    () => computeContrastRatio(customDraft.textPrimary, customDraft.bgSurface),
+    [customDraft.textPrimary, customDraft.bgSurface]
+  );
+
+  const persistCustomThemesAndSelect = async (
+    nextCustom: ThemeDefinition[],
+    selectThemeId: string,
+    noticeText?: string
+  ) => {
+    const synced = setCustomThemes(nextCustom);
+    setCustomThemesState(synced);
+    const chosen =
+      getAllThemes(synced).find((t) => t.id === selectThemeId) || THEMES[0];
+    setActiveTheme(chosen);
+    applyTheme(chosen.id, synced);
+    try {
+      await Promise.all([
+        api.updateSettings({ custom_themes: synced, active_theme: chosen.id }),
+        api.updateSystemSettings({ custom_themes: synced, active_theme: chosen.id }),
+      ]);
+      window.dispatchEvent(
+        new CustomEvent('lost-heaven:settings-updated', {
+          detail: { custom_themes: synced, active_theme: chosen.id },
+        })
+      );
+      if (noticeText) {
+        setThemeStudioNotice(noticeText);
+        setTimeout(() => setThemeStudioNotice(null), 3000);
+      }
+    } catch {
+      setThemeStudioNotice('Applied locally; backend settings sync failed.');
+    }
+  };
+
+  const handleSaveCustomTheme = async () => {
+    const cleanName = customDraft.name.trim() || 'Custom Studio Theme';
+    let targetId = editingCustomId;
+    if (!targetId) {
+      const candidateBase = buildCustomTheme({ ...customDraft, name: cleanName }).id;
+      const existingIds = new Set(allThemesList.map((t) => t.id));
+      targetId = existingIds.has(candidateBase)
+        ? `${candidateBase}-${Date.now().toString(36).slice(-4)}`
+        : candidateBase;
+    }
+    const built = buildCustomTheme({
+      id: targetId,
+      name: cleanName,
+      description: customDraft.description.trim() || 'User-crafted Studio Theme',
+      bgCanvas: customDraft.bgCanvas,
+      bgSurface: customDraft.bgSurface,
+      bgElevated: customDraft.bgElevated,
+      accentPrimary: customDraft.accentPrimary,
+      accentSecondary: customDraft.accentSecondary,
+      textPrimary: customDraft.textPrimary,
+      borderSubtle: customDraft.borderSubtle,
+    });
+    const existsIdx = customThemesState.findIndex((t) => t.id === built.id);
+    const nextList =
+      existsIdx >= 0
+        ? customThemesState.map((t, idx) => (idx === existsIdx ? built : t))
+        : [...customThemesState, built];
+    setEditingCustomId(built.id);
+    await persistCustomThemesAndSelect(
+      nextList,
+      built.id,
+      existsIdx >= 0 ? `Updated theme "${built.name}"` : `Saved theme "${built.name}"`
+    );
+  };
+
+  const handleEditCustomTheme = (t: ThemeDefinition) => {
+    setEditingCustomId(t.isCustom ? t.id : null);
+    setCustomDraft({
+      name: t.isCustom ? t.name : `${t.name} Remix`,
+      description: t.description || 'Custom Studio Theme',
+      bgCanvas: t.bgCanvas,
+      bgSurface: t.bgSurface,
+      bgElevated: t.bgElevated || t.cardHover || t.bgCard,
+      accentPrimary: t.accentPrimary,
+      accentSecondary: t.accentSecondary || t.accentHover || t.accentPrimary,
+      textPrimary: t.textPrimary,
+      borderSubtle: t.borderSubtle,
+    });
+    setShowCustomStudio(true);
+  };
+
+  const handleDeleteCustomTheme = async (themeId: string) => {
+    const nextList = customThemesState.filter((t) => t.id !== themeId);
+    const fallbackId = activeTheme.id === themeId ? THEMES[0].id : activeTheme.id;
+    if (editingCustomId === themeId) setEditingCustomId(null);
+    await persistCustomThemesAndSelect(nextList, fallbackId, 'Deleted custom theme.');
+  };
+
+  const handleExportCustomTheme = (theme: ThemeDefinition) => {
+    const payload = JSON.stringify(theme, null, 2);
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${theme.id}.lost-heaven-theme.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const themeImportInputRef = useRef<HTMLInputElement | null>(null);
+
+  const handleImportCustomThemeFile = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const rawItems = Array.isArray(parsed) ? parsed : [parsed];
+      const imported: ThemeDefinition[] = [];
+      for (const item of rawItems) {
+        const norm = normalizeCustomTheme(item);
+        if (norm) {
+          const uniqueId = THEMES.some((b) => b.id === norm.id)
+            ? `custom-${norm.id}-${Date.now().toString(36).slice(-3)}`
+            : norm.id;
+          imported.push({ ...norm, id: uniqueId });
+        }
+      }
+      if (imported.length === 0) {
+        setThemeStudioNotice('Invalid theme JSON format.');
+        return;
+      }
+      const merged = [...customThemesState];
+      for (const imp of imported) {
+        const idx = merged.findIndex((m) => m.id === imp.id);
+        if (idx >= 0) merged[idx] = imp;
+        else merged.push(imp);
+      }
+      await persistCustomThemesAndSelect(
+        merged,
+        imported[imported.length - 1].id,
+        `Imported ${imported.length} custom theme(s)`
+      );
+    } catch {
+      setThemeStudioNotice('Failed to parse theme JSON file.');
+    }
+  };
+
+  const handleSaveRenderDefaults = async () => {
+    setSavingRenderDefaults(true);
+    setRenderDefaultsNotice(null);
+    const formattedLufs = `${Number.isInteger(loudnessTarget) ? loudnessTarget : loudnessTarget.toFixed(1)} LUFS`;
+    const payload = {
+      hardware_acceleration: hardwareMode,
+      video_encoder: videoEncoder,
+      default_resolution: defaultResolution,
+      default_fps: defaultFps,
+      loudness_target: formattedLufs,
+      audio_normalization_enabled: audioNormalizationEnabled,
+      auto_cleanup_days: autoCleanupDays,
+    };
+    try {
+      await Promise.all([
+        api.updateSystemSettings(payload),
+        api.updateSettings(payload),
+      ]);
+      window.dispatchEvent(new CustomEvent('lost-heaven:settings-updated', { detail: payload }));
+      setRenderDefaultsNotice('Render & audio mastering defaults saved.');
+      setTimeout(() => setRenderDefaultsNotice(null), 3000);
+    } catch {
+      setRenderDefaultsNotice('Failed to save render & audio defaults.');
+    } finally {
+      setSavingRenderDefaults(false);
+    }
+  };
+
+  const handleResetDefaults = async () => {
+    setResettingDefaults(true);
+    try {
+      const res = await api.resetSettingsDefaults();
+      const s = res?.settings || {};
+      const nextThemeId = s.active_theme || 'Hicksfield';
+      const defaultTheme = getAllThemes(customThemesState).find((t) => t.id === nextThemeId) || THEMES[0];
+      setActiveTheme(defaultTheme);
+      applyTheme(defaultTheme.id, customThemesState);
+      setHardwareMode(s.hardware_acceleration || 'auto');
+      setVideoEncoder(s.video_encoder || 'auto');
+      setDefaultResolution(s.default_resolution || '1080x1920');
+      setDefaultFps(String(s.default_fps || '30'));
+      const parsedResetLt = parseFloat(String(s.loudness_target ?? '-14 LUFS').replace(/[^0-9.-]/g, ''));
+      setLoudnessTarget(Number.isFinite(parsedResetLt) ? parsedResetLt : -14.0);
+      setAudioNormalizationEnabled(
+        typeof s.audio_normalization_enabled === 'boolean' ? s.audio_normalization_enabled : true
+      );
+      setAutoCleanupDays(typeof s.auto_cleanup_days === 'number' ? s.auto_cleanup_days : 30);
+      if (s.whisper_model) setActiveWhisperModel(s.whisper_model);
+      if (s.gemini_analysis_mode) setGeminiAnalysisMode(s.gemini_analysis_mode);
+      window.dispatchEvent(new CustomEvent('lost-heaven:settings-updated', { detail: s }));
+      setRenderDefaultsNotice('Studio defaults restored (API keys & custom themes preserved).');
+      setThemeStudioNotice('Restored default Studio theme & preferences.');
+      setTimeout(() => {
+        setRenderDefaultsNotice(null);
+        setThemeStudioNotice(null);
+      }, 3500);
+      await loadAllDiagnostics();
+    } catch {
+      setRenderDefaultsNotice('Failed to reset defaults.');
+    } finally {
+      setResettingDefaults(false);
+    }
   };
 
   const handleSelectWhisperModel = async (modelName: string) => {
@@ -370,59 +661,115 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
   // Safe checks array (never invent fake hardware specs before API responds)
   const activeChecks = systemCheck?.checks || [];
 
-  return (
-    <div className="flex-1 overflow-y-auto p-6 md:p-8 space-y-10 animate-fadeIn max-w-7xl mx-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] transition-colors">
-      {/* View Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-[var(--border-subtle)]">
-        <div>
-          <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight flex items-center gap-3">
-            <SettingsIcon className="w-7 h-7 text-[var(--accent-primary)]" />
-            <span>Settings & Diagnostics</span>
-          </h1>
-          <p className="text-xs md:text-sm text-[var(--text-secondary)] mt-1">
-            Hardware acceleration, Whisper AI models, 11 studio UI themes, and Gemini API controls.
-          </p>
-        </div>
+  const okChecksCount = activeChecks.filter((c: any) => c.ok !== false && c.status !== 'error').length;
 
-        <div className="flex items-center gap-2">
-          {onOpenSetupWizard && (
-            <button
-              onClick={onOpenSetupWizard}
-              className="flex items-center gap-1.5 px-3.5 py-2 bg-[var(--bg-card)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] transition shadow-sm"
-            >
-              <Sparkles className="w-4 h-4 text-[var(--accent-primary)]" />
-              <span>Re-Scan PC Specs &amp; Setup Wizard</span>
-            </button>
-          )}
-          <button
-            onClick={handleCopyReport}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-[var(--bg-card)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] transition shadow-sm"
-          >
-            {copiedReport ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
-            <span>{copiedReport ? 'Report Copied' : 'Copy report'}</span>
-          </button>
-          <button
-            onClick={handleRunSystemCheck}
-            disabled={checkingSystem}
-            className="flex items-center gap-1.5 px-4 py-2 bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold rounded-xl shadow-md transition hover:opacity-90 disabled:opacity-50"
-          >
-            <RefreshCw className={`w-4 h-4 ${checkingSystem ? 'animate-spin' : ''}`} />
-            <span>Check again</span>
-          </button>
+  return (
+    <div className="flex-1 overflow-y-auto bg-[var(--bg-canvas)] text-[var(--text-primary)] transition-colors">
+      {/* Sticky Workstation Header + Quick Actions + 4-Tab Bar */}
+      <div className="sticky top-0 z-20 bg-[var(--bg-canvas)]/95 backdrop-blur-md border-b border-[var(--border-subtle)]">
+        <div className="max-w-7xl mx-auto px-6 md:px-8 pt-5 pb-3 space-y-4">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div>
+              <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight flex items-center gap-3">
+                <SettingsIcon className="w-7 h-7 text-[var(--accent-primary)]" />
+                <span>Settings &amp; Diagnostics</span>
+              </h1>
+              <p className="text-xs md:text-sm text-[var(--text-secondary)] mt-1">
+                {allThemesList.length} Studio Themes • {hardwareMode === 'cpu' ? 'CPU Mode' : 'Hardware Acceleration'} • Theme:{' '}
+                <span className="font-semibold text-[var(--accent-primary)]">{activeTheme.name}</span>
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {onOpenSetupWizard && (
+                <button
+                  onClick={onOpenSetupWizard}
+                  className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-elevated)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] transition shadow-sm"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  <span>Re-Scan PC Specs</span>
+                </button>
+              )}
+              <button
+                onClick={handleCopyReport}
+                className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-elevated)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] transition shadow-sm"
+              >
+                {copiedReport ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedReport ? 'Copied' : 'Copy Diagnostics'}</span>
+              </button>
+              <button
+                onClick={handleResetDefaults}
+                disabled={resettingDefaults}
+                className="flex items-center gap-1.5 px-3 py-2 bg-[var(--bg-elevated)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] transition shadow-sm disabled:opacity-50"
+                title="Reset render, audio, AI preference, and theme defaults (keeps API keys & custom themes)"
+              >
+                <RotateCcw className={`w-3.5 h-3.5 ${resettingDefaults ? 'animate-spin' : ''}`} />
+                <span>{resettingDefaults ? 'Resetting...' : 'Reset Defaults'}</span>
+              </button>
+              <button
+                onClick={handleRunSystemCheck}
+                disabled={checkingSystem}
+                className="flex items-center gap-1.5 px-3.5 py-2 bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold rounded-xl shadow-md transition hover:opacity-90 disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${checkingSystem ? 'animate-spin' : ''}`} />
+                <span>Check Again</span>
+              </button>
+            </div>
+          </div>
+
+          {/* 4-Tab Workstation Navigation */}
+          <div className="flex flex-wrap items-center gap-1.5" role="tablist">
+            {[
+              { id: 'appearance' as const, label: 'Appearance & Custom Themes', icon: Palette, badge: `${allThemesList.length}` },
+              { id: 'ai' as const, label: 'AI Engines & Models', icon: Sparkles, badge: activeWhisperModel },
+              { id: 'render' as const, label: 'Default Render & Audio Mastering', icon: Sliders, badge: `${loudnessTarget} LUFS` },
+              { id: 'diagnostics' as const, label: 'System Health & Diagnostics', icon: Shield, badge: `${okChecksCount}/${activeChecks.length}` },
+            ].map((tab) => {
+              const Icon = tab.icon;
+              const isActive = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={isActive}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all border ${
+                    isActive
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] shadow-md'
+                      : 'bg-[var(--bg-surface)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)]'
+                  }`}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  <span>{tab.label}</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded-md text-[10px] font-mono ${
+                      isActive ? 'bg-black/20 text-[var(--accent-foreground)]' : 'bg-[var(--bg-elevated)] text-[var(--text-muted)]'
+                    }`}
+                  >
+                    {tab.badge}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
-      {/* SECTION 1: SYSTEM CHECK (8 Status Badges) */}
+      <div className="max-w-7xl mx-auto p-6 md:p-8 space-y-8 animate-fadeIn">
+
+      {/* TAB 4 PART A: SYSTEM CHECK (8 Status Badges) */}
+      {activeTab === 'diagnostics' && (
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <h2 className="text-sm font-bold tracking-wide uppercase">System Check</h2>
             <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
-              {systemCheck?.all_passed ? '8/8 ALL OK' : 'DIAGNOSTIC STATUS'}
+              {systemCheck?.all_passed ? `${activeChecks.length}/${activeChecks.length} ALL OK` : `${okChecksCount}/${activeChecks.length} PASSED`}
             </span>
           </div>
           <span className="text-[11px] text-[var(--text-secondary)]">
-            Real-time validation against video pipeline & GPU runtime
+            Real-time validation against video pipeline &amp; GPU runtime
           </span>
         </div>
 
@@ -430,7 +777,7 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
           {activeChecks.map((check: any) => (
             <div 
               key={check.id}
-              className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-3 flex items-start gap-3 hover:border-[var(--accent-primary)]/50 transition-colors shadow-sm"
+              className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-xl p-3 flex items-start gap-3 hover:border-[var(--accent-primary)]/50 transition-colors shadow-sm"
             >
               <div className="p-1.5 rounded-lg bg-emerald-500/15 text-emerald-400 flex-shrink-0 mt-0.5">
                 <CheckCircle2 className="w-4 h-4" />
@@ -446,71 +793,407 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
           ))}
         </div>
       </div>
+      )}
 
-      {/* SECTION 2: LIVE UI THEME SWITCHER (11 Themes) */}
-      <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
+      {/* TAB 1: APPEARANCE & CUSTOM THEMES (18+ Built-In Themes + Live Custom Theme Studio) */}
+      {activeTab === 'appearance' && (
+      <div className="space-y-6">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
             <Palette className="w-4 h-4 text-[var(--accent-primary)]" />
-            <h2 className="text-sm font-bold tracking-wide uppercase">Studio Theme</h2>
-            <span className="text-xs text-[var(--text-secondary)]">({THEMES.length} Themes)</span>
+            <h2 className="text-sm font-bold tracking-wide uppercase">Studio Theme Library</h2>
+            <span className="text-xs text-[var(--text-secondary)]">({allThemesList.length} Themes)</span>
+            <span className="px-2 py-0.5 rounded-full text-[11px] bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[var(--accent-primary)] font-semibold">
+              Active: {activeTheme.name}
+            </span>
           </div>
-          <span className="text-xs text-[var(--accent-primary)] font-semibold">
-            Active: {activeTheme.name}
-          </span>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={themeImportInputRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleImportCustomThemeFile(file);
+                e.currentTarget.value = '';
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => themeImportInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] hover:bg-[var(--bg-elevated)] text-xs font-semibold transition"
+            >
+              <Upload className="w-3.5 h-3.5" />
+              <span>Import .json</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExportCustomTheme(activeTheme)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-surface)] hover:bg-[var(--bg-elevated)] text-xs font-semibold transition"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Export Active</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEditingCustomId(null);
+                setShowCustomStudio((prev) => !prev);
+              }}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold shadow-sm hover:opacity-90 transition"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>{showCustomStudio ? 'Close Theme Studio' : 'Create Custom Theme'}</span>
+            </button>
+          </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-          {THEMES.map((t) => {
-            const isSelected = activeTheme.id === t.id;
-            return (
-              <button
-                key={t.id}
-                onClick={() => handleSelectTheme(t)}
-                className={`flex flex-col text-left p-3 rounded-xl border transition-all relative overflow-hidden group ${
-                  isSelected 
-                    ? 'border-[var(--accent-primary)] bg-[var(--bg-card)] ring-2 ring-[var(--accent-primary)]/40 shadow-lg' 
-                    : 'border-[var(--border-subtle)] bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/40'
-                }`}
-              >
-                {/* Visual Palette Swatches */}
-                <div className="flex items-center gap-1.5 mb-2.5">
-                  <span 
-                    className="w-4 h-4 rounded-full border border-black/20 dark:border-white/20 shadow-sm flex-shrink-0" 
-                    style={{ backgroundColor: t.bgCanvas }} 
-                    title={`Background: ${t.bgCanvas}`}
-                  />
-                  <span 
-                    className="w-4 h-4 rounded-full border border-black/20 dark:border-white/20 shadow-sm flex-shrink-0" 
-                    style={{ backgroundColor: t.bgCard }} 
-                    title={`Card: ${t.bgCard}`}
-                  />
-                  <span 
-                    className="w-4 h-4 rounded-full shadow-sm flex-shrink-0 ring-1 ring-black/20 dark:ring-white/30" 
-                    style={{ backgroundColor: t.accentPrimary }} 
-                    title={`Accent: ${t.accentPrimary}`}
-                  />
+        {themeStudioNotice && (
+          <div className="px-3.5 py-2 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-xs font-medium text-emerald-400">
+            {themeStudioNotice}
+          </div>
+        )}
+
+        {/* Interactive Custom Theme Studio Drawer */}
+        {showCustomStudio && (
+          <div className="bg-[var(--bg-surface)] border border-[var(--accent-primary)]/40 rounded-2xl p-5 space-y-5 shadow-lg">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-[var(--border-subtle)]">
+              <div>
+                <h3 className="text-sm font-extrabold flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-[var(--accent-primary)]" />
+                  <span>{editingCustomId ? 'Edit Custom Studio Theme' : 'Custom Theme Studio'}</span>
+                </h3>
+                <p className="text-[11px] text-[var(--text-secondary)] mt-0.5">
+                  Craft semantic canvas, elevated surface, dual accents, and text tokens with live WCAG contrast verification.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 text-[11px] font-mono">
+                <span
+                  className={`px-2 py-0.5 rounded-full border font-bold ${
+                    primaryContrastRatio >= 4.5
+                      ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                      : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                  }`}
+                >
+                  Canvas Contrast {primaryContrastRatio}:1 {primaryContrastRatio >= 4.5 ? 'AA' : 'LOW'}
+                </span>
+                <span
+                  className={`px-2 py-0.5 rounded-full border font-bold ${
+                    surfaceContrastRatio >= 4.5
+                      ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                      : 'bg-amber-500/15 text-amber-400 border-amber-500/30'
+                  }`}
+                >
+                  Surface {surfaceContrastRatio}:1
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+              {/* Token Pickers */}
+              <div className="lg:col-span-7 space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[var(--text-secondary)] mb-1">Theme Name</label>
+                    <input
+                      type="text"
+                      value={customDraft.name}
+                      onChange={(e) => setCustomDraft((prev) => ({ ...prev, name: e.target.value }))}
+                      placeholder="e.g. Velvet Amber"
+                      className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold outline-none focus:border-[var(--accent-primary)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-[var(--text-secondary)] mb-1">Description</label>
+                    <input
+                      type="text"
+                      value={customDraft.description}
+                      onChange={(e) => setCustomDraft((prev) => ({ ...prev, description: e.target.value }))}
+                      placeholder="Short editorial description"
+                      className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs outline-none focus:border-[var(--accent-primary)]"
+                    />
+                  </div>
                 </div>
 
-                <div className="flex items-center justify-between w-full">
-                  <span className="text-xs font-bold truncate">{t.name}</span>
-                  {isSelected && (
-                    <Check className="w-3.5 h-3.5 text-[var(--accent-primary)] flex-shrink-0" />
-                  )}
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                  {([
+                    { key: 'bgCanvas', label: 'Canvas (--bg-canvas)' },
+                    { key: 'bgSurface', label: 'Surface (--bg-surface)' },
+                    { key: 'bgElevated', label: 'Elevated (--bg-elevated)' },
+                    { key: 'accentPrimary', label: 'Primary Accent' },
+                    { key: 'accentSecondary', label: 'Secondary Accent' },
+                    { key: 'textPrimary', label: 'Primary Text' },
+                    { key: 'borderSubtle', label: 'Subtle Border' },
+                  ] as const).map((field) => (
+                    <div
+                      key={field.key}
+                      className="p-2.5 rounded-xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] space-y-1.5"
+                    >
+                      <div className="text-[10px] font-bold text-[var(--text-secondary)] truncate">{field.label}</div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="color"
+                          value={customDraft[field.key]}
+                          onChange={(e) =>
+                            setCustomDraft((prev) => ({ ...prev, [field.key]: e.target.value.toUpperCase() }))
+                          }
+                          className="w-8 h-7 rounded cursor-pointer border-0 bg-transparent p-0"
+                        />
+                        <input
+                          type="text"
+                          value={customDraft[field.key]}
+                          onChange={(e) =>
+                            setCustomDraft((prev) => ({ ...prev, [field.key]: e.target.value }))
+                          }
+                          className="w-full px-2 py-1 rounded bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] font-mono outline-none"
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                <p className="text-[10px] text-[var(--text-secondary)] truncate mt-0.5">{t.description}</p>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={handleSaveCustomTheme}
+                    className="px-4 py-2 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold shadow hover:opacity-90 transition"
+                  >
+                    {editingCustomId ? 'Update Custom Theme' : 'Save & Apply Theme'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const preview = buildCustomTheme({ id: 'live-preview', ...customDraft });
+                      applyTheme(preview.id, [...customThemesState, preview]);
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-xs font-semibold hover:opacity-90 transition"
+                  >
+                    Live Preview on App
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowCustomStudio(false);
+                      setEditingCustomId(null);
+                      applyTheme(activeTheme.id, customThemesState);
+                    }}
+                    className="px-3 py-2 rounded-xl text-xs font-semibold text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+
+              {/* Miniature Live Studio Preview Card */}
+              <div className="lg:col-span-5">
+                <div
+                  className="rounded-2xl p-4 h-full flex flex-col justify-between gap-3 transition-colors"
+                  style={{
+                    backgroundColor: previewDraftTheme.bgCanvas,
+                    color: previewDraftTheme.textPrimary,
+                    border: `1px solid ${previewDraftTheme.borderSubtle}`,
+                  }}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-bold uppercase tracking-wider opacity-80">
+                      Live Miniature Studio Preview
+                    </span>
+                    <span
+                      className="px-2 py-0.5 rounded-full text-[10px] font-bold"
+                      style={{
+                        backgroundColor: previewDraftTheme.accentLight,
+                        color: previewDraftTheme.accentPrimary,
+                      }}
+                    >
+                      {previewDraftTheme.isDark ? 'Dark Studio' : 'Light Editorial'}
+                    </span>
+                  </div>
+
+                  <div
+                    className="rounded-xl p-3 space-y-2.5"
+                    style={{
+                      backgroundColor: previewDraftTheme.bgSurface,
+                      border: `1px solid ${previewDraftTheme.borderSubtle}`,
+                    }}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-extrabold">{previewDraftTheme.name}</span>
+                      <span
+                        className="w-2.5 h-2.5 rounded-full"
+                        style={{ backgroundColor: previewDraftTheme.accentSecondary }}
+                      />
+                    </div>
+                    <div
+                      className="rounded-lg p-2.5 text-[11px]"
+                      style={{
+                        backgroundColor: previewDraftTheme.bgElevated,
+                        border: `1px solid ${previewDraftTheme.borderSubtle}`,
+                        color: previewDraftTheme.textSecondary,
+                      }}
+                    >
+                      Hook Score 94 • 9:16 CFR Timeline • -14 LUFS Master
+                    </div>
+                    <div className="flex items-center gap-2 pt-1">
+                      <span
+                        className="px-3 py-1 rounded-lg text-[11px] font-bold"
+                        style={{
+                          backgroundColor: previewDraftTheme.accentPrimary,
+                          color: previewDraftTheme.accentForeground,
+                        }}
+                      >
+                        Primary CTA
+                      </span>
+                      <span
+                        className="px-3 py-1 rounded-lg text-[11px] font-semibold"
+                        style={{
+                          backgroundColor: previewDraftTheme.bgElevated,
+                          color: previewDraftTheme.accentSecondary,
+                          border: `1px solid ${previewDraftTheme.borderSubtle}`,
+                        }}
+                      >
+                        Secondary Pill
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Category Filter Pills */}
+        <div className="flex flex-wrap items-center gap-2">
+          {THEME_CATEGORIES_META.map((cat) => {
+            const count =
+              cat.id === 'all'
+                ? allThemesList.length
+                : allThemesList.filter((t) => getThemeCategory(t) === cat.id).length;
+            const activePill = themeCategoryFilter === cat.id;
+            return (
+              <button
+                key={cat.id}
+                type="button"
+                onClick={() => setThemeCategoryFilter(cat.id)}
+                className={`px-3 py-1.5 rounded-full text-xs font-bold border transition-all ${
+                  activePill
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] shadow-sm'
+                    : 'bg-[var(--bg-surface)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                {cat.label} ({count})
               </button>
             );
           })}
         </div>
-      </div>
 
-      {/* SECTION 3: FASTER-WHISPER MODELS MANAGER */}
+        {/* Theme Grid (18+ Built-in + User Custom Themes) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3">
+          {filteredThemes.map((t) => {
+            const isSelected = activeTheme.id === t.id;
+            return (
+              <div
+                key={t.id}
+                onClick={() => handleSelectTheme(t)}
+                className={`flex flex-col justify-between text-left p-3 rounded-xl border transition-all relative cursor-pointer group ${
+                  isSelected 
+                    ? 'border-[var(--accent-primary)] bg-[var(--bg-elevated)] ring-2 ring-[var(--accent-primary)]/40 shadow-lg' 
+                    : 'border-[var(--border-subtle)] bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 hover:bg-[var(--bg-elevated)]'
+                }`}
+              >
+                <div>
+                  <div className="flex items-center justify-between mb-2.5">
+                    <div className="flex items-center gap-1.5">
+                      <span 
+                        className="w-4 h-4 rounded-full border border-black/20 dark:border-white/20 shadow-sm flex-shrink-0" 
+                        style={{ backgroundColor: t.bgCanvas }} 
+                        title={`Canvas: ${t.bgCanvas}`}
+                      />
+                      <span 
+                        className="w-4 h-4 rounded-full border border-black/20 dark:border-white/20 shadow-sm flex-shrink-0" 
+                        style={{ backgroundColor: t.bgSurface }} 
+                        title={`Surface: ${t.bgSurface}`}
+                      />
+                      <span 
+                        className="w-4 h-4 rounded-full shadow-sm flex-shrink-0 ring-1 ring-black/20 dark:ring-white/30" 
+                        style={{ backgroundColor: t.accentPrimary }} 
+                        title={`Primary Accent: ${t.accentPrimary}`}
+                      />
+                      {t.accentSecondary && (
+                        <span 
+                          className="w-3 h-3 rounded-full shadow-sm flex-shrink-0 opacity-90" 
+                          style={{ backgroundColor: t.accentSecondary }} 
+                          title={`Secondary Accent: ${t.accentSecondary}`}
+                        />
+                      )}
+                    </div>
+                    <span className="text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-[var(--bg-canvas)] text-[var(--text-muted)] border border-[var(--border-subtle)]">
+                      {t.isCustom ? 'Custom' : getThemeCategory(t)}
+                    </span>
+                  </div>
+
+                  <div className="flex items-center justify-between w-full">
+                    <span className="text-xs font-bold truncate">{t.name}</span>
+                    {isSelected && (
+                      <Check className="w-3.5 h-3.5 text-[var(--accent-primary)] flex-shrink-0" />
+                    )}
+                  </div>
+                  <p className="text-[10px] text-[var(--text-secondary)] truncate mt-0.5">{t.description}</p>
+                </div>
+
+                <div
+                  className="flex items-center justify-end gap-1 mt-2 pt-2 border-t border-[var(--border-subtle)]/60"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleEditCustomTheme(t)}
+                    className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[var(--bg-canvas)] hover:text-[var(--accent-primary)] border border-[var(--border-subtle)]"
+                    title={t.isCustom ? 'Edit custom theme' : 'Remix into custom theme'}
+                  >
+                    {t.isCustom ? 'Edit' : 'Remix'}
+                  </button>
+                  {t.isCustom && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleExportCustomTheme(t)}
+                        className="p-1 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] hover:text-[var(--accent-primary)]"
+                        title="Export theme JSON"
+                      >
+                        <Download className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteCustomTheme(t.id)}
+                        className="p-1 rounded bg-[var(--bg-canvas)] border border-[var(--border-subtle)] text-rose-400 hover:bg-rose-500/15"
+                        title="Delete custom theme"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      )}
+
+      {/* TAB 2 PART A: FASTER-WHISPER MODELS MANAGER */}
+      {activeTab === 'ai' && (
       <div className="space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <HardDrive className="w-4 h-4 text-[var(--accent-primary)]" />
             <h2 className="text-sm font-bold tracking-wide uppercase">Whisper AI Models</h2>
+            {specs?.gpu?.has_cuda && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                CUDA Accelerated
+              </span>
+            )}
           </div>
           <div className="text-xs text-[var(--text-secondary)]">
             Storage used: <span className="font-semibold text-[var(--text-primary)]">{modelsData?.storage?.used_mb ? `${modelsData.storage.used_mb} MB` : '0 MB'}</span>
@@ -592,11 +1275,13 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
           })}
         </div>
       </div>
+      )}
 
-      {/* SECTION 4: PROCESSING & GRAPHICS ACCELERATION */}
+      {/* TAB 3: DEFAULT RENDER & AUDIO MASTERING */}
+      {activeTab === 'render' && (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Hardware Acceleration Mode */}
-        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-2xl p-5 space-y-4 shadow-sm">
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-5 space-y-4 shadow-sm">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Zap className="w-4 h-4 text-[var(--accent-primary)]" />
@@ -616,7 +1301,7 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
               className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
                 hardwareMode === 'gpu' 
                   ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/10' 
-                  : 'border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/30'
+                  : 'border-[var(--border-subtle)] bg-[var(--bg-elevated)] hover:border-[var(--accent-primary)]/30'
               }`}
             >
               <input 
@@ -639,7 +1324,7 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
               className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
                 hardwareMode === 'cpu' 
                   ? 'border-[var(--accent-primary)] bg-[var(--accent-primary)]/10' 
-                  : 'border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/30'
+                  : 'border-[var(--border-subtle)] bg-[var(--bg-elevated)] hover:border-[var(--accent-primary)]/30'
               }`}
             >
               <input 
@@ -659,38 +1344,143 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
           </div>
         </div>
 
-        {/* YouTube Import Engine (yt-dlp) */}
-        <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-2xl p-5 space-y-4 shadow-sm">
+        {/* Default Codec, FPS, Resolution, Audio Mastering & Cleanup */}
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-5 space-y-4 shadow-sm">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <Terminal className="w-4 h-4 text-[var(--accent-primary)]" />
-              <h2 className="text-sm font-bold uppercase">YouTube Import Engine</h2>
+              <Film className="w-4 h-4 text-[var(--accent-primary)]" />
+              <h2 className="text-sm font-bold uppercase">Render &amp; Audio Mastering Defaults</h2>
             </div>
-            <span className="text-xs text-[var(--text-secondary)] font-mono">
-              v{specs?.binaries?.ytdlp?.version || '2026.11.23'}
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[var(--text-muted)]">
+              {loudnessTarget} LUFS
             </span>
           </div>
 
-          <p className="text-xs text-[var(--text-secondary)]">
-            Directly extracts high-resolution streams from YouTube URLs for automatic multimodal viral moment clipping.
-          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-[11px] font-semibold text-[var(--text-secondary)] mb-1">
+                Default Video Codec
+              </label>
+              <select
+                value={videoEncoder}
+                onChange={(e) => setVideoEncoder(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold outline-none focus:border-[var(--accent-primary)]"
+              >
+                <option value="auto">Auto (NVENC GPU if available)</option>
+                <option value="h264_nvenc">H.264 NVENC (GPU Fast)</option>
+                <option value="hevc_nvenc">HEVC / H.265 NVENC (GPU 4K)</option>
+                <option value="libx264">H.264 Software (libx264 Master)</option>
+                <option value="libx265">HEVC / H.265 Software (libx265)</option>
+                <option value="prores_ks">Apple ProRes 422 LT (.mov)</option>
+              </select>
+            </div>
 
-          <div className="flex items-center gap-3">
+            <div>
+              <label className="block text-[11px] font-semibold text-[var(--text-secondary)] mb-1">
+                Default Canvas Resolution
+              </label>
+              <select
+                value={defaultResolution}
+                onChange={(e) => setDefaultResolution(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold outline-none focus:border-[var(--accent-primary)]"
+              >
+                <option value="1080x1920">1080x1920 (9:16 Vertical HD)</option>
+                <option value="2160x3840">2160x3840 (9:16 Vertical 4K)</option>
+                <option value="1080x1350">1080x1350 (4:5 Portrait Feed)</option>
+                <option value="1080x1080">1080x1080 (1:1 Square)</option>
+                <option value="1920x1080">1920x1080 (16:9 Landscape HD)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-semibold text-[var(--text-secondary)] mb-1">
+                Target Frame Rate (CFR)
+              </label>
+              <select
+                value={defaultFps}
+                onChange={(e) => setDefaultFps(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold outline-none focus:border-[var(--accent-primary)]"
+              >
+                <option value="source">Match Source FPS</option>
+                <option value="24">24 fps (Cinema)</option>
+                <option value="30">30 fps (Social Standard)</option>
+                <option value="60">60 fps (High Motion)</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-[11px] font-semibold text-[var(--text-secondary)] mb-1">
+                Temp Proxy Auto-Cleanup
+              </label>
+              <select
+                value={autoCleanupDays}
+                onChange={(e) => setAutoCleanupDays(Number(e.target.value))}
+                className="w-full px-3 py-2 rounded-xl bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-semibold outline-none focus:border-[var(--accent-primary)]"
+              >
+                <option value={0}>Keep Forever (Manual Cleanup)</option>
+                <option value={7}>Purge Temp Files Older Than 7 Days</option>
+                <option value={14}>Purge Temp Files Older Than 14 Days</option>
+                <option value={30}>Purge Temp Files Older Than 30 Days</option>
+                <option value={90}>Purge Temp Files Older Than 90 Days</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Audio Loudness Mastering */}
+          <div className="p-3.5 rounded-xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Volume2 className="w-4 h-4 text-[var(--accent-primary)]" />
+                <span className="text-xs font-bold">Broadcast Loudness Normalization</span>
+              </div>
+              <label className="flex items-center gap-2 text-xs font-semibold cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={audioNormalizationEnabled}
+                  onChange={(e) => setAudioNormalizationEnabled(e.target.checked)}
+                  className="accent-[var(--accent-primary)]"
+                />
+                <span>{audioNormalizationEnabled ? 'Enabled' : 'Bypass'}</span>
+              </label>
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[11px] text-[var(--text-secondary)]">
+                <span>Target Integrated Loudness (Social Standard: -14 LUFS)</span>
+                <span className="font-mono font-bold text-[var(--text-primary)]">{loudnessTarget.toFixed(1)} LUFS</span>
+              </div>
+              <input
+                type="range"
+                min={-24}
+                max={-9}
+                step={0.5}
+                value={loudnessTarget}
+                disabled={!audioNormalizationEnabled}
+                onChange={(e) => setLoudnessTarget(Number(e.target.value))}
+                className="w-full accent-[var(--accent-primary)] disabled:opacity-50"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-3 pt-1">
             <button
-              onClick={handleUpdateYtdlp}
-              disabled={updatingYtdlp}
-              className="px-4 py-2 bg-[var(--bg-surface)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] flex items-center gap-2 transition-colors"
+              type="button"
+              onClick={handleSaveRenderDefaults}
+              disabled={savingRenderDefaults}
+              className="px-4 py-2 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] text-xs font-bold shadow hover:opacity-90 disabled:opacity-50 transition"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${updatingYtdlp ? 'animate-spin text-[var(--accent-primary)]' : ''}`} />
-              <span>{updatingYtdlp ? 'Updating yt-dlp...' : 'Update yt-dlp'}</span>
+              {savingRenderDefaults ? 'Saving...' : 'Save Render & Audio Defaults'}
             </button>
-            {ytdlpMessage && (
-              <span className="text-xs text-emerald-400 truncate">{ytdlpMessage}</span>
+            {renderDefaultsNotice && (
+              <span className="text-xs text-emerald-400 font-medium truncate">{renderDefaultsNotice}</span>
             )}
           </div>
         </div>
       </div>
+      )}
 
+      {/* TAB 2 PART B: GEMINI MULTIMODAL AI BOOST */}
+      {activeTab === 'ai' && (
+      <div className="space-y-6">
       {/* SECTION 5: GEMINI MULTIMODAL AI BOOST */}
       <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-2xl p-6 space-y-5 shadow-sm">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1124,10 +1914,45 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
           </div>
         </div>
       </div>
+      </div>
+      )}
 
-      {/* SECTION 6: MACHINE SPECS & BUNDLED BINARIES */}
+      {/* TAB 4 PART B: YOUTUBE ENGINE, MACHINE SPECS & BUNDLED BINARIES */}
+      {activeTab === 'diagnostics' && (
+      <div className="space-y-6">
+        {/* YouTube Import Engine (yt-dlp) */}
+        <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl p-5 space-y-3 shadow-sm">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Terminal className="w-4 h-4 text-[var(--accent-primary)]" />
+              <h2 className="text-sm font-bold uppercase">YouTube Import Engine (yt-dlp)</h2>
+            </div>
+            <span className="text-xs text-[var(--text-secondary)] font-mono">
+              v{specs?.binaries?.ytdlp?.version || '2026.11.23'}
+            </span>
+          </div>
+
+          <p className="text-xs text-[var(--text-secondary)]">
+            Extracts high-resolution streams from YouTube URLs for automatic multimodal viral moment clipping.
+          </p>
+
+          <div className="flex items-center gap-3">
+            <button
+              onClick={handleUpdateYtdlp}
+              disabled={updatingYtdlp}
+              className="px-4 py-2 bg-[var(--bg-elevated)] hover:opacity-90 text-xs font-semibold rounded-xl border border-[var(--border-subtle)] flex items-center gap-2 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${updatingYtdlp ? 'animate-spin text-[var(--accent-primary)]' : ''}`} />
+              <span>{updatingYtdlp ? 'Updating yt-dlp...' : 'Update yt-dlp'}</span>
+            </button>
+            {ytdlpMessage && (
+              <span className="text-xs text-emerald-400 truncate">{ytdlpMessage}</span>
+            )}
+          </div>
+        </div>
+
       <div className="space-y-4">
-        <h2 className="text-sm font-bold tracking-wide uppercase">Machine Specs & Binaries</h2>
+        <h2 className="text-sm font-bold tracking-wide uppercase">Machine Specs &amp; Binaries</h2>
         
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {/* Host Hardware Card */}
@@ -1216,6 +2041,9 @@ export const ViewSettings: React.FC<ViewSettingsProps> = ({ onOpenSetupWizard })
             </div>
           </div>
         </div>
+      </div>
+      </div>
+      )}
       </div>
     </div>
   );

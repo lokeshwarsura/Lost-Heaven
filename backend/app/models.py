@@ -35,8 +35,33 @@ class Project(SQLModel, table=True):
     ai_mode: Optional[str] = SQLField(default=None) # Explicit per-project "gemini" or "offline"
     topic_focus: Optional[str] = SQLField(default=None) # Optional creative guidance for Gemini
     multimodal_analysis_json: str = SQLField(default="") # Persistent audio+video multimodal timeline & summary
+    tags_json: str = SQLField(default="[]") # Custom Vault project tags JSON list
+    podcast_mode: bool = SQLField(default=False) # Audio-only / podcast waveform ingestion mode
 
     created_at: str = SQLField(default_factory=lambda: datetime.utcnow().isoformat())
+
+    def get_tags(self) -> List[str]:
+        try:
+            raw = (self.tags_json or "[]").strip()
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [str(t).strip() for t in data if str(t).strip()]
+        except Exception:
+            pass
+        return []
+
+    def set_tags(self, tags: Optional[List[str]]):
+        if not tags:
+            self.tags_json = "[]"
+        else:
+            cleaned = []
+            seen = set()
+            for t in tags:
+                s = str(t).strip()
+                if s and s.lower() not in seen:
+                    seen.add(s.lower())
+                    cleaned.append(s[:32])
+            self.tags_json = json.dumps(cleaned)
 
     def get_multimodal_analysis(self) -> Optional[Dict[str, Any]]:
         try:
@@ -501,7 +526,9 @@ class PreviewFrameRequest(BaseModel):
     custom_height: int = 1920
     frame_layout: str = "auto_track"
     framing_template: Optional[str] = None
+    framing_user_locked: Optional[bool] = None
     webcam_corner: str = "top_left"
+    source_corner: Optional[str] = "auto"
     webcam_split_ratio: float = 0.40
     source_webcam_region: Optional[Dict[str, Any]] = None
     framing_override: Optional[Dict[str, Any]] = None
@@ -543,6 +570,8 @@ class PreviewFrameRequest(BaseModel):
     voice_eq_preset: Optional[str] = None
     de_esser: Optional[bool] = None
     loudness_target: Optional[str] = None
+    voice_enhancer: Optional[bool] = None
+    horizon_tilt: Optional[float] = None
     saturation: float = 1.0
     black_and_white: float = 0.0
     vintage: float = 0.0
@@ -591,6 +620,7 @@ class PreviewFrameRequest(BaseModel):
     pos_y: Optional[float] = None
     caption_x: Optional[float] = None
     caption_y: Optional[float] = None
+    caption_custom_position: Optional[bool] = None
     caption_rotation: Optional[float] = None
     caption_max_width: Optional[float] = None
     outline_width: float = 4.0
@@ -723,6 +753,7 @@ class PreviewFrameResponse(BaseModel):
     frame_url: str
     render_time_ms: int
     timestamp: float
+    timeline_fx_summary: Optional[Dict[str, Any]] = None
 
 
 class YouTubeImportRequest(BaseModel):
@@ -741,6 +772,11 @@ class YouTubeImportRequest(BaseModel):
     framing_template: Optional[str] = None
     ai_mode: Optional[str] = None
     batch_queue: Optional[bool] = False
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    start_seconds: Optional[float] = None
+    end_seconds: Optional[float] = None
+    podcast_mode: Optional[bool] = False
 
 
 class UpdateClipRequest(BaseModel):
@@ -766,6 +802,7 @@ class UpdateClipRequest(BaseModel):
     custom_height: Optional[int] = None
     frame_layout: Optional[str] = None
     framing_template: Optional[str] = None
+    framing_user_locked: Optional[bool] = None
     webcam_corner: Optional[str] = None
     webcam_split_ratio: Optional[float] = None
     source_webcam_region: Optional[Dict[str, Any]] = None
@@ -800,6 +837,7 @@ class UpdateClipRequest(BaseModel):
     position_y: Optional[float] = None
     caption_x: Optional[float] = None
     caption_y: Optional[float] = None
+    caption_custom_position: Optional[bool] = None
     caption_rotation: Optional[float] = None
     caption_max_width: Optional[float] = None
     hold_back_alpha: Optional[float] = None
@@ -854,6 +892,8 @@ class UpdateClipRequest(BaseModel):
     voice_eq_preset: Optional[str] = None
     de_esser: Optional[bool] = None
     loudness_target: Optional[str] = None
+    voice_enhancer: Optional[bool] = None
+    horizon_tilt: Optional[float] = None
 
     # Step 4: Branding & BGM / Audio
     watermark_path: Optional[str] = None
@@ -970,6 +1010,13 @@ class UpdateWebcamRegionRequest(BaseModel):
 class FramingOverrideRequest(BaseModel):
     webcam_box: Optional[Dict[str, float]] = None
     focus_anchor: Optional[Dict[str, float]] = None
+    frame_crop: Optional[Dict[str, float]] = None
+    frame_crop_x: Optional[float] = None
+    frame_crop_y: Optional[float] = None
+    frame_crop_w: Optional[float] = None
+    frame_crop_h: Optional[float] = None
+    keyframe_start_crop: Optional[Dict[str, float]] = None
+    keyframe_end_crop: Optional[Dict[str, float]] = None
     lock_camera: Optional[bool] = None
     reset: bool = False
 
@@ -1006,6 +1053,8 @@ class RenderClipRequest(BaseModel):
     text_case: Optional[str] = None
     caption_x: Optional[float] = None
     caption_y: Optional[float] = None
+    caption_custom_position: Optional[bool] = None
+    face_safe_captions: Optional[bool] = None
     caption_rotation: Optional[float] = None
     caption_max_width: Optional[float] = None
     color_preset: Optional[str] = None
@@ -1017,10 +1066,19 @@ class RenderClipRequest(BaseModel):
     voice_eq_preset: Optional[str] = None
     de_esser: Optional[bool] = None
     loudness_target: Optional[str] = None
+    voice_enhancer: Optional[bool] = None
+    horizon_tilt: Optional[float] = None
     speed_ramp: Optional[float] = None
     chroma_split: Optional[float] = None
     letterbox: Optional[str] = None
     outro_cta_enabled: Optional[bool] = None
+    frame_layout: Optional[str] = None
+    framing_template: Optional[str] = None
+    framing_user_locked: Optional[bool] = None
+    webcam_corner: Optional[str] = None
+    webcam_split_ratio: Optional[float] = None
+    pip_border_color: Optional[str] = None
+    source_corner: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
 
 
@@ -1084,6 +1142,7 @@ class PublishYouTubeRequest(BaseModel):
     clip_id: Optional[int] = None
     title: Optional[str] = None
     description: Optional[str] = None
+    tags: Optional[List[str]] = None
     privacy_status: Optional[str] = "private"
     privacy: Optional[str] = None
 
@@ -1102,7 +1161,14 @@ class SettingsUpdateRequest(BaseModel):
     gemini_enabled: Optional[bool] = None
     gemini_boost_enabled: Optional[bool] = None
     active_theme: Optional[str] = None
+    custom_themes: Optional[List[Dict[str, Any]]] = None
     hardware_acceleration: Optional[str] = None
+    video_encoder: Optional[str] = None
+    default_resolution: Optional[str] = None
+    default_fps: Optional[str] = None
+    loudness_target: Optional[str] = None
+    audio_normalization_enabled: Optional[bool] = None
+    auto_cleanup_days: Optional[int] = None
     pexels_api_key: Optional[str] = None
     watch_folder_path: Optional[str] = None
     watch_folder_enabled: Optional[bool] = None
@@ -1117,6 +1183,7 @@ class ProvideKeyRequest(BaseModel):
 class RetryProjectRequest(BaseModel):
     force_offline: Optional[bool] = False
     ai_mode: Optional[str] = None
+    stage: Optional[str] = None
 
 
 class BulkDeleteProjectsRequest(BaseModel):
@@ -1148,6 +1215,15 @@ class CompleteOnboardingRequest(BaseModel):
 
 class ImportAnalyticsCsvRequest(BaseModel):
     csv_text: str
+
+
+class ProExportRequest(BaseModel):
+    format: str = "mp4_h264"
+    resolution: Optional[str] = None
+    fps: Optional[str] = None
+    quality_preset: str = "social_balanced"
+    burn_captions: Optional[bool] = None
+    aspects: Optional[List[str]] = None
 
 
 class ExportEvent(SQLModel, table=True):

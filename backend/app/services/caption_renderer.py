@@ -277,6 +277,8 @@ def normalize_and_chunk_words(
             rel_e = min(clip_duration, max(rel_s + 0.08, rel_e))
 
         item_d: Dict[str, Any] = {"word": text, "start": round(rel_s, 3), "end": round(rel_e, 3)}
+        if w.get("is_climax_teaser"):
+            item_d["is_climax_teaser"] = True
         if w.get("speaker_id"):
             item_d["speaker_id"] = w["speaker_id"]
         if w.get("translated_text"):
@@ -317,6 +319,8 @@ def normalize_and_chunk_words(
         should_flush = False
         if curr:
             if len(curr) >= max_words_per_chunk:
+                should_flush = True
+            elif bool(curr[-1].get("is_climax_teaser")) != bool(w.get("is_climax_teaser")):
                 should_flush = True
             elif len(curr) >= 2 and projected_chars > max_chars_per_line:
                 should_flush = True
@@ -405,6 +409,7 @@ def _resolve_style_settings(
     position_grid: str = "bottom_center",
     caption_x: Optional[float] = None,
     caption_y: Optional[float] = None,
+    caption_custom_position: bool = False,
     caption_rotation: float = 0.0,
     caption_max_width: float = 0.82,
     caption_animation: Optional[str] = None,
@@ -506,6 +511,7 @@ def _resolve_style_settings(
         "pos_y": eff_pos_y,
         "caption_x": eff_pos_x / 100.0,
         "caption_y": eff_pos_y / 100.0,
+        "caption_custom_position": bool(caption_custom_position),
         "caption_rotation": eff_rot,
         "caption_max_width": eff_mw,
         "caption_animation": _canonicalize_caption_animation(caption_animation),
@@ -656,11 +662,11 @@ def _draw_cold_open_climax_badge(
     height: int,
     has_hook_banner: bool = False,
 ):
-    """Draw a high-contrast pill badge (`🔥 CLIMAX PREVIEW`) during the prepended Cold-Open teaser."""
+    """Draw a high-contrast pill badge (`CLIMAX HOOK`) during the prepended Cold-Open teaser."""
     scale = max(0.45, width / 1080.0)
     font = resolve_pillow_font("Montserrat", int(round(24 * scale)), bold=True, italic=False)
     draw = ImageDraw.Draw(canvas)
-    label = "CLIMAX PREVIEW"
+    label = "CLIMAX HOOK"
     tw, th = _measure_text(draw, label, font)
     pad_x = int(round(22 * scale))
     pad_y = int(round(10 * scale))
@@ -1073,6 +1079,7 @@ def render_caption_frame(
     pos_y: Optional[float] = 74.0,
     caption_x: Optional[float] = None,
     caption_y: Optional[float] = None,
+    caption_custom_position: bool = False,
     caption_rotation: float = 0.0,
     caption_max_width: float = 0.82,
     base_color: Optional[str] = None,
@@ -1290,6 +1297,7 @@ def render_caption_frame(
         position_grid=position_grid,
         caption_x=caption_x,
         caption_y=caption_y,
+        caption_custom_position=caption_custom_position,
         caption_rotation=caption_rotation,
         caption_max_width=caption_max_width,
         caption_animation=caption_animation,
@@ -1412,12 +1420,10 @@ def render_caption_frame(
             clean_key = raw_tok.lower().strip(".,!?:;\"'()[]")
             tok = _apply_text_case(raw_tok, cfg["text_case"])
             is_power = bool(highlight_power_words and clean_key in power_words)
-            is_kin_active = bool(cfg["highlight_shape"] == "kinetic_pop" and tok_i == active_word_idx)
-            tok_font = kinetic_pop_font if is_kin_active else (power_font if is_power else font)
+            tok_font = power_font if is_power else font
 
             matched_emoji: Optional[str] = None
             emoji_prefix_w = 0.0
-            emoji_h = 0.0
             if auto_emoji:
                 matched_emoji = EMOJI_KEYWORDS.get(clean_key)
                 if matched_emoji:
@@ -1426,22 +1432,25 @@ def render_caption_frame(
                         try:
                             ebb = dummy_draw.textbbox((0, 0), matched_emoji, font=emoji_font, embedded_color=True)
                             emoji_prefix_w = max(float(emoji_px), float(ebb[2] - ebb[0])) + emoji_gap
-                            emoji_h = float(ebb[3] - ebb[1])
                         except Exception:
                             emoji_prefix_w = float(emoji_px) + emoji_gap
-                            emoji_h = float(emoji_px)
                     else:
                         emoji_prefix_w = float(emoji_px) + emoji_gap
-                        emoji_h = float(emoji_px)
 
-            tw, th = _measure_text(dummy_draw, tok, tok_font, letter_spacing=spacing_px)
+            tw, _ = _measure_text(dummy_draw, tok, tok_font, letter_spacing=spacing_px)
             display_tokens.append(tok)
             token_widths.append(tw + emoji_prefix_w)
-            token_heights.append(max(th, emoji_h))
             token_emojis.append(matched_emoji)
             token_emoji_offsets.append(emoji_prefix_w)
             token_is_power.append(is_power)
             token_fonts.append(tok_font)
+
+        try:
+            asc, desc = font.getmetrics()
+            metric_h = float(abs(asc) + abs(desc))
+        except Exception:
+            metric_h = float(font_px) * 1.25
+        fixed_line_h = max(float(font_px) * 1.25, metric_h)
 
         lines_idx = []
         curr_line: List[int] = []
@@ -1458,7 +1467,7 @@ def render_caption_frame(
         if curr_line:
             lines_idx.append(curr_line)
 
-        line_heights = [max(token_heights[i] for i in ln) for ln in lines_idx]
+        line_heights = [fixed_line_h for _ in lines_idx]
         line_widths = [
             sum(token_widths[i] for i in ln) + max(0, len(ln) - 1) * space_w
             for ln in lines_idx
@@ -1471,8 +1480,13 @@ def render_caption_frame(
             break
 
     base_font_px = max(12, int(getattr(font, "size", font_px)))
-    line_gap = max(8.0, font_px * 0.22)
+    line_gap = max(6.0, float(font_px) * 0.14)
     total_h = sum(line_heights) + max(0, len(lines_idx) - 1) * line_gap
+    try:
+        ref_bb = dummy_draw.textbbox((0, 0), "HÉpg", font=font)
+        ref_vis_mid = 0.5 * float(ref_bb[1] + ref_bb[3])
+    except Exception:
+        ref_vis_mid = float(font_px) * 0.52
 
     sec_line_txt = ""
     sec_font = None
@@ -1501,9 +1515,14 @@ def render_caption_frame(
 
     # Clamp cleanly inside edge margins (>= 24px from left/right/top/bottom on real frames)
     margin_pad = side_margin
-    top_safe_pad = max(edge_margin, height * 0.16) if hook_visible_now else edge_margin
+    is_custom_pos = bool(cfg.get("caption_custom_position", False))
+    top_safe_pad = (
+        edge_margin
+        if is_custom_pos
+        else (max(edge_margin, height * 0.16) if hook_visible_now else edge_margin)
+    )
     bot_safe_pad = edge_margin
-    if face_safe_captions and face_keyframes:
+    if face_safe_captions and not is_custom_pos and face_keyframes:
         anchor_y = _compute_face_safe_anchor_y(
             t=t,
             default_anchor_y=float(anchor_y),
@@ -1513,6 +1532,7 @@ def render_caption_frame(
             face_keyframes=face_keyframes,
         )
     start_y = max(top_safe_pad, min(height - total_h - bot_safe_pad, float(anchor_y) - total_h / 2.0))
+    block_mid_y = start_y + total_h / 2.0
 
     shadow_px = max(0, int(round(cfg["shadow"] * scale)))
 
@@ -1597,26 +1617,52 @@ def render_caption_frame(
     caption_layer = Image.alpha_composite(caption_layer, bg_layer)
 
     # 2. Glow layer (Gaussian blurred duplicate — enhanced for Neon Outer Glow)
+    def _token_draw_xy(tok_idx: int, tx: float, ty: float, tok_h: float, is_active: bool, tok_font: Any):
+        tok_str = display_tokens[tok_idx]
+        emoji_off = token_emoji_offsets[tok_idx] if tok_idx < len(token_emoji_offsets) else 0.0
+        base_draw_y = ty + (tok_h * 0.5) - ref_vis_mid
+        if cfg["highlight_shape"] == "kinetic_pop" and is_active:
+            pop_font = kinetic_pop_font
+            base_text_w = max(1.0, token_widths[tok_idx] - emoji_off)
+            pop_text_w, _ = _measure_text(dummy_draw, tok_str, pop_font, letter_spacing=spacing_px * 1.18)
+            slot_cx = tx + emoji_off + base_text_w * 0.5
+            slot_cy = ty + tok_h * 0.5
+            try:
+                pop_bb = dummy_draw.textbbox((0, 0), "HÉpg", font=pop_font)
+                pop_vis_mid = 0.5 * float(pop_bb[1] + pop_bb[3])
+            except Exception:
+                pop_vis_mid = float(getattr(pop_font, "size", font_px)) * 0.52
+            return (
+                slot_cx - pop_text_w * 0.5,
+                slot_cy - pop_vis_mid,
+                pop_font,
+                spacing_px * 1.18,
+            )
+        is_pow = token_is_power[tok_idx] if tok_idx < len(token_is_power) else False
+        pow_off = -max(1.0, base_font_px * 0.04) if is_pow and tok_font is not font else 0.0
+        return tx + emoji_off, base_draw_y + pow_off, tok_font, spacing_px
+
     if cfg["glow"] > 0.0 or cfg["highlight_shape"] == "neon_glow":
         glow_layer = Image.new("RGBA", (int(width), int(height)), (0, 0, 0, 0))
         glow_draw = ImageDraw.Draw(glow_layer)
         glow_str = max(cfg["glow"], 3.5 if cfg["highlight_shape"] == "neon_glow" else 0.0)
-        for tok_i, tx, ty, _, _ in token_positions:
+        for tok_i, tx, ty, _, tok_h in token_positions:
             if tok_i > max_visible_tok:
                 continue
             tok = display_tokens[tok_i]
             is_active = tok_i == active_word_idx
-            tok_font = token_fonts[tok_i] if tok_i < len(token_fonts) else font
+            tok_font_base = token_fonts[tok_i] if tok_i < len(token_fonts) else font
             if cfg["highlight_shape"] == "neon_glow" and not is_active:
                 continue
+            gx, gy, g_font, g_sp = _token_draw_xy(tok_i, tx, ty, tok_h, is_active, tok_font_base)
             glow_col = active_rgba if is_active else _parse_rgba(cfg["base_color"], alpha_float=0.45)
             _draw_spaced_text(
                 glow_draw,
-                (tx, ty),
+                (gx, gy),
                 tok,
-                tok_font,
+                g_font,
                 fill=glow_col,
-                letter_spacing=spacing_px,
+                letter_spacing=g_sp,
                 stroke_width=max(2, stroke_px // 2 + 2),
                 stroke_fill=glow_col,
             )
@@ -1628,17 +1674,19 @@ def render_caption_frame(
     fg_draw = ImageDraw.Draw(fg_layer)
 
     if shadow_px > 0 and not cfg["is_full_line_block"]:
-        for tok_i, tx, ty, _, _ in token_positions:
+        for tok_i, tx, ty, _, tok_h in token_positions:
             if tok_i > max_visible_tok:
                 continue
-            tok_font = token_fonts[tok_i] if tok_i < len(token_fonts) else font
+            is_active = tok_i == active_word_idx
+            tok_font_base = token_fonts[tok_i] if tok_i < len(token_fonts) else font
+            sx_t, sy_t, s_font, s_sp = _token_draw_xy(tok_i, tx, ty, tok_h, is_active, tok_font_base)
             _draw_spaced_text(
                 fg_draw,
-                (tx + shadow_px, ty + shadow_px),
+                (sx_t + shadow_px, sy_t + shadow_px),
                 display_tokens[tok_i],
-                tok_font,
+                s_font,
                 fill=shadow_rgba,
-                letter_spacing=spacing_px,
+                letter_spacing=s_sp,
                 stroke_width=stroke_px,
                 stroke_fill=shadow_rgba,
             )
@@ -1648,7 +1696,7 @@ def render_caption_frame(
             continue
         is_active = tok_i == active_word_idx
         is_power = token_is_power[tok_i] if tok_i < len(token_is_power) else False
-        tok_font = token_fonts[tok_i] if tok_i < len(token_fonts) else font
+        tok_font_base = token_fonts[tok_i] if tok_i < len(token_fonts) else font
         emoji_char = token_emojis[tok_i] if tok_i < len(token_emojis) else None
         emoji_x_off = token_emoji_offsets[tok_i] if tok_i < len(token_emoji_offsets) else 0.0
 
@@ -1666,7 +1714,7 @@ def render_caption_frame(
             tok_stroke = 0 if cfg["is_full_line_block"] else stroke_px
 
         if emoji_char and emoji_x_off > 0:
-            ey = ty + max(0.0, (tok_h - emoji_px) * 0.35)
+            ey = ty + max(0.0, (tok_h - emoji_px) * 0.5)
             if emoji_font is not None:
                 try:
                     fg_draw.text((tx, ey), emoji_char, font=emoji_font, embedded_color=True)
@@ -1688,14 +1736,14 @@ def render_caption_frame(
                     fill=(255, 255, 255, 245),
                 )
 
-        power_y_off = -max(1.0, base_font_px * 0.04) if is_power and tok_font is not font else 0.0
+        dx_t, dy_t, d_font, d_sp = _token_draw_xy(tok_i, tx, ty, tok_h, is_active, tok_font_base)
         _draw_spaced_text(
             fg_draw,
-            (tx + emoji_x_off, ty + power_y_off),
+            (dx_t, dy_t),
             display_tokens[tok_i],
-            tok_font,
+            d_font,
             fill=text_fill,
-            letter_spacing=spacing_px,
+            letter_spacing=d_sp,
             stroke_width=tok_stroke,
             stroke_fill=outline_rgba if tok_stroke > 0 else None,
         )
@@ -1767,8 +1815,13 @@ def render_caption_frame(
         if k_alpha < 0.99:
             a_ch = crop_patch.getchannel("A").point(lambda v: int(round(v * k_alpha)))
             crop_patch.putalpha(a_ch)
-        cx_mid = 0.5 * (bb[0] + bb[2])
-        cy_mid = 0.5 * (bb[1] + bb[3]) + k_dy
+        ox = 0.5 * (bb[0] + bb[2]) - float(anchor_x)
+        oy = 0.5 * (bb[1] + bb[3]) - float(block_mid_y)
+        rad = math.radians(rot_deg)
+        cos_r = math.cos(rad)
+        sin_r = math.sin(rad)
+        cx_mid = float(anchor_x) + (ox * max_k) * cos_r - (oy * max_k) * sin_r
+        cy_mid = float(block_mid_y) + (ox * max_k) * sin_r + (oy * max_k) * cos_r + k_dy
         min_x = int(edge_margin)
         max_x = max(min_x, int(width - edge_margin - crop_patch.width))
         min_y = int(top_safe_pad)
@@ -1821,6 +1874,7 @@ def build_caption_ffconcat(
     speaker_lower_thirds: bool = False,
     face_safe_captions: bool = False,
     face_keyframes: Optional[List[Dict[str, Any]]] = None,
+    caption_custom_position: bool = False,
     callout_cards: Optional[List[Dict[str, Any]]] = None,
     auto_callouts: bool = False,
     bilingual_enabled: bool = False,
@@ -1898,7 +1952,8 @@ def build_caption_ffconcat(
         breakpoints.add(round(dur_total - 1.78, 3))
         breakpoints.add(round(dur_total - 1.60, 3))
 
-    if face_safe_captions and face_keyframes:
+    eff_face_safe = bool(face_safe_captions and not caption_custom_position)
+    if eff_face_safe and face_keyframes:
         fk_step = 0.5
         cur_ft = fk_step
         while cur_ft < dur_total:
@@ -2000,7 +2055,7 @@ def build_caption_ffconcat(
         )
 
         face_bucket = -1
-        if burn_captions and face_safe_captions and face_keyframes:
+        if burn_captions and eff_face_safe and face_keyframes:
             closest_kf = min(face_keyframes, key=lambda kf: abs(float(kf.get("t", 0.0)) - mid_t))
             if not ("face_count" in closest_kf and int(closest_kf.get("face_count", 0) or 0) <= 0):
                 face_bucket = int(round(float(closest_kf.get("cy", 0.4)) * 20))
@@ -2089,8 +2144,9 @@ def build_caption_ffconcat(
                     precomputed_chunks=chunks if burn_captions else [],
                     speakers=speakers,
                     speaker_lower_thirds=speaker_lower_thirds,
-                    face_safe_captions=face_safe_captions,
+                    face_safe_captions=eff_face_safe,
                     face_keyframes=face_keyframes,
+                    caption_custom_position=caption_custom_position,
                     callout_cards=callout_cards,
                     auto_callouts=auto_callouts,
                     precomputed_turns=turns,

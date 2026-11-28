@@ -263,6 +263,54 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
 
           <button
             type="button"
+            disabled={words.length === 0}
+            onClick={() => {
+              const FILLER_SET = new Set(['um', 'uh', 'uhh', 'umm', 'erm', 'ah', 'ahh', 'eh']);
+              const nextWords = words.map((w) => {
+                const token = (w.word || '').toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '');
+                if (FILLER_SET.has(token)) {
+                  return { ...w, deleted: true, cut_from_video: true };
+                }
+                return w;
+              });
+              onUpdateClip({
+                clean_filler_words: true,
+                transcript_words: nextWords,
+              });
+            }}
+            className="px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:border-[var(--accent-primary)] hover:text-[var(--text-primary)] disabled:opacity-50"
+            title="Immediately strip all filler tokens (um, uh, erm, ah) from transcript & cuts"
+          >
+            <Zap className="w-3 h-3 text-[var(--accent-primary)]" />
+            <span>Strip Filler Words</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              const next = !(clip.voice_enhancer ?? false);
+              onUpdateClip({
+                voice_enhancer: next,
+                ...(next
+                  ? {
+                      normalize_audio: true,
+                      loudness_target: '-14 LUFS',
+                    }
+                  : {}),
+              });
+            }}
+            className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${clip.voice_enhancer
+              ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+              : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+            title="Studio Voice Enhancer: 80Hz High-Pass Filter + Presence EQ + -14 LUFS Loudness Normalization"
+          >
+            <Volume2 className="w-3 h-3" />
+            <span>{clip.voice_enhancer ? '✓ Voice Enhancer (-14 LUFS)' : 'Studio Voice Enhancer'}</span>
+          </button>
+
+          <button
+            type="button"
             onClick={() => onUpdateClip({ censor_profanity: !clip.censor_profanity })}
             className={`px-2.5 py-1 rounded-lg border text-[11px] font-semibold flex items-center gap-1.5 transition ${clip.censor_profanity
               ? 'bg-amber-500/15 border-amber-500/40 text-amber-400'
@@ -1242,9 +1290,11 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                   onUpdateClip({
                     position_grid: 'bottom_center',
                     position_x: 50,
-                    position_y: 76,
+                    position_y: 78,
                     caption_x: 0.5,
-                    caption_y: 0.76,
+                    caption_y: 0.78,
+                    caption_custom_position: false,
+                    face_safe_captions: true,
                     caption_rotation: 0,
                     caption_max_width: 0.82,
                   })
@@ -1258,10 +1308,10 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
             {/* Quick Canvas Presets */}
             <div className="grid grid-cols-4 gap-1">
               {[
-                { label: 'Center Bottom', grid: 'bottom_center', x: 0.5, y: 0.76, rot: 0, mw: 0.82 },
-                { label: 'Dead Center', grid: 'center', x: 0.5, y: 0.5, rot: 0, mw: 0.82 },
-                { label: 'Top Safe', grid: 'top_center', x: 0.5, y: 0.18, rot: 0, mw: 0.82 },
-                { label: 'Reset', grid: 'bottom_center', x: 0.5, y: 0.76, rot: 0, mw: 0.82 },
+                { label: 'Center Bottom', grid: 'bottom_center', x: 0.5, y: 0.78, rot: 0, mw: 0.82, custom: true, faceSafe: false },
+                { label: 'Dead Center', grid: 'center', x: 0.5, y: 0.5, rot: 0, mw: 0.82, custom: true, faceSafe: false },
+                { label: 'Top Safe', grid: 'top_center', x: 0.5, y: 0.18, rot: 0, mw: 0.82, custom: true, faceSafe: false },
+                { label: 'Reset', grid: 'bottom_center', x: 0.5, y: 0.78, rot: 0, mw: 0.82, custom: false, faceSafe: true },
               ].map((qp) => (
                 <button
                   key={qp.label}
@@ -1273,6 +1323,8 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                       position_y: Math.round(qp.y * 100),
                       caption_x: qp.x,
                       caption_y: qp.y,
+                      caption_custom_position: qp.custom,
+                      face_safe_captions: qp.faceSafe,
                       caption_rotation: qp.rot,
                       caption_max_width: qp.mw,
                     })
@@ -1297,6 +1349,8 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                         position_y: pos.y,
                         caption_x: Number((pos.x / 100).toFixed(2)),
                         caption_y: Number((pos.y / 100).toFixed(2)),
+                        caption_custom_position: true,
+                        face_safe_captions: false,
                       })
                     }
                     className={`rounded-md transition flex items-center justify-center ${clip.position_grid === pos.id
@@ -1328,6 +1382,8 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                       onUpdateClip({
                         position_x: pct,
                         caption_x: Number((pct / 100).toFixed(3)),
+                        caption_custom_position: true,
+                        face_safe_captions: false,
                       });
                     }}
                     className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
@@ -1338,19 +1394,21 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                   <div className="flex justify-between text-[11px] text-[var(--text-secondary)] mb-1">
                     <span>Vertical Y</span>
                     <span className="font-mono font-bold text-[var(--accent-primary)]">
-                      {Math.round((clip.caption_y ?? (clip.position_y ?? 76) / 100) * 100)}%
+                      {Math.round((clip.caption_y ?? (clip.position_y ?? 78) / 100) * 100)}%
                     </span>
                   </div>
                   <input
                     type="range"
                     min={8}
                     max={92}
-                    value={Math.max(8, Math.min(92, Math.round((clip.caption_y ?? (clip.position_y ?? 76) / 100) * 100)))}
+                    value={Math.max(8, Math.min(92, Math.round((clip.caption_y ?? (clip.position_y ?? 78) / 100) * 100)))}
                     onChange={(e) => {
                       const pct = parseFloat(e.target.value);
                       onUpdateClip({
                         position_y: pct,
                         caption_y: Number((pct / 100).toFixed(3)),
+                        caption_custom_position: true,
+                        face_safe_captions: false,
                       });
                     }}
                     className="w-full h-1.5 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
@@ -1400,8 +1458,14 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => onUpdateClip({ face_safe_captions: !(clip.face_safe_captions ?? true) })}
-                  className={`w-full px-2.5 py-1.5 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${(clip.face_safe_captions ?? true)
+                  onClick={() => {
+                    const nextSafe = !(clip.face_safe_captions ?? true);
+                    onUpdateClip({
+                      face_safe_captions: nextSafe,
+                      caption_custom_position: nextSafe ? false : clip.caption_custom_position,
+                    });
+                  }}
+                  className={`w-full px-2.5 py-1.5 rounded-lg border flex items-center justify-between text-[11px] font-semibold transition ${(clip.face_safe_captions ?? true) && !clip.caption_custom_position
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--text-primary)]'
                     : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
                     }`}
@@ -1412,7 +1476,7 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
                     <span>Smart Face-Safe Placement</span>
                   </span>
                   <span className="text-[10px] font-bold">
-                    {(clip.face_safe_captions ?? true) ? 'ON' : 'OFF'}
+                    {(clip.face_safe_captions ?? true) && !clip.caption_custom_position ? 'ON' : 'OFF'}
                   </span>
                 </button>
               </div>

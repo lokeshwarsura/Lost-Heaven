@@ -32,7 +32,17 @@ def recommend_optimal_framing(visual_map: Dict[str, Any]) -> Dict[str, Any]:
     kfs: List[Dict[str, Any]] = list(visual_map.get("keyframes") or [])
 
     src_zone = str(webcam.get("source_zone") or "none").strip().lower()
-    has_corner_cam = bool(webcam.get("detected")) and src_zone in CORNER_ZONES
+    sampled_cnt = int(webcam.get("frames_sampled") or 0)
+    face_cnt = int(webcam.get("face_frames") or 0)
+    persisted_ok = (face_cnt / float(sampled_cnt) >= 0.45) if sampled_cnt > 0 else True
+    stationary_ok = (float(webcam["bbox_std_dev"]) < 0.04) if "bbox_std_dev" in webcam else True
+    has_corner_cam = bool(
+        webcam.get("detected")
+        and webcam.get("webcam_detected", True)
+        and src_zone in CORNER_ZONES
+        and persisted_ok
+        and stationary_ok
+    )
 
     # 1. Corner webcam + gameplay -> gameplay_webcam_pip with opposite safe corner
     if has_corner_cam:

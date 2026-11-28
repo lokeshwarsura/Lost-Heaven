@@ -14,7 +14,7 @@ from app.services.proxy import get_ffmpeg_cmd
 logger = logging.getLogger(__name__)
 
 FILLER_WORDS = {
-    "um", "uh", "ah", "er", "hmm", "like", "you know", "i mean", "sort of", "kind of"
+    "um", "uh", "ah", "er", "hmm", "like", "you know", "i mean", "sort of", "kind of", "basically"
 }
 
 _whisper_model_instance = None
@@ -366,6 +366,7 @@ def transcribe_clip(video_path: str, start_time: float, duration: float, languag
                         "word": cleaned,
                         "start": round(w.start, 3),
                         "end": round(w.end, 3),
+                        "probability": round(float(getattr(w, "probability", 0.90) or 0.90), 4),
                         "is_filler": is_filler_word(cleaned),
                         "deleted": False
                     })
@@ -403,6 +404,7 @@ def transcribe_clip(video_path: str, start_time: float, duration: float, languag
                             "word": cleaned,
                             "start": round(w.start, 3),
                             "end": round(w.end, 3),
+                            "probability": round(float(getattr(w, "probability", 0.90) or 0.90), 4),
                             "is_filler": is_filler_word(cleaned),
                             "deleted": False
                         })
@@ -522,6 +524,7 @@ def transcribe_audio_full(
                         "word": cleaned,
                         "start": round(float(w.start), 3),
                         "end": round(float(w.end), 3),
+                        "probability": round(float(getattr(w, "probability", 0.90) or 0.90), 4),
                         "is_filler": is_filler_word(cleaned),
                         "deleted": False,
                     })

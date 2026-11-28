@@ -216,19 +216,19 @@ def test_all_five_templates_and_split_podcast_cutaway(
     assert "brightness=-0.18:saturation=1.15" in vf_blur
     assert "drawbox=x=0:y=0:w=iw:h=1" in vf_blur
 
-    # 3. gameplay_webcam_pip fallback when zero faces exist returns clean auto_track without fake card
+    # 3. gameplay_webcam_pip on zero-face gameplay still renders 32% rounded PiP of deterministic secondary_box
     game_only = np.full((1080, 1920, 3), (120, 85, 22), dtype=np.uint8)
     cv2.rectangle(game_only, (400, 300), (900, 700), (40, 210, 180), -1)
     game_mp4 = _encode_png_sequence_video(tmp_path / "game_only.mp4", [(game_only, 1.5)])
     ft_game, _, _ = prepare_clip_framing_data(str(game_mp4), [(0.0, 1.5)], frame_layout="gameplay_webcam_pip")
-    vf_pip_fallback = build_multi_aspect_filter(
+    vf_pip_gameplay = build_multi_aspect_filter(
         "9:16", "gameplay_webcam_pip", 1920, 1080, face_track_data=ft_game
     )
-    assert "geq=" not in vf_pip_fallback and "pad=" not in vf_pip_fallback
+    assert "geq=" in vf_pip_gameplay and "pad=" in vf_pip_gameplay and "overlay=" in vf_pip_gameplay
 
-    # 4. webcam_gameplay_split filter produces 40/60 stack + 3px divider
+    # 4. webcam_gameplay_split filter produces Top 38% / Bottom 62% stack + 2px divider
     vf_split = build_multi_aspect_filter("9:16", "webcam_gameplay_split", 1920, 1080, face_track_data=ft_game)
-    assert "vstack=inputs=2" in vf_split and "h=3:color=0xFFFFFF@0.28" in vf_split
+    assert "vstack=inputs=2" in vf_split and "h=2:color=0xFFFFFF@0.28" in vf_split
 
 
 def test_preview_and_render_pixel_coordinate_parity(

@@ -1,10 +1,237 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
-  Sun, Droplets, Sparkles, Shield, Upload, Music, Volume2, Copy, Check, RotateCcw, Save, Film, Flag, Eye, Sliders
+  Activity, Sun, Droplets, Sparkles, Shield, Upload, Music, Volume2, Copy, Check, RotateCcw, Save, Film, Flag, Eye, Sliders,
+  Download, Package, Image as ImageIcon, Loader2, ChevronDown, ChevronUp
 } from 'lucide-react';
 import { ViralClip, BrollSegment, PresetPreviewsResponse } from '../types';
 import { api } from '../api/client';
 import { GradeSlider } from './GradeSlider';
+
+interface ColorScopesPanelProps {
+  clip: ViralClip;
+  sampleImageUrl?: string | null;
+}
+
+const ColorScopesPanel: React.FC<ColorScopesPanelProps> = ({ clip, sampleImageUrl }) => {
+  const waveCanvasRef = useRef<HTMLCanvasElement>(null);
+  const histCanvasRef = useRef<HTMLCanvasElement>(null);
+  const imgDataRef = useRef<{ width: number; height: number; data: Uint8ClampedArray } | null>(null);
+  const [hasRealPixels, setHasRealPixels] = useState(false);
+
+  // Sample current clip frame (if available) for pixel-accurate waveform & histogram scopes
+  useEffect(() => {
+    if (!sampleImageUrl) {
+      imgDataRef.current = null;
+      setHasRealPixels(false);
+      return;
+    }
+    let cancelled = false;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      if (cancelled) return;
+      try {
+        const cw = 96;
+        const ch = 54;
+        const off = document.createElement('canvas');
+        off.width = cw;
+        off.height = ch;
+        const octx = off.getContext('2d');
+        if (!octx) return;
+        octx.drawImage(img, 0, 0, cw, ch);
+        const snap = octx.getImageData(0, 0, cw, ch);
+        imgDataRef.current = { width: cw, height: ch, data: snap.data };
+        setHasRealPixels((prev) => !prev || true);
+      } catch {
+        imgDataRef.current = null;
+        setHasRealPixels(false);
+      }
+    };
+    img.onerror = () => {
+      if (!cancelled) {
+        imgDataRef.current = null;
+        setHasRealPixels(false);
+      }
+    };
+    img.src = sampleImageUrl;
+    return () => {
+      cancelled = true;
+    };
+  }, [sampleImageUrl]);
+
+  // Redraw Luma Waveform & RGB Histogram whenever any grade slider changes
+  useEffect(() => {
+    const waveCanvas = waveCanvasRef.current;
+    const histCanvas = histCanvasRef.current;
+    if (!waveCanvas || !histCanvas) return;
+
+    const wctx = waveCanvas.getContext('2d');
+    const hctx = histCanvas.getContext('2d');
+    if (!wctx || !hctx) return;
+
+    const ww = waveCanvas.width;
+    const wh = waveCanvas.height;
+    const hw = histCanvas.width;
+    const hh = histCanvas.height;
+
+    const expShift = (clip.exposure || 0) * 75 + (clip.brightness || 0) * 110;
+    const contrastMul = Math.max(0.25, clip.contrast ?? 1.0);
+    const satMul = Math.max(0, (clip.saturation ?? 1.0) * (1 - Math.max(0, Math.min(1, clip.black_and_white || 0))));
+    const warmDelta = ((clip.color_temp || 0) / 100) * 28;
+    const tintDelta = ((clip.tint_shift || 0) / 100) * 18;
+    const matteLift = ((clip.matte_fade || 0) / 100) * 28;
+    const shLift = ((clip.shadows || 0) / 100) * 22;
+    const hiLift = ((clip.highlights || 0) / 100) * 22;
+
+    const adjustRgb = (r0: number, g0: number, b0: number): [number, number, number] => {
+      const y0 = 0.299 * r0 + 0.587 * g0 + 0.114 * b0;
+      const toneBias = y0 < 90 ? shLift : y0 > 170 ? hiLift : 0;
+      const tf = (v: number, chBias: number) => {
+        const c = (v - 128) * contrastMul + 128 + expShift + toneBias + chBias;
+        return Math.max(matteLift, Math.min(255, c));
+      };
+      let r = tf(r0, warmDelta);
+      let g = tf(g0, -tintDelta * 0.5);
+      let b = tf(b0, -warmDelta + tintDelta * 0.3);
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      r = Math.max(0, Math.min(255, lum + (r - lum) * satMul));
+      g = Math.max(0, Math.min(255, lum + (g - lum) * satMul));
+      b = Math.max(0, Math.min(255, lum + (b - lum) * satMul));
+      return [r, g, b];
+    };
+
+    const rBins = new Uint32Array(64);
+    const gBins = new Uint32Array(64);
+    const bBins = new Uint32Array(64);
+
+    wctx.clearRect(0, 0, ww, wh);
+    wctx.fillStyle = 'rgba(10, 12, 16, 0.92)';
+    wctx.fillRect(0, 0, ww, wh);
+    // IRE reference lines (25%, 50%, 75%)
+    wctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+    wctx.lineWidth = 1;
+    [0.25, 0.5, 0.75].forEach((p) => {
+      const y = Math.round(wh * p);
+      wctx.beginPath();
+      wctx.moveTo(0, y);
+      wctx.lineTo(ww, y);
+      wctx.stroke();
+    });
+
+    const src = imgDataRef.current;
+    if (src) {
+      wctx.fillStyle = 'rgba(125, 232, 200, 0.28)';
+      for (let x = 0; x < src.width; x++) {
+        const drawX = (x / src.width) * ww;
+        for (let y = 0; y < src.height; y++) {
+          const i = (y * src.width + x) * 4;
+          const [r, g, b] = adjustRgb(src.data[i], src.data[i + 1], src.data[i + 2]);
+          const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+          const plotY = wh - 2 - (luma / 255) * (wh - 4);
+          wctx.fillRect(drawX, plotY, 2, 1.5);
+          rBins[Math.min(63, Math.floor((r / 256) * 64))]++;
+          gBins[Math.min(63, Math.floor((g / 256) * 64))]++;
+          bBins[Math.min(63, Math.floor((b / 256) * 64))]++;
+        }
+      }
+    } else {
+      wctx.fillStyle = 'rgba(125, 232, 200, 0.45)';
+      for (let x = 0; x < 72; x++) {
+        const drawX = (x / 72) * ww;
+        for (let band = 0; band < 12; band++) {
+          const base = 35 + ((x * 7 + band * 19) % 180);
+          const [r, g, b] = adjustRgb(base, Math.min(255, base + 4), Math.max(0, base - 4));
+          const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+          const plotY = wh - 2 - (luma / 255) * (wh - 4);
+          wctx.fillRect(drawX, plotY, 2, 1.5);
+          rBins[Math.min(63, Math.floor((r / 256) * 64))]++;
+          gBins[Math.min(63, Math.floor((g / 256) * 64))]++;
+          bBins[Math.min(63, Math.floor((b / 256) * 64))]++;
+        }
+      }
+    }
+
+    // Draw RGB Parade Histogram
+    hctx.clearRect(0, 0, hw, hh);
+    hctx.fillStyle = 'rgba(10, 12, 16, 0.92)';
+    hctx.fillRect(0, 0, hw, hh);
+    let maxBin = 1;
+    for (let i = 0; i < 64; i++) {
+      maxBin = Math.max(maxBin, rBins[i], gBins[i], bBins[i]);
+    }
+    const drawCurve = (bins: Uint32Array, stroke: string, fill: string) => {
+      hctx.beginPath();
+      hctx.moveTo(0, hh);
+      for (let i = 0; i < 64; i++) {
+        const px = (i / 63) * hw;
+        const py = hh - 2 - Math.min(1, bins[i] / maxBin) * (hh - 6);
+        hctx.lineTo(px, py);
+      }
+      hctx.lineTo(hw, hh);
+      hctx.closePath();
+      hctx.fillStyle = fill;
+      hctx.fill();
+      hctx.strokeStyle = stroke;
+      hctx.lineWidth = 1.2;
+      hctx.stroke();
+    };
+    drawCurve(rBins, 'rgba(248, 113, 113, 0.9)', 'rgba(248, 113, 113, 0.18)');
+    drawCurve(gBins, 'rgba(74, 222, 128, 0.9)', 'rgba(74, 222, 128, 0.18)');
+    drawCurve(bBins, 'rgba(96, 165, 250, 0.9)', 'rgba(96, 165, 250, 0.18)');
+  }, [
+    hasRealPixels,
+    clip.exposure,
+    clip.brightness,
+    clip.contrast,
+    clip.shadows,
+    clip.highlights,
+    clip.saturation,
+    clip.black_and_white,
+    clip.color_temp,
+    clip.tint_shift,
+    clip.matte_fade,
+  ]);
+
+  return (
+    <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-3 space-y-2">
+      <div className="flex items-center justify-between text-[11px] font-bold text-[var(--text-primary)]">
+        <span className="flex items-center gap-1.5">
+          <Activity className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+          <span>Live Color Scopes</span>
+        </span>
+        <span className="text-[10px] font-normal text-[var(--text-muted)]">
+          Luma Waveform (0–100 IRE) &amp; RGB Histogram
+        </span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+        <div className="space-y-1">
+          <div className="flex justify-between text-[9px] font-mono uppercase text-[var(--text-muted)]">
+            <span>Luma Waveform</span>
+            <span>IRE 0–100</span>
+          </div>
+          <canvas
+            ref={waveCanvasRef}
+            width={220}
+            height={68}
+            className="w-full h-[68px] rounded-lg border border-[var(--border-subtle)] block"
+          />
+        </div>
+        <div className="space-y-1">
+          <div className="flex justify-between text-[9px] font-mono uppercase text-[var(--text-muted)]">
+            <span>RGB Histogram</span>
+            <span>Blacks → Highlights</span>
+          </div>
+          <canvas
+            ref={histCanvasRef}
+            width={220}
+            height={68}
+            className="w-full h-[68px] rounded-lg border border-[var(--border-subtle)] block"
+          />
+        </div>
+      </div>
+    </div>
+  );
+};
 
 interface Step3VideoProps {
   clip: ViralClip | null;
@@ -36,6 +263,23 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   const [logoNotice, setLogoNotice] = useState<string | null>(null);
   const [presetPreviews, setPresetPreviews] = useState<PresetPreviewsResponse | null>(null);
   const [loadingPresetPreviews, setLoadingPresetPreviews] = useState(false);
+  const [presetCategory, setPresetCategory] = useState<'all' | 'film' | 'gaming' | 'creator'>('all');
+  const [exportFormat, setExportFormat] = useState<
+    'mp4_h264' | 'mp4_hevc' | 'mov_prores' | 'webm_vp9' | 'audio_wav' | 'audio_mp3'
+  >('mp4_h264');
+  const [exportQualityPreset, setExportQualityPreset] = useState<'master_high' | 'social_balanced' | 'compact'>('social_balanced');
+  const [exportBurnCaptions, setExportBurnCaptions] = useState<boolean>(true);
+  const [isExportingPro, setIsExportingPro] = useState(false);
+  const [isExportingBatchZip, setIsExportingBatchZip] = useState(false);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const [exportCardOpen, setExportCardOpen] = useState(true);
+  const [lookCardOpen, setLookCardOpen] = useState(true);
+  const [toneCardOpen, setToneCardOpen] = useState(true);
+  const [colorCardOpen, setColorCardOpen] = useState(true);
+
+  useEffect(() => {
+    if (clip) setExportBurnCaptions(Boolean(clip.burn_captions ?? true));
+  }, [clip?.id, clip?.burn_captions]);
 
   useEffect(() => {
     if (!clip) {
@@ -132,10 +376,11 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   }
 
   const exportResolutions: { id: ViralClip['clip_size']; label: string }[] = [
-    { id: 'Auto', label: 'Auto' },
+    { id: '4k', label: '4K' },
     { id: '1080p', label: '1080p' },
     { id: '720p', label: '720p' },
     { id: '480p', label: '480p' },
+    { id: 'Auto', label: 'Auto' },
   ];
 
   const colorPresets: {
@@ -243,7 +488,132 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
         tint_color: 'none', tint_strength: 0,
       },
     },
+    {
+      id: 'fuji_velvia_50',
+      label: 'Fuji Velvia 50',
+      swatch: 'from-emerald-700/70 via-indigo-900/60 to-rose-900/80',
+      values: {
+        exposure: -0.02, brightness: -0.02, contrast: 1.22, lift_mids: 0.95, highlights: 12, shadows: -18,
+        sharpness: 0.22, vignette: 0.25, color_temp: -8, tint_shift: -14, vibrance: 28, saturation: 1.34,
+        matte_fade: 0, halation_glow: 8, warmth: -0.04, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'cinestill_800t',
+      label: 'CineStill 800T',
+      swatch: 'from-cyan-700/65 via-slate-900/70 to-red-700/70',
+      values: {
+        exposure: -0.04, brightness: 0.0, contrast: 1.10, lift_mids: 1.03, highlights: 15, shadows: 14,
+        sharpness: 0.08, vignette: 0.35, color_temp: -42, tint_shift: 12, vibrance: 14, saturation: 1.08,
+        matte_fade: 24, halation_glow: 58, warmth: -0.18, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'bleach_bypass',
+      label: 'Bleach Bypass',
+      swatch: 'from-stone-500/50 via-zinc-800/80 to-neutral-950',
+      values: {
+        exposure: -0.05, brightness: -0.03, contrast: 1.38, lift_mids: 0.92, highlights: 26, shadows: -32,
+        sharpness: 0.45, vignette: 0.48, color_temp: -10, tint_shift: -8, vibrance: -35, saturation: 0.42,
+        matte_fade: 0, halation_glow: 0, warmth: -0.05, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'pastel_dream',
+      label: 'Pastel Dream',
+      swatch: 'from-pink-400/55 via-violet-400/45 to-amber-200/40',
+      values: {
+        exposure: 0.14, brightness: 0.07, contrast: 0.88, lift_mids: 1.08, highlights: -14, shadows: 34,
+        sharpness: 0.0, vignette: 0.0, color_temp: 10, tint_shift: 32, vibrance: 18, saturation: 0.88,
+        matte_fade: 38, halation_glow: 45, warmth: 0.06, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'tokyo_midnight',
+      label: 'Tokyo Midnight',
+      swatch: 'from-indigo-700/75 via-purple-900/75 to-slate-950',
+      values: {
+        exposure: -0.10, brightness: -0.06, contrast: 1.24, lift_mids: 0.96, highlights: 10, shadows: -22,
+        sharpness: 0.28, vignette: 0.45, color_temp: -55, tint_shift: 42, vibrance: 26, saturation: 1.28,
+        matte_fade: 10, halation_glow: 36, warmth: -0.25, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'warm_podcast_studio',
+      label: 'Warm Podcast Studio',
+      swatch: 'from-amber-600/60 via-orange-900/60 to-stone-950',
+      values: {
+        exposure: 0.04, brightness: 0.03, contrast: 1.08, lift_mids: 1.04, highlights: -10, shadows: 26,
+        sharpness: 0.25, vignette: 0.14, color_temp: 24, tint_shift: 4, vibrance: 22, saturation: 1.12,
+        matte_fade: 0, halation_glow: 4, warmth: 0.14, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'vhs_90s_tape',
+      label: 'VHS 90s Tape',
+      swatch: 'from-fuchsia-700/50 via-teal-800/55 to-amber-900/75',
+      values: {
+        exposure: 0.0, brightness: 0.01, contrast: 0.94, lift_mids: 1.05, highlights: -18, shadows: 18,
+        sharpness: 0.0, vignette: 0.42, color_temp: 16, tint_shift: -18, vibrance: -10, saturation: 1.18,
+        matte_fade: 46, halation_glow: 18, warmth: 0.10, black_and_white: 0, vintage: 65,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'arctic_crisp',
+      label: 'Arctic Crisp',
+      swatch: 'from-sky-400/60 via-cyan-800/60 to-slate-950',
+      values: {
+        exposure: 0.14, brightness: 0.05, contrast: 1.16, lift_mids: 1.02, highlights: 24, shadows: 20,
+        sharpness: 0.40, vignette: 0.0, color_temp: -38, tint_shift: -8, vibrance: 16, saturation: 1.06,
+        matte_fade: 0, halation_glow: 0, warmth: -0.22, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
+    {
+      id: 'emerald_gold',
+      label: 'Emerald & Gold',
+      swatch: 'from-emerald-600/75 via-teal-900/75 to-amber-600/75',
+      values: {
+        exposure: -0.02, brightness: -0.01, contrast: 1.22, lift_mids: 0.97, highlights: 16, shadows: -14,
+        sharpness: 0.24, vignette: 0.28, color_temp: 36, tint_shift: -42, vibrance: 32, saturation: 1.24,
+        matte_fade: 4, halation_glow: 12, warmth: 0.20, black_and_white: 0, vintage: 0,
+        tint_color: 'none', tint_strength: 0,
+      },
+    },
   ];
+
+  const PRESET_CATEGORY_BY_ID: Record<string, 'film' | 'gaming' | 'creator'> = {
+    none: 'creator',
+    kodak_portra_400: 'film',
+    teal_orange: 'film',
+    cyberpunk_neon: 'gaming',
+    moody_noir: 'film',
+    golden_hour: 'creator',
+    bw_16mm: 'film',
+    gaming_pop: 'gaming',
+    clean_rec709: 'creator',
+    fuji_velvia_50: 'film',
+    cinestill_800t: 'film',
+    bleach_bypass: 'film',
+    pastel_dream: 'creator',
+    tokyo_midnight: 'gaming',
+    warm_podcast_studio: 'creator',
+    vhs_90s_tape: 'gaming',
+    arctic_crisp: 'creator',
+    emerald_gold: 'gaming',
+  };
+
+  const filteredPresets =
+    presetCategory === 'all'
+      ? colorPresets
+      : colorPresets.filter((p) => (PRESET_CATEGORY_BY_ID[p.id] ?? 'creator') === presetCategory);
 
   const corners: { id: ViralClip['watermark_corner']; label: string }[] = [
     { id: 'top_left', label: 'Top Left' },
@@ -339,37 +709,116 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
     if (item.thumbnail_url) thumbUrlByPreset[item.id] = item.thumbnail_url;
   });
 
-  const activeExportFps = String(clip.export_fps || 'source') === '60' ? '60' : 'source';
+  const activeExportFps = ['24', '30', '60'].includes(String(clip.export_fps || ''))
+    ? String(clip.export_fps)
+    : 'source';
+
+  const handleExportProDeliverable = async () => {
+    if (!clip) return;
+    setIsExportingPro(true);
+    setExportNotice(null);
+    try {
+      const res = await api.exportProMaster(clip.project_id, clip.id, {
+        format: exportFormat,
+        resolution: clip.clip_size || '1080p',
+        fps: activeExportFps,
+        quality_preset: exportQualityPreset,
+        burn_captions: exportBurnCaptions,
+      });
+      setExportNotice(`Downloaded ${res.filename}`);
+    } catch (err: any) {
+      setExportNotice(err?.message || 'Pro export failed');
+    } finally {
+      setIsExportingPro(false);
+    }
+  };
+
+  const handleExportMultiAspectBatch = async () => {
+    if (!clip) return;
+    setIsExportingBatchZip(true);
+    setExportNotice(null);
+    try {
+      const res = await api.exportBatchAspectsZip(clip.project_id, clip.id, {
+        aspects: ['9:16', '4:5', '1:1', '16:9'],
+        resolution: clip.clip_size === '4k' ? '1080p' : (clip.clip_size || '720p'),
+        fps: activeExportFps,
+        quality_preset: exportQualityPreset,
+        burn_captions: exportBurnCaptions,
+      });
+      setExportNotice(`Downloaded ${res.filename}`);
+    } catch (err: any) {
+      setExportNotice(err?.message || 'Multi-aspect batch failed');
+    } finally {
+      setIsExportingBatchZip(false);
+    }
+  };
 
   return (
     <div className="space-y-4 text-xs animate-fadeIn w-full text-[var(--text-primary)]">
-      {/* Top Row: Compact Export Output + 3x3 Live-Thumbnail Look Presets */}
-      <div className="grid grid-cols-1 lg:grid-cols-[270px_minmax(0,1fr)] gap-4 items-stretch">
-        {/* Left: Compact Export Output */}
+      {/* Top Row: Pro Mastering Export Output + Live-Thumbnail Look Presets */}
+      <div className="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-4 items-stretch">
+        {/* Left: Pro Mastering & Multi-Deliverable Export Output */}
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 flex flex-col justify-between gap-3">
           <div className="space-y-3">
-            <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => setExportCardOpen((v) => !v)}
+              className="w-full flex items-center justify-between gap-2 text-left"
+            >
               <span className="font-bold text-xs uppercase tracking-wide flex items-center gap-1.5">
                 <Film className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-                Export Output
+                <span>Export Output</span>
               </span>
-              <span className="text-[10px] font-mono text-[var(--text-muted)]">MP4 H.264</span>
+              <span className="flex items-center gap-1.5 text-[10px] font-mono text-[var(--text-muted)]">
+                <span>
+                  {exportFormat === 'mp4_hevc'
+                    ? 'HEVC'
+                    : exportFormat === 'mov_prores'
+                      ? 'ProRes'
+                      : exportFormat === 'webm_vp9'
+                        ? 'VP9'
+                        : exportFormat === 'audio_wav'
+                          ? 'WAV 24b'
+                          : exportFormat === 'audio_mp3'
+                            ? 'MP3 320k'
+                            : 'H.264'}
+                </span>
+                {exportCardOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+              </span>
+            </button>
+
+            {exportCardOpen && (
+            <div className="space-y-2.5">
+            <div>
+              <label className="block text-[10px] text-[var(--text-secondary)] mb-1">Container &amp; Codec</label>
+              <select
+                value={exportFormat}
+                onChange={(e) => setExportFormat(e.target.value as any)}
+                className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] font-semibold outline-none focus:border-[var(--accent-primary)]"
+              >
+                <option value="mp4_h264">MP4 H.264 (Universal Social)</option>
+                <option value="mp4_hevc">MP4 HEVC / H.265 (High Efficiency)</option>
+                <option value="mov_prores">MOV ProRes 422 LT (NLE Intermediate)</option>
+                <option value="webm_vp9">WebM VP9 (Web Transparent Alpha)</option>
+                <option value="audio_wav">Audio Only WAV 24-bit (PCM)</option>
+                <option value="audio_mp3">Audio Only MP3 320k</option>
+              </select>
             </div>
 
             <div>
-              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1.5">
+              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1">
                 <span>Resolution</span>
                 <span className="font-mono text-[var(--accent-primary)] font-semibold">
                   {clip.clip_size || 'Auto'}
                 </span>
               </div>
-              <div className="grid grid-cols-4 gap-1.5 tabular-nums">
+              <div className="grid grid-cols-5 gap-1 tabular-nums">
                 {exportResolutions.map((sz) => (
                   <button
                     key={sz.id}
                     type="button"
                     onClick={() => onUpdateClip({ clip_size: sz.id })}
-                    className={`py-1.5 rounded-lg border text-center text-[11px] font-medium transition ${
+                    className={`py-1 rounded-lg border text-center text-[10px] font-medium transition ${
                       clip.clip_size === sz.id
                         ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
                         : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -382,22 +831,24 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
             </div>
 
             <div>
-              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1.5">
-                <span>Frame Rate</span>
+              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1">
+                <span>Frame Rate (CFR)</span>
                 <span className="font-mono text-[var(--accent-primary)] font-semibold">
-                  {activeExportFps === '60' ? '60 fps' : 'Source'}
+                  {activeExportFps === 'source' ? 'Source' : `${activeExportFps} fps`}
                 </span>
               </div>
-              <div className="grid grid-cols-2 gap-1.5 tabular-nums">
+              <div className="grid grid-cols-4 gap-1 tabular-nums">
                 {[
-                  { id: 'source', label: 'Source FPS' },
+                  { id: 'source', label: 'Source' },
+                  { id: '24', label: '24 fps' },
+                  { id: '30', label: '30 fps' },
                   { id: '60', label: '60 fps' },
                 ].map((opt) => (
                   <button
                     key={opt.id}
                     type="button"
                     onClick={() => onUpdateClip({ export_fps: opt.id })}
-                    className={`py-1.5 rounded-lg border text-center text-[11px] font-medium transition ${
+                    className={`py-1 rounded-lg border text-center text-[10px] font-medium transition ${
                       activeExportFps === opt.id
                         ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold border-[var(--accent-primary)]'
                         : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -408,6 +859,89 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                 ))}
               </div>
             </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <div className="text-[10px] text-[var(--text-secondary)] mb-1">Quality Preset</div>
+                <select
+                  value={exportQualityPreset}
+                  onChange={(e) => setExportQualityPreset(e.target.value as any)}
+                  className="w-full px-2 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[10px] font-semibold outline-none"
+                >
+                  <option value="master_high">Master High</option>
+                  <option value="social_balanced">Social Balanced</option>
+                  <option value="compact">Compact</option>
+                </select>
+              </div>
+              <div>
+                <div className="text-[10px] text-[var(--text-secondary)] mb-1">Master Track</div>
+                <button
+                  type="button"
+                  onClick={() => setExportBurnCaptions((v) => !v)}
+                  className={`w-full py-1 px-2 rounded-lg border text-[10px] font-bold transition ${
+                    exportBurnCaptions
+                      ? 'bg-[var(--accent-primary)]/15 border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)]'
+                  }`}
+                >
+                  {exportBurnCaptions ? 'Burned-In Captions' : 'Clean Master'}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-1.5 pt-1">
+              <button
+                type="button"
+                onClick={handleExportProDeliverable}
+                disabled={isExportingPro}
+                className="py-1.5 px-2 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold text-[11px] flex items-center justify-center gap-1 hover:opacity-90 disabled:opacity-50"
+              >
+                {isExportingPro ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                <span>{isExportingPro ? 'Exporting...' : 'Export Master'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleExportMultiAspectBatch}
+                disabled={isExportingBatchZip}
+                className="py-1.5 px-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 font-semibold text-[10px] flex items-center justify-center gap-1 disabled:opacity-50"
+                title="Render 9:16 + 4:5 + 1:1 + 16:9 MP4s + SRT/VTT captions in .zip"
+              >
+                {isExportingBatchZip ? <Loader2 className="w-3 h-3 animate-spin" /> : <Package className="w-3 h-3 text-[var(--accent-primary)]" />}
+                <span>Batch Aspects</span>
+              </button>
+            </div>
+
+            {/* Standalone Captions, Cover PNG & NLE Interchange */}
+            <div className="flex flex-wrap gap-1 pt-1">
+              {(['srt', 'vtt', 'ass', 'premiere', 'edl', 'fcpxml'] as const).map((fmt) => (
+                <button
+                  key={fmt}
+                  type="button"
+                  onClick={() => window.open(api.getNleExportUrl(clip.project_id, clip.id, fmt), '_blank')}
+                  className="px-1.5 py-0.5 rounded bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-[9px] font-mono font-bold uppercase"
+                  title={`Download .${fmt.toUpperCase()} deliverable`}
+                >
+                  .{fmt}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => window.open(api.getExportCoverUrl(clip.project_id, clip.id, clip.clip_size || '1080p'), '_blank')}
+                className="px-1.5 py-0.5 rounded bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/50 text-[9px] font-mono font-bold inline-flex items-center gap-0.5"
+                title="Download Full-Res Cover .PNG"
+              >
+                <ImageIcon className="w-2.5 h-2.5 text-[var(--accent-primary)]" />
+                <span>Cover .PNG</span>
+              </button>
+            </div>
+
+            {exportNotice && (
+              <div className="text-[10px] font-medium text-emerald-400 truncate">
+                {exportNotice}
+              </div>
+            )}
+            </div>
+            )}
           </div>
 
           <div className="pt-2.5 border-t border-[var(--border-subtle)]/70 flex items-center justify-between text-[10px] text-[var(--text-muted)]">
@@ -421,13 +955,18 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
           </div>
         </div>
 
-        {/* Right: 3x3 Live-Thumbnail Visual Look Presets & .cube 3D LUT Studio */}
+        {/* Right: Live-Thumbnail Visual Look Presets & .cube 3D LUT Studio */}
         <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="font-bold text-xs uppercase tracking-wide flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => setLookCardOpen((v) => !v)}
+              className="font-bold text-xs uppercase tracking-wide flex items-center gap-1.5"
+            >
               <Sliders className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
-              Visual Look Presets
-            </span>
+              <span>Visual Look Presets</span>
+              {lookCardOpen ? <ChevronUp className="w-3.5 h-3.5 text-[var(--text-muted)]" /> : <ChevronDown className="w-3.5 h-3.5 text-[var(--text-muted)]" />}
+            </button>
             <div className="flex items-center gap-2 shrink-0">
               {onCompareOriginalChange && (
                 <button
@@ -457,8 +996,32 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
             </div>
           </div>
 
-          <div className="grid grid-cols-3 gap-2">
-            {colorPresets.map((p) => {
+          {lookCardOpen && (
+          <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-1.5 pb-1">
+            {[
+              { id: 'all' as const, label: `All (${colorPresets.length})` },
+              { id: 'film' as const, label: 'Film & Cinema' },
+              { id: 'gaming' as const, label: 'Gaming & Neon' },
+              { id: 'creator' as const, label: 'Creator & Clean' },
+            ].map((cat) => (
+              <button
+                key={cat.id}
+                type="button"
+                onClick={() => setPresetCategory(cat.id)}
+                className={`px-2.5 py-1 rounded-full text-[10px] font-semibold border transition ${
+                  presetCategory === cat.id
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                    : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                {cat.label}
+              </button>
+            ))}
+          </div>
+
+          <div className="grid grid-cols-3 gap-2 max-h-[340px] overflow-y-auto pr-1">
+            {filteredPresets.map((p) => {
               const active = (clip.color_preset || 'none') === p.id;
               const thumbUrl = thumbUrlByPreset[p.id];
               return (
@@ -567,6 +1130,8 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
               )}
             </div>
           </div>
+          </div>
+          )}
         </div>
       </div>
 
@@ -597,18 +1162,36 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
         })}
       </div>
 
-      {/* TAB 1: BALANCED 6 vs 6 LIGHT & COLOR STUDIO */}
+      {/* TAB 1: LIVE SCOPES + BALANCED LIGHT & COLOR STUDIO */}
       {subTab === 'grade' && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 animate-fadeIn tabular-nums">
+        <div className="space-y-4 animate-fadeIn tabular-nums">
+          <ColorScopesPanel
+            clip={clip}
+            sampleImageUrl={
+              thumbUrlByPreset[clip.color_preset || 'none'] ||
+              thumbUrlByPreset['none'] ||
+              presetPreviews?.presets?.[0]?.thumbnail_url ||
+              null
+            }
+          />
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {/* Tone & Optics (6 sliders) */}
           <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
             <div className="flex items-center justify-between font-bold text-xs text-[var(--text-primary)]">
-              <span className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setToneCardOpen((v) => !v)}
+                className="flex items-center gap-2 text-left"
+              >
                 <Sun className="w-4 h-4 text-[var(--accent-primary)]" />
-                <span>Tone & Optics</span>
-              </span>
+                <span>Tone &amp; Optics</span>
+                {toneCardOpen ? <ChevronUp className="w-3.5 h-3.5 text-[var(--text-muted)]" /> : <ChevronDown className="w-3.5 h-3.5 text-[var(--text-muted)]" />}
+              </button>
               <span className="text-[10px] font-normal text-[var(--text-muted)]">Double-click to reset</span>
             </div>
+
+            {toneCardOpen && (
+            <div className="space-y-3">
 
             <GradeSlider
               label="Exposure"
@@ -670,17 +1253,37 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
               unit="%"
               onChange={(val) => onUpdateClip({ vignette: Number((val / 100).toFixed(2)) })}
             />
+            <GradeSlider
+              label="35mm Film Grain"
+              value={Math.round((clip.film_grain || 0) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              defaultValue={0}
+              unit="%"
+              onChange={(val) => onUpdateClip({ film_grain: Number((val / 100).toFixed(2)) })}
+            />
+            </div>
+            )}
           </div>
 
           {/* Color & Film Character (6 sliders) */}
           <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-4 space-y-3">
             <div className="flex items-center justify-between font-bold text-xs text-[var(--text-primary)]">
-              <span className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setColorCardOpen((v) => !v)}
+                className="flex items-center gap-2 text-left"
+              >
                 <Droplets className="w-4 h-4 text-[var(--accent-primary)]" />
-                <span>Color & Film Character</span>
-              </span>
+                <span>Color &amp; Film Character</span>
+                {colorCardOpen ? <ChevronUp className="w-3.5 h-3.5 text-[var(--text-muted)]" /> : <ChevronDown className="w-3.5 h-3.5 text-[var(--text-muted)]" />}
+              </button>
               <span className="text-[10px] font-normal text-[var(--text-muted)]">0 = neutral center</span>
             </div>
+
+            {colorCardOpen && (
+            <div className="space-y-3">
 
             <GradeSlider
               label="Temperature (Cool ↔ Warm)"
@@ -747,6 +1350,9 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
               unit="%"
               onChange={(val) => onUpdateClip({ halation_glow: val })}
             />
+            </div>
+            )}
+          </div>
           </div>
         </div>
       )}
@@ -954,6 +1560,11 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                   </button>
                 )}
               </div>
+              {clip.has_existing_music && !clip.bgm_path && (
+                <div className="px-2.5 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/35 text-amber-300 text-[10px] font-medium">
+                  Existing source music detected — extra BGM skipped automatically to prevent clashing.
+                </div>
+              )}
 
               <div className="flex items-center gap-2.5">
                 <label className="flex items-center gap-1.5 px-3 py-1.5 bg-[var(--bg-input)] hover:border-[var(--accent-primary)]/40 text-[var(--text-primary)] rounded-lg border border-[var(--border-subtle)] cursor-pointer transition">

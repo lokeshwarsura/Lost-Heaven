@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, Callable, List
 
 from app.config import settings
 from app.services.proxy import get_ffmpeg_cmd, detect_hardware_encoder, probe_video
+from app.services.hardware import build_video_encoder_args
 from app.services.caption_renderer import build_caption_ffconcat
 from app.services.face_tracker import (
     track_faces_in_clip,
@@ -47,6 +48,7 @@ from app.services.timeline_editor import (
     build_timeline_trim_concat_filter,
     build_profanity_bleep_filter,
     select_cold_open_climax_window,
+    build_timeline_edit_plan,
 )
 from app.services.reframer import (
     resolve_target_dimensions,
@@ -56,45 +58,20 @@ from app.services.reframer import (
     prepare_clip_framing_data,
 )
 from app.services.filters import build_advanced_color_filter
+from app.services.render_queue import (
+    RenderSupersededError,
+    acquire_or_attach_render,
+    active_render_tokens as _active_render_tokens,
+    active_renders as _active_renders,
+    active_temp_dirs as _active_temp_dirs,
+    await_attached_render,
+    cancel_active_render,
+    compute_render_signature,
+    finish_render_entry,
+    render_lock as _render_lock,
+)
 
 logger = logging.getLogger(__name__)
-
-_render_lock = threading.RLock()
-_active_renders: Dict[str, subprocess.Popen] = {}
-_active_render_tokens: Dict[str, str] = {}
-_active_temp_dirs: Dict[str, Path] = {}
-
-
-class RenderSupersededError(Exception):
-    """Raised when an in-flight render is terminated by a newer render request for the same clip."""
-
-
-def cancel_active_render(clip_key: str) -> bool:
-    """Immediately terminate any active FFmpeg process for `clip_key` and clean its temp dir."""
-    with _render_lock:
-        proc = _active_renders.pop(clip_key, None)
-        old_temp = _active_temp_dirs.pop(clip_key, None)
-        had_active = proc is not None
-
-    if proc is not None:
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=0.5)
-                except Exception:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=0.5)
-                    except Exception:
-                        pass
-        except Exception as e:
-            logger.debug(f"Ignored error terminating superseded FFmpeg for {clip_key}: {e}")
-
-    if old_temp is not None and old_temp.exists():
-        shutil.rmtree(old_temp, ignore_errors=True)
-
-    return had_active
 
 
 def apply_watermark_to_filtergraph(
@@ -168,7 +145,7 @@ def find_cold_open_segment(words: list, cold_open_quote: str, clip_duration: flo
 
 
 def scale_dimensions_for_clip_size(width: int, height: int, clip_size: str) -> tuple[int, int]:
-    """Adjust output width and height according to selected clip size (Auto, 1080p, 720p, 540p, 480p)."""
+    """Adjust output width and height according to selected clip size (Auto, 4K/2160p, 1080p, 720p, 540p, 480p)."""
     norm_size = (clip_size or "1080p").strip().lower()
     if norm_size in ("", "auto", "original"):
         w = width if width % 2 == 0 else width - 1
@@ -177,6 +154,8 @@ def scale_dimensions_for_clip_size(width: int, height: int, clip_size: str) -> t
 
     is_vertical = height > width
     size_map = {
+        "4k": 3840 if is_vertical else 2160,
+        "2160p": 3840 if is_vertical else 2160,
         "1080p": 1920 if is_vertical else 1080,
         "720p": 1280 if is_vertical else 720,
         "540p": 960 if is_vertical else 540,
@@ -184,14 +163,17 @@ def scale_dimensions_for_clip_size(width: int, height: int, clip_size: str) -> t
     }
     target_h = size_map.get(norm_size)
     if not target_h:
-        return width, height
+        w = width if width % 2 == 0 else width - 1
+        h = height if height % 2 == 0 else height - 1
+        return max(2, w), max(2, h)
 
+    target_h = target_h if target_h % 2 == 0 else max(2, target_h - 1)
     scale = target_h / float(height)
     new_w = int(round(width * scale / 2) * 2)
     return max(2, new_w), target_h
 
 
-def render_clip_ultra(
+def _render_clip_ultra_impl(
     master_video_path: str,
     clip_id: int,
     start_time: float,
@@ -292,9 +274,12 @@ def render_clip_ultra(
     show_hook_banner: bool = True,
     cold_open_quote: str = "",
     use_cold_open: bool = False,
+    cold_open: Optional[bool] = None,
     auto_trim_dead_air: bool = False,
+    trim_dead_air: Optional[bool] = None,
     dynamic_punch_zoom: bool = False,
-    punch_zoom_intensity: float = 1.14,
+    punch_zoom: Optional[bool] = None,
+    punch_zoom_intensity: float = 1.16,
     quality_mode: str = "final_hq",
     progress_callback: Optional[Callable[[int, str], None]] = None,
     output_path_override: Optional[str] = None,
@@ -329,27 +314,18 @@ def render_clip_ultra(
     handle_opacity: float = 0.65,
     handle_display_mode: str = "always",
     options: Optional[Dict[str, Any]] = None,
+    _clip_key: str = "",
+    _my_token: str = "",
 ) -> str:
     """
-    Complete ClipShip studio rendering pipeline:
-    - Cancellable per-clip Popen queue (`_active_renders` guarded by `_render_lock`)
-    - Versioned output filenames (`clip_{id}_r{ms}.mp4`) to prevent Windows file-lock crashes
-    - Fast auto-render (`fast_preview`) vs high quality (`final_hq`) presets
-    - Dynamic face tracking + 5 framing templates + Step 3 grading + Pillow/ffconcat captions
+    Internal implementation of the ClipShip studio rendering pipeline.
     """
     ffmpeg = get_ffmpeg_cmd()
     renders_dir = Path(settings.STORAGE_DIR) / "renders"
     renders_dir.mkdir(parents=True, exist_ok=True)
 
-    my_token = uuid.uuid4().hex
-    clip_key = (
-        f"pack_{project_id if project_id is not None else 0}_{clip_id}_{my_token}"
-        if allow_concurrent
-        else f"{project_id if project_id is not None else 0}:{clip_id}"
-    )
-    with _render_lock:
-        cancel_active_render(clip_key)
-        _active_render_tokens[clip_key] = my_token
+    clip_key = _clip_key or f"{project_id if project_id is not None else 0}:{clip_id}"
+    my_token = _my_token or uuid.uuid4().hex
 
     def _ensure_not_superseded():
         with _render_lock:
@@ -403,61 +379,46 @@ def render_clip_ultra(
     )
 
     render_words = [dict(w) for w in (words or []) if not w.get("muted", False)]
+    eff_cold_open = bool(cold_open) if cold_open is not None else bool(use_cold_open)
+    eff_trim_dead_air = bool(trim_dead_air) if trim_dead_air is not None else bool(auto_trim_dead_air)
+    eff_punch_zoom = bool(punch_zoom) if punch_zoom is not None else bool(dynamic_punch_zoom)
+    eff_punch_intensity = float(punch_zoom_intensity if punch_zoom_intensity is not None else 1.16)
 
-    # Plan transcript-native, dead-air silence, & blade-split kept segments cleanly BEFORE cold-open / face tracking
+    # Unified Timeline Edit Plan: trim_dead_air -> cold_open (2.8s climax + 0.2s flash + +2.8s word shift) -> punch_zoom (top 6 peaks)
     eff_cf_sec = (
         max(0.03, float(merge_crossfade_sec or 0.03))
-        if (tighten_pacing or auto_trim_dead_air)
+        if (tighten_pacing or eff_trim_dead_air)
         else float(merge_crossfade_sec or 0.03)
     )
-    tl_plan = compute_kept_segments_and_remapped_words(
-        words=render_words,
+    tl_plan = build_timeline_edit_plan(
+        video_path=master_video_path,
         clip_start_time=source_start_anchor,
         clip_duration=source_span,
+        words=render_words,
+        cold_open=eff_cold_open,
+        cold_open_quote=cold_open_quote,
+        trim_dead_air=eff_trim_dead_air,
         tighten_pacing=tighten_pacing,
-        auto_trim_dead_air=auto_trim_dead_air,
         silence_threshold=silence_threshold,
         clean_filler_words=clean_filler_words,
-        crossfade_sec=eff_cf_sec,
+        punch_zoom=eff_punch_zoom,
+        punch_zoom_intensity=eff_punch_intensity,
         explicit_keep_segments=explicit_abs_segs,
-        video_path=master_video_path,
+        crossfade_sec=eff_cf_sec,
     )
-    kept_segments = tl_plan["kept_segments"]
-    kept_segments_abs = tl_plan.get("kept_segments_abs") or [
-        (round(source_start_anchor + s, 3), round(source_start_anchor + e, 3))
-        for s, e in kept_segments
-    ]
-    has_cuts = tl_plan["has_cuts"]
-    main_duration = float(tl_plan["effective_duration"])
-    post_cut_words = tl_plan["remapped_words"]
+    kept_segments = tl_plan.keep_intervals
+    kept_segments_abs = tl_plan.kept_segments_abs
+    has_cuts = tl_plan.has_cuts
+    main_duration = tl_plan.main_duration
+    post_cut_words = [dict(w) for w in tl_plan.remapped_words]
     use_multi_input = len(kept_segments_abs) > 1
 
-    # Cold-Open Climax Teaser: extract 2.5s climax from second half (>= 8.0s clips) & stitch via fadewhite xfade
-    cold_open_active = False
-    cold_open_window: Optional[tuple[float, float]] = None
-    cold_open_teaser_len = 2.50
-    cold_open_xfade = 0.20
-    cold_open_net_offset = 0.0
-    if use_cold_open and main_duration >= 8.0:
-        cold_open_window = select_cold_open_climax_window(
-            master_video_path,
-            clip_start_time=source_start_anchor,
-            clip_duration=source_span,
-            words=render_words,
-            cold_open_quote=cold_open_quote,
-            window_sec=2.50,
-        )
-        if cold_open_window is not None:
-            co_s, co_e = cold_open_window
-            cold_open_teaser_len = max(0.8, round(co_e - co_s, 3))
-            cold_open_xfade = min(0.20, round(cold_open_teaser_len * 0.25, 3))
-            cold_open_net_offset = round(cold_open_teaser_len - cold_open_xfade, 3)
-            cold_open_active = True
-            for pw in post_cut_words:
-                pw["start"] = round(float(pw.get("start", 0.0)) + cold_open_net_offset, 3)
-                pw["end"] = round(float(pw.get("end", 0.0)) + cold_open_net_offset, 3)
-
-    effective_duration = round(main_duration + cold_open_net_offset, 3)
+    cold_open_active = tl_plan.cold_open_active
+    cold_open_window = tl_plan.climax_window
+    cold_open_teaser_len = tl_plan.teaser_duration or 2.80
+    cold_open_xfade = tl_plan.flash_duration or 0.20
+    cold_open_net_offset = tl_plan.teaser_duration
+    effective_duration = tl_plan.effective_duration
 
     # Single Source of Truth framing analysis (identical keyframes & crop math as preview_frame.py)
     face_track_data, effective_corner, _ = prepare_clip_framing_data(
@@ -469,7 +430,7 @@ def render_clip_ultra(
         visual_map=visual_map,
         framing_override=framing_override,
         best_frames=best_frames,
-        merge_crossfade_sec=float(tl_plan.get("crossfade_sec", merge_crossfade_sec or 0.03)),
+        merge_crossfade_sec=float(tl_plan.crossfade_sec or merge_crossfade_sec or 0.03),
     )
 
     opts = dict(options or {})
@@ -579,6 +540,7 @@ def render_clip_ultra(
                 pos_y=position_y,
                 caption_x=opts.get("caption_x"),
                 caption_y=opts.get("caption_y"),
+                caption_custom_position=bool(opts.get("caption_custom_position", False)),
                 caption_rotation=float(opts.get("caption_rotation", 0.0) or 0.0),
                 caption_max_width=float(opts.get("caption_max_width", 0.82) or 0.82),
                 base_color=base_color,
@@ -613,7 +575,7 @@ def render_clip_ultra(
                 handle_opacity=handle_opacity,
                 handle_display_mode=handle_display_mode,
                 cold_open_active=cold_open_active,
-                cold_open_teaser_dur=round((cold_open_net_offset if cold_open_active else 2.3) / speed_ramp, 3),
+                cold_open_teaser_dur=round((cold_open_net_offset if cold_open_active else 2.8) / speed_ramp, 3),
                 caption_animation=caption_animation,
                 pill_color=opts.get("pill_color"),
                 pacing_density=opts.get("pacing_density", "3-4 Words Viral"),
@@ -640,7 +602,7 @@ def render_clip_ultra(
         if has_cuts:
             tl_fg, v_in_lbl, a_in_lbl = build_timeline_trim_concat_filter(
                 kept_segments_abs if use_multi_input else kept_segments,
-                crossfade_sec=float(tl_plan.get("crossfade_sec", 0.03)),
+                crossfade_sec=float(tl_plan.crossfade_sec),
                 has_audio=has_audio,
                 multi_input=use_multi_input,
             )
@@ -649,6 +611,10 @@ def render_clip_ultra(
             fg_segments.append("[0:v]setpts=PTS-STARTPTS[v_pts]")
             v_in_lbl = "v_pts"
 
+        eff_source_corner = str(
+            ((source_webcam_region or {}).get("locked_zone") if isinstance(source_webcam_region, dict) else None)
+            or "auto"
+        )
         layout_vf = build_multi_aspect_filter(
             aspect_ratio=aspect_ratio,
             frame_layout=layout,
@@ -671,6 +637,7 @@ def render_clip_ultra(
             clip_duration=main_duration,
             fps=max(15.0, min(60.0, float(meta.get("fps") or 30.0))),
             beat_timestamps=beat_data.get("beats"),
+            source_corner=eff_source_corner,
         )
         fg_segments.append(layout_vf)
 
@@ -713,6 +680,7 @@ def render_clip_ultra(
                 whip_pan_cuts=False,
                 clip_duration=cold_open_teaser_len,
                 fps=src_fps_norm,
+                source_corner=eff_source_corner,
             )
             # Scope internal filtergraph labels to `[co_*]` so main stream `[v_main_src]` never collides
             co_layout_scoped = re.sub(
@@ -721,29 +689,33 @@ def render_clip_ultra(
                 co_layout_vf,
             ).replace("[co___CO_IN__]", f"[{co_in_idx}:v]")
             fg_segments.append(co_layout_scoped)
+            flash_st = max(0.05, round(cold_open_teaser_len - cold_open_xfade, 3))
             fg_segments.append(
-                f"[co_v]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS[co_v_norm]"
+                f"[co_v]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,"
+                f"trim=duration={cold_open_teaser_len:.3f},setpts=PTS-STARTPTS,"
+                f"fade=t=out:st={flash_st:.3f}:d={cold_open_xfade:.3f}:color=white[co_v_norm]"
             )
             fg_segments.append(
-                f"[v_main_src]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS[main_v_norm]"
-            )
-            fg_segments.append(
-                f"[co_v_norm][main_v_norm]xfade=transition=fadewhite:duration={cold_open_xfade:.3f}:"
-                f"offset={cold_open_net_offset:.3f},setpts=PTS-STARTPTS[v]"
+                f"[v_main_src]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS,"
+                f"fade=t=in:st=0.000:d={cold_open_xfade:.3f}:color=white[main_v_norm]"
             )
             if has_audio and a_in_lbl:
                 fg_segments.append(
-                    f"[{co_in_idx}:a]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
-                    f"asetpts=PTS-STARTPTS[co_a_norm]"
+                    f"[{co_in_idx}:a]atrim=duration={cold_open_teaser_len:.3f},asetpts=PTS-STARTPTS,"
+                    f"aresample=async=1:first_pts=0,aresample=48000,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo[co_a_norm]"
                 )
                 fg_segments.append(
-                    f"[{a_in_lbl}]aresample=48000,aformat=sample_rates=48000:channel_layouts=stereo,"
-                    f"asetpts=PTS-STARTPTS[main_a_norm]"
+                    f"[{a_in_lbl}]asetpts=PTS-STARTPTS,"
+                    f"aresample=async=1:first_pts=0,aresample=48000,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo[main_a_norm]"
                 )
                 fg_segments.append(
-                    f"[co_a_norm][main_a_norm]acrossfade=d={cold_open_xfade:.3f}:c1=qsin:c2=qsin[a_co]"
+                    "[co_v_norm][co_a_norm][main_v_norm][main_a_norm]concat=n=2:v=1:a=1[v][a_co]"
                 )
                 a_in_lbl = "a_co"
+            else:
+                fg_segments.append("[co_v_norm][main_v_norm]concat=n=2:v=1:a=0[v]")
 
         staged_lut_rel: Optional[str] = None
         if opts.get("lut_path"):
@@ -780,20 +752,25 @@ def render_clip_ultra(
             blur=blur,
             film_grain=film_grain,
             # Never darken PiP webcam corners with radial vignette
-            vignette=0.0 if layout == "gameplay_webcam_pip" else vignette,
+            vignette=0.0 if layout in ("gameplay_webcam_pip", "portrait_pip_badge", "triple_gaming_hud") else vignette,
             bottom_fade=bottom_fade,
+            horizon_tilt=float(opts.get("horizon_tilt", 0.0) or 0.0),
             target_w=target_w,
             target_h=target_h,
         )
 
-        punch_data: Dict[str, Any] = {"punch_timestamps": [], "punch_intervals": [], "peak_zoom": punch_zoom_intensity}
-        if dynamic_punch_zoom or auto_sfx:
+        punch_data: Dict[str, Any] = {
+            "punch_timestamps": list(tl_plan.punch_timestamps),
+            "punch_intervals": list(tl_plan.punch_intervals),
+            "peak_zoom": eff_punch_intensity,
+        }
+        if not eff_punch_zoom and auto_sfx:
             punch_data = detect_punch_zoom_peaks(
                 master_video_path,
                 start_sec=source_start_anchor,
                 end_sec=source_start_anchor + max(0.5, main_duration),
                 base_zoom=1.0,
-                punch_intensity=punch_zoom_intensity,
+                punch_intensity=eff_punch_intensity,
             )
             if cold_open_active and punch_data.get("punch_intervals"):
                 punch_data["punch_timestamps"] = [
@@ -825,24 +802,26 @@ def render_clip_ultra(
                 punch_data = snapped_punch
 
         punch_zoom_vf = ""
-        if dynamic_punch_zoom and punch_data.get("punch_intervals"):
-            fx, fy = compute_punch_focus_anchor(face_track_data, framing_override=framing_override)
+        if eff_punch_zoom and punch_data.get("punch_intervals"):
+            fx, fy = (0.5, 0.5)
+            if isinstance(framing_override, dict) and isinstance(framing_override.get("focus_anchor"), dict):
+                fx, fy = compute_punch_focus_anchor(face_track_data, framing_override=framing_override)
             z_expr = "1.0"
             for t0, t1, pz in reversed(punch_data["punch_intervals"]):
                 span = max(0.08, float(t1) - float(t0))
-                ramp_in = span * 0.34
+                ramp_in = max(0.02, span * 0.34)
                 ramp_out = max(0.04, span - ramp_in)
                 dz = max(0.02, float(pz) - 1.0)
                 seg = (
                     f"if(lt(t,{t0 + ramp_in:.3f}),"
-                    f"1.0+{dz:.3f}*((t-{t0:.3f})/{ramp_in:.3f}),"
-                    f"{1.0 + dz:.3f}-{dz:.3f}*((t-{t0 + ramp_in:.3f})/{ramp_out:.3f}))"
+                    f"1.0+{dz:.3f}*max(0.0,min(1.0,(t-{t0:.3f})/{ramp_in:.3f})),"
+                    f"1.0+{dz:.3f}*max(0.0,min(1.0,1.0-(t-{t0 + ramp_in:.3f})/{ramp_out:.3f})))"
                 )
                 z_expr = f"if(between(t,{t0:.3f},{t1:.3f}),{seg},{z_expr})"
             punch_zoom_vf = (
-                f"scale=w='trunc({target_w}*({z_expr})/2)*2':"
-                f"h='trunc({target_h}*({z_expr})/2)*2':eval=frame:flags=lanczos,"
-                f"crop=w={target_w}:h={target_h}:x='(iw-ow)*{fx:.4f}':y='(ih-oh)*{fy:.4f}',setsar=1"
+                f"scale=w='max({target_w},trunc(iw*(max(1.0,{z_expr}))/2)*2)':"
+                f"h='max({target_h},trunc(ih*(max(1.0,{z_expr}))/2)*2)':eval=frame:flags=lanczos,"
+                f"crop=w={target_w}:h={target_h}:x='max(0,(iw-{target_w})*{fx:.4f})':y='max(0,(ih-{target_h})*{fy:.4f})',setsar=1"
             )
 
         # Stage optional BGM & Micro-SFX assets into ASCII temp exec_dir
@@ -1075,7 +1054,10 @@ def render_clip_ultra(
                 fg_segments=fg_segments,
             )
             fg_segments.append(f"[{cap_in_idx}:v]format=rgba[cap]")
-            fg_segments.append(f"[{curr_v_lbl}][cap]overlay=0:0:eof_action=pass:shortest=1[v_out]")
+            fg_segments.append(
+                f"[{curr_v_lbl}][cap]overlay=0:0:eof_action=pass:shortest=1,"
+                f"scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v_out]"
+            )
         else:
             next_in_idx, curr_v_lbl = apply_watermark_to_filtergraph(
                 watermark_path=watermark_path,
@@ -1089,14 +1071,15 @@ def render_clip_ultra(
                 curr_v_lbl=curr_v_lbl,
                 fg_segments=fg_segments,
             )
-            fg_segments.append(f"[{curr_v_lbl}]null[v_out]")
+            fg_segments.append(f"[{curr_v_lbl}]scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[v_out]")
 
         # Build audio chain inside filter_complex when cuts, profanity bleeps, BGM, or SFX apply
         audio_af = build_voice_filter_chain(
-            auto_trim_dead_air=auto_trim_dead_air,
+            auto_trim_dead_air=eff_trim_dead_air,
             tighten_pacing=tighten_pacing,
             voice_isolation=voice_isolation,
             vocal_clarity=vocal_clarity,
+            voice_enhancer=bool(opts.get("voice_enhancer", False)),
             audio_volume=audio_volume,
             normalize_audio=normalize_audio,
             voice_eq_preset=str(opts.get("voice_eq_preset", "Raw") or "Raw"),
@@ -1127,6 +1110,11 @@ def render_clip_ultra(
                 input_args.extend(["-i", os.path.basename(rt_path)])
                 next_in_idx += 1
 
+        export_codec = str(opts.get("export_codec", "h264") or "h264").strip().lower()
+        export_quality_preset = str(opts.get("export_quality_preset", "social_balanced") or "social_balanced").strip().lower()
+        audio_codec_args = ["-c:a", "libopus", "-b:a", "192k"] if export_codec in ("vp9", "webm_vp9") else (
+            ["-c:a", "pcm_s16le"] if export_codec in ("prores", "mov_prores") else ["-c:a", "aac", "-b:a", "192k"]
+        )
         if use_fc_audio and a_in_lbl:
             curr_a = a_in_lbl
             if prof_intervals:
@@ -1161,30 +1149,30 @@ def render_clip_ultra(
                 )
                 fg_segments.append(sfx_frag)
             fg_segments.append(f"[{curr_a}]anull[a_out]")
-            audio_cli_args = ["-map", "[a_out]", "-c:a", "aac", "-b:a", "192k"]
+            audio_cli_args = ["-map", "[a_out]", *audio_codec_args]
         else:
-            audio_cli_args = ["-map", "0:a?", "-af", audio_af, "-c:a", "aac", "-b:a", "192k"]
+            audio_cli_args = ["-map", "0:a?", "-af", audio_af, *audio_codec_args]
 
         full_filter_complex = ";".join(fg_segments)
         fg_script = exec_dir / "filtergraph.txt"
         fg_script.write_text(full_filter_complex, encoding="utf-8")
 
-        is_fast_preview = (quality_mode or "final_hq").strip().lower() == "fast_preview"
         detected_encoder = detect_hardware_encoder()
-        if is_fast_preview:
-            cpu_enc_args = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "26"]
-            enc_args = (
-                ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-cq", "26"]
-                if (hardware_mode == "gpu" and detected_encoder == "h264_nvenc")
-                else cpu_enc_args
-            )
-        else:
-            cpu_enc_args = ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]
-            enc_args = (
-                ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20"]
-                if (hardware_mode == "gpu" and detected_encoder == "h264_nvenc")
-                else cpu_enc_args
-            )
+        cpu_enc_args = build_video_encoder_args(
+            "libx264",
+            quality_mode=quality_mode,
+            hardware_mode="cpu",
+            codec_family=export_codec,
+            quality_preset=export_quality_preset,
+        )
+        enc_args = build_video_encoder_args(
+            detected_encoder,
+            quality_mode=quality_mode,
+            hardware_mode=hardware_mode,
+            codec_family=export_codec,
+            quality_preset=export_quality_preset,
+        )
+        active_codec = enc_args[1] if len(enc_args) > 1 else "libx264"
 
         fg_args = build_filter_complex_args(ffmpeg, "filtergraph.txt", full_filter_complex)
 
@@ -1217,36 +1205,55 @@ def render_clip_ultra(
 
             return proc.returncode, (stderr_out or "")
 
+        from app.services.reframer import _ffmpeg_major_version
         export_fps_opt = str(opts.get("export_fps", "source") or "source").strip().lower()
-        fps_cli_args = ["-r", "60"] if export_fps_opt in ("60", "60fps", "60.0") else []
+        fps_cli_args: List[str] = []
+        if export_fps_opt in ("60", "60fps", "60.0"):
+            fps_cli_args = ["-r", "60"]
+        elif export_fps_opt in ("30", "30fps", "30.0"):
+            fps_cli_args = ["-r", "30"]
+        elif export_fps_opt in ("24", "24fps", "24.0", "23.976"):
+            fps_cli_args = ["-r", "24"]
+        cfr_args = ["-fps_mode", "cfr"] if _ffmpeg_major_version(ffmpeg) >= 5 else ["-vsync", "cfr"]
+        out_ext = Path(output_mp4).suffix.lower()
+        mov_flags = ["-movflags", "+faststart"] if out_ext in (".mp4", ".mov") else []
 
         def _build_cmd(video_enc_args: List[str]) -> List[str]:
+            pix_args = [] if "-pix_fmt" in video_enc_args else ["-pix_fmt", "yuv420p"]
             return [
                 ffmpeg,
                 "-y",
                 *input_args,
                 *fg_args,
                 "-map", "[v_out]",
+                *cfr_args,
                 *fps_cli_args,
                 *video_enc_args,
-                "-pix_fmt", "yuv420p",
+                *pix_args,
                 *audio_cli_args,
-                "-movflags", "+faststart",
+                *mov_flags,
                 output_mp4,
             ]
 
         cmd = _build_cmd(enc_args)
-        logger.info(f"Executing Lost Heaven render ({quality_mode}) in {exec_dir}: {' '.join(cmd)}")
+        logger.info(f"Executing Lost Heaven render ({quality_mode}, codec={active_codec}) in {exec_dir}: {' '.join(cmd)}")
 
         rc, stderr_text = _run_cancellable_popen(cmd)
         if rc != 0:
-            if "nvenc" in " ".join(enc_args):
-                logger.warning(f"NVENC render failed, retrying with libx264 keeping full filtergraph: {stderr_text[-300:]}")
+            if active_codec != cpu_enc_args[1]:
+                logger.warning(
+                    f"{active_codec} render failed ({target_w}x{target_h}), retrying with {cpu_enc_args[1]} keeping full filtergraph: "
+                    f"{(stderr_text or '').strip()[-400:]}"
+                )
                 rc2, stderr2 = _run_cancellable_popen(_build_cmd(cpu_enc_args))
                 if rc2 != 0:
-                    raise RuntimeError(f"FFmpeg render failed: {stderr2[-500:]}")
+                    err_tail = (stderr2 or "").strip()[-400:]
+                    logger.error(f"FFmpeg render failed (codec={cpu_enc_args[1]}, res={target_w}x{target_h}): {err_tail}")
+                    raise RuntimeError(f"FFmpeg render failed (codec={cpu_enc_args[1]}, res={target_w}x{target_h}): {err_tail}")
             else:
-                raise RuntimeError(f"FFmpeg render failed: {stderr_text[-500:]}")
+                err_tail = (stderr_text or "").strip()[-400:]
+                logger.error(f"FFmpeg render failed (codec={active_codec}, res={target_w}x{target_h}): {err_tail}")
+                raise RuntimeError(f"FFmpeg render failed (codec={active_codec}, res={target_w}x{target_h}): {err_tail}")
 
         # Best-effort clean up older versioned renders for this clip (Windows file-lock safe)
         if not output_path_override:
@@ -1268,3 +1275,178 @@ def render_clip_ultra(
                 _active_temp_dirs.pop(clip_key, None)
         if cap_temp_dir is not None and cap_temp_dir.exists():
             shutil.rmtree(cap_temp_dir, ignore_errors=True)
+
+
+def render_clip_ultra(
+    master_video_path: str,
+    clip_id: int,
+    start_time: float,
+    duration: float,
+    words: list,
+    project_id: Optional[int] = None,
+    # Layout & aspect
+    aspect_ratio: str = "9:16",
+    custom_width: int = 1080,
+    custom_height: int = 1920,
+    frame_layout: str = "auto_track",
+    webcam_corner: str = "auto",
+    webcam_split_ratio: float = 0.40,
+    source_webcam_region: Optional[Dict[str, Any]] = None,
+    visual_map: Optional[Dict[str, Any]] = None,
+    framing_override: Optional[Dict[str, Any]] = None,
+    best_frames: Optional[List[Dict[str, Any]]] = None,
+    camera_motion: str = "steady",
+    whip_pan_cuts: bool = False,
+    pip_border_color: str = "#F59E0B",
+    zoom: float = 1.0,
+    pan_x_offset: float = 0.0,
+    pan_x: Optional[float] = None,
+    # Step 2: Pro Captions & Typography
+    burn_captions: bool = True,
+    timing_offset: float = 0.0,
+    caption_style: str = "Karaoke pop",
+    caption_font: str = "Montserrat",
+    caption_animation: str = "Karaoke",
+    font_size_percent: int = 100,
+    base_color: str = "#FFFFFF",
+    active_color: str = "#C6F32F",
+    outline_color: str = "#000000",
+    font_size: int = 64,
+    bold: bool = True,
+    italic: bool = False,
+    all_caps: bool = True,
+    text_align: str = "Centre",
+    position_grid: str = "bottom_center",
+    position_x: float = 50.0,
+    position_y: float = 78.0,
+    hold_back_alpha: float = 1.0,
+    highlight_shape: str = "Colour only",
+    emoji_enabled: bool = False,
+    highlight_power_words: bool = False,
+    how_phrase_arrives: str = "All at once",
+    outline_width: float = 4.0,
+    shadow_depth: float = 3.0,
+    glow_intensity: float = 0.0,
+    letter_spacing: float = 0.0,
+    clean_filler_words: bool = False,
+    tighten_pacing: bool = False,
+    silence_threshold: float = 0.45,
+    censor_profanity: bool = False,
+    # Step 3: Color Grading & Visual FX
+    clip_size: str = "1080p",
+    color_preset: str = "none",
+    exposure: float = 0.0,
+    brightness: float = 0.0,
+    contrast: float = 1.0,
+    lift_mids: float = 0.0,
+    warmth: float = 0.0,
+    saturation: float = 1.0,
+    black_and_white: float = 0.0,
+    vintage: float = 0.0,
+    tint_color: str = "none",
+    tint_strength: float = 0.0,
+    glow: float = 0.0,
+    smooth: float = 0.0,
+    sharpness: float = 0.0,
+    blur: float = 0.0,
+    film_grain: float = 0.0,
+    vignette: float = 0.0,
+    bottom_fade: float = 0.0,
+    # Branding, Outro & Audio
+    watermark_path: Optional[str] = None,
+    watermark_corner: str = "top_right",
+    watermark_opacity: float = 0.85,
+    watermark_size: float = 0.15,
+    outro_path: Optional[str] = None,
+    bgm_path: Optional[str] = None,
+    bgm_volume: float = 0.20,
+    audio_volume: float = 1.0,
+    normalize_audio: bool = True,
+    vocal_clarity: bool = False,
+    voice_isolation: bool = False,
+    auto_sfx: bool = False,
+    retention_bar_enabled: bool = False,
+    retention_bar_color: str = "#C6F32F",
+    outro_cta_enabled: bool = False,
+    outro_cta_text: str = "Subscribe for More",
+    broll_segments: Optional[List[Dict[str, Any]]] = None,
+    broll_layout: str = "fullscreen",
+    export_resolution: Optional[str] = None,
+    hardware_mode: str = "gpu",
+    # Hooks & Retention FX
+    hook_headline: str = "",
+    show_hook_banner: bool = True,
+    cold_open_quote: str = "",
+    use_cold_open: bool = False,
+    cold_open: Optional[bool] = None,
+    auto_trim_dead_air: bool = False,
+    trim_dead_air: Optional[bool] = None,
+    dynamic_punch_zoom: bool = False,
+    punch_zoom: Optional[bool] = None,
+    punch_zoom_intensity: float = 1.16,
+    quality_mode: str = "final_hq",
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    output_path_override: Optional[str] = None,
+    allow_concurrent: bool = False,
+    keep_segments: Optional[List[List[float]]] = None,
+    merge_crossfade_sec: float = 0.03,
+    speakers: Optional[Dict[str, Any]] = None,
+    speaker_lower_thirds: bool = False,
+    face_safe_captions: bool = True,
+    callout_cards: Optional[List[Dict[str, Any]]] = None,
+    auto_callouts: bool = False,
+    bilingual_enabled: bool = False,
+    secondary_language: str = "",
+    dubbing_enabled: bool = False,
+    dubbed_audio_path: Optional[str] = None,
+    dubbing_bed_volume: float = 0.15,
+    backdrop_mode: str = "none",
+    backdrop_blur_intensity: float = 18.0,
+    backdrop_color: str = "#18181B",
+    depth_pop: float = 0.0,
+    privacy_blur_boxes: Optional[List[Dict[str, Any]]] = None,
+    beat_sync_enabled: bool = False,
+    spectrum_enabled: bool = False,
+    spectrum_position: str = "bottom",
+    spectrum_color: str = "#C6F32F",
+    chapters_enabled: bool = False,
+    chapters: Optional[List[Dict[str, Any]]] = None,
+    handle_watermark_enabled: bool = False,
+    handle_text: str = "",
+    handle_platform_icon: str = "none",
+    handle_corner: str = "bottom_right",
+    handle_opacity: float = 0.65,
+    handle_display_mode: str = "always",
+    options: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Complete ClipShip studio rendering pipeline with hash-based in-flight deduplication:
+    - Identical in-flight renders (`clip_id + start + end + options_hash`) attach & await the active render
+    - Option or timestamp changes supersede the older FFmpeg job cleanly
+    """
+    raw_params = dict(locals())
+    my_token = uuid.uuid4().hex
+    clip_key = (
+        f"pack_{project_id if project_id is not None else 0}_{clip_id}_{my_token}"
+        if allow_concurrent
+        else f"{project_id if project_id is not None else 0}:{clip_id}"
+    )
+    render_sig = compute_render_signature(
+        clip_id=clip_id,
+        project_id=project_id,
+        start_time=start_time,
+        duration=duration,
+        params=raw_params,
+    )
+    action, queue_entry = acquire_or_attach_render(clip_key, my_token, render_sig)
+    if action == "attach":
+        logger.info(f"Attaching to identical active render for {clip_key} (sig={render_sig[:10]})")
+        return await_attached_render(queue_entry)
+
+    try:
+        out_file = _render_clip_ultra_impl(**raw_params, _clip_key=clip_key, _my_token=my_token)
+        finish_render_entry(queue_entry, result_path=out_file)
+        return out_file
+    except BaseException as exc:
+        finish_render_entry(queue_entry, error=exc)
+        raise

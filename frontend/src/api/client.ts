@@ -155,6 +155,16 @@ export const api = {
     });
     return res.json();
   },
+  async resetSettingsDefaults(): Promise<any> {
+    const res = await fetch(`${API_BASE}/settings/reset`, {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to reset studio settings' }));
+      throw new Error(err.detail || 'Failed to reset studio settings');
+    }
+    return res.json();
+  },
 
   async testGeminiModels(apiKey?: string): Promise<TestGeminiResponse> {
     const res = await fetch(`${API_BASE}/system/test-gemini`, {
@@ -249,6 +259,21 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updates),
     });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || `Failed to update project (${res.status})`);
+    }
+    return res.json();
+  },
+
+  async duplicateProject(id: number): Promise<{ status: string; source_project_id: number; project: Project }> {
+    const res = await fetch(`${API_BASE}/projects/${id}/duplicate`, {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => null);
+      throw new Error(err?.detail || `Failed to duplicate project (${res.status})`);
+    }
     return res.json();
   },
 
@@ -339,11 +364,14 @@ export const api = {
     return res.json();
   },
 
-  async retryProject(id: number, forceOffline: boolean = false): Promise<{ status: string; project_id: number; resumed_stage?: string; force_offline?: boolean }> {
+  async retryProject(id: number, forceOffline: boolean = false, stage?: string): Promise<{ status: string; project_id: number; resumed_stage?: string; force_offline?: boolean }> {
     const res = await fetch(`${API_BASE}/projects/${id}/retry`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force_offline: forceOffline })
+      body: JSON.stringify({
+        force_offline: forceOffline,
+        ...(stage ? { stage } : {}),
+      })
     });
     if (!res.ok) {
       throw new Error(`Failed to retry project (${res.status})`);
@@ -385,7 +413,8 @@ export const api = {
     hardwareMode: string = 'gpu',
     aiMode?: 'gemini' | 'offline',
     defaultFraming: string = 'smart_auto',
-    batchQueue: boolean = false
+    batchQueue: boolean = false,
+    podcastMode: boolean = false
   ): Promise<{ project_id: number; job_id?: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
     const formData = new FormData();
     formData.append('file', file);
@@ -400,6 +429,7 @@ export const api = {
     formData.append('default_framing', defaultFraming || 'smart_auto');
     formData.append('framing_template', defaultFraming || 'smart_auto');
     formData.append('batch_queue', batchQueue ? 'true' : 'false');
+    formData.append('podcast_mode', podcastMode ? 'true' : 'false');
     if (aiMode) {
       formData.append('ai_mode', aiMode);
     }
@@ -429,7 +459,8 @@ export const api = {
     hardwareMode: string = 'gpu',
     aiMode?: 'gemini' | 'offline',
     defaultFraming: string = 'smart_auto',
-    batchQueue: boolean = false
+    batchQueue: boolean = false,
+    extraOpts?: { startTime?: string; endTime?: string; podcastMode?: boolean }
   ): Promise<{ project_id: number; job_id?: number; title: string; status?: string; ai_mode?: string; default_framing?: string }> {
     const res = await fetch(`${API_BASE}/ingest/youtube`, {
       method: 'POST',
@@ -449,7 +480,10 @@ export const api = {
         ai_mode: aiMode,
         default_framing: defaultFraming || 'smart_auto',
         framing_template: defaultFraming || 'smart_auto',
-        batch_queue: batchQueue
+        batch_queue: batchQueue,
+        ...(extraOpts?.startTime?.trim() ? { start_time: extraOpts.startTime.trim() } : {}),
+        ...(extraOpts?.endTime?.trim() ? { end_time: extraOpts.endTime.trim() } : {}),
+        ...(extraOpts?.podcastMode ? { podcast_mode: true } : {}),
       }),
     });
     if (!res.ok) {
@@ -495,7 +529,8 @@ export const api = {
     clipId: number,
     qualityMode: 'fast_preview' | 'final_hq' = 'final_hq',
     signal?: AbortSignal,
-    projectId?: number
+    projectId?: number,
+    overrides?: Record<string, any>
   ): Promise<{
     status: string;
     clip_status?: string;
@@ -513,7 +548,7 @@ export const api = {
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ quality_mode: qualityMode }),
+      body: JSON.stringify({ quality_mode: qualityMode, ...(overrides || {}) }),
       signal,
     });
     if (!res.ok) {
@@ -523,16 +558,102 @@ export const api = {
     return res.json();
   },
 
+  async getYouTubeStatus(): Promise<{
+    client_configured: boolean;
+    connected: boolean;
+    channel_title: string | null;
+    channel_id: string | null;
+  }> {
+    const res = await fetch(`${API_BASE}/youtube/auth/status`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to check YouTube connection status' }));
+      throw new Error(err.detail || 'Failed to check YouTube connection status');
+    }
+    return res.json();
+  },
+
+  async uploadYouTubeClientSecrets(file: File): Promise<{
+    client_configured: boolean;
+    connected: boolean;
+    channel_title: string | null;
+    channel_id: string | null;
+  }> {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch(`${API_BASE}/youtube/auth/client-secrets`, {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to upload Google OAuth client JSON' }));
+      throw new Error(err.detail || 'Failed to upload Google OAuth client JSON');
+    }
+    return res.json();
+  },
+
+  async connectYouTube(): Promise<{
+    client_configured: boolean;
+    connected: boolean;
+    channel_title: string | null;
+    channel_id: string | null;
+  }> {
+    const res = await fetch(`${API_BASE}/youtube/auth/connect`, {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to connect YouTube account' }));
+      throw new Error(err.detail || 'Failed to connect YouTube account');
+    }
+    return res.json();
+  },
+
+  async disconnectYouTube(): Promise<{
+    client_configured: boolean;
+    connected: boolean;
+    channel_title: string | null;
+    channel_id: string | null;
+  }> {
+    const res = await fetch(`${API_BASE}/youtube/auth/disconnect`, {
+      method: 'POST',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to disconnect YouTube account' }));
+      throw new Error(err.detail || 'Failed to disconnect YouTube account');
+    }
+    return res.json();
+  },
+
   async publishToYouTube(
     clipId: number,
-    data: { title?: string; description?: string; privacy_status?: string }
-  ): Promise<any> {
-    const res = await fetch(`${API_BASE}/publish/youtube?clip_id=${clipId}`, {
+    data: { title?: string; description?: string; tags?: string[]; privacy_status?: string },
+    projectId?: number
+  ): Promise<{
+    success: boolean;
+    video_id: string;
+    url: string;
+    privacy_status: string;
+    channel_title?: string | null;
+    channel_id?: string | null;
+  }> {
+    const endpoint =
+      projectId !== undefined
+        ? `${API_BASE}/clips/${projectId}/${clipId}/publish/youtube`
+        : `${API_BASE}/publish/youtube?clip_id=${clipId}`;
+    const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
     });
-    return res.json();
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const error = new Error(payload?.detail || payload?.message || 'YouTube upload failed');
+      (error as any).status = res.status;
+      throw error;
+    }
+    if (!payload?.video_id || !payload?.url) {
+      throw new Error('YouTube API did not return a valid uploaded video URL.');
+    }
+    return payload;
   },
 
   async getBrandPresets(): Promise<BrandPreset[]> {
@@ -624,7 +745,9 @@ export const api = {
     custom_height?: number;
     frame_layout?: string;
     framing_template?: string;
+    framing_user_locked?: boolean;
     webcam_corner?: string;
+    source_corner?: string;
     webcam_split_ratio?: number;
     pip_border_color?: string;
     source_webcam_region?: any;
@@ -669,6 +792,7 @@ export const api = {
     chroma_split?: number;
     letterbox?: string;
     speed_ramp?: number;
+    horizon_tilt?: number;
     bypass_color?: boolean;
     outro_cta_headline?: string;
     outro_cta_handle?: string;
@@ -699,6 +823,7 @@ export const api = {
     pos_y?: number;
     caption_x?: number;
     caption_y?: number;
+    caption_custom_position?: boolean;
     caption_rotation?: number;
     caption_max_width?: number;
     outline_width?: number;
@@ -757,10 +882,13 @@ export const api = {
     handle_opacity?: number;
     handle_display_mode?: string;
     use_cold_open?: boolean;
+    cold_open?: boolean;
     cold_open_quote?: string;
     auto_trim_dead_air?: boolean;
+    trim_dead_air?: boolean;
     silence_threshold?: number;
     dynamic_punch_zoom?: boolean;
+    punch_zoom?: boolean;
     punch_zoom_intensity?: number;
     options?: Record<string, any>;
   }): Promise<PreviewFrameResponse> {
@@ -780,8 +908,87 @@ export const api = {
     return `${API_BASE}/download/${projectId}/${clipId}`;
   },
 
-  getNleExportUrl(projectId: number, clipId: number, format: 'fcpxml' | 'premiere' | 'srt' | 'zip'): string {
+  getNleExportUrl(
+    projectId: number,
+    clipId: number,
+    format: 'fcpxml' | 'premiere' | 'edl' | 'srt' | 'vtt' | 'ass' | 'zip'
+  ): string {
     return `${API_BASE}/clips/${projectId}/${clipId}/export-nle?format=${format}`;
+  },
+
+  getExportCoverUrl(projectId: number, clipId: number, resolution?: string): string {
+    const q = resolution ? `?resolution=${encodeURIComponent(resolution)}` : '';
+    return `${API_BASE}/clips/${projectId}/${clipId}/export-cover${q}`;
+  },
+
+  async exportProMaster(
+    projectId: number,
+    clipId: number,
+    payload: {
+      format: 'mp4_h264' | 'mp4_hevc' | 'mov_prores' | 'webm_vp9' | 'audio_wav' | 'audio_mp3' | 'cover_png';
+      resolution?: string;
+      fps?: string;
+      quality_preset?: 'master_high' | 'social_balanced' | 'compact';
+      burn_captions?: boolean;
+    }
+  ): Promise<{ filename: string }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/export-pro`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to export deliverable' }));
+      throw new Error(err.detail || 'Failed to export deliverable');
+    }
+    const blob = await res.blob();
+    const disp = res.headers.get('Content-Disposition') || '';
+    const m = disp.match(/filename="?([^"]+)"?/i);
+    const filename = m ? m[1] : `lost_heaven_clip_${clipId}_export`;
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+    return { filename };
+  },
+
+  async exportBatchAspectsZip(
+    projectId: number,
+    clipId: number,
+    payload: {
+      aspects?: string[];
+      resolution?: string;
+      fps?: string;
+      quality_preset?: 'master_high' | 'social_balanced' | 'compact';
+      burn_captions?: boolean;
+    } = {}
+  ): Promise<{ filename: string }> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/export-batch-aspects`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to export multi-aspect batch .zip' }));
+      throw new Error(err.detail || 'Failed to export multi-aspect batch .zip');
+    }
+    const blob = await res.blob();
+    const disp = res.headers.get('Content-Disposition') || '';
+    const m = disp.match(/filename="?([^"]+)"?/i);
+    const filename = m ? m[1] : `lost_heaven_clip_${clipId}_multi_aspect.zip`;
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+    return { filename };
   },
 
   async getBrollSuggestions(projectId: number, clipId: number): Promise<{ suggestions: any[] }> {
@@ -1307,6 +1514,13 @@ export const api = {
     payload: {
       webcam_box?: { x: number; y: number; w: number; h: number } | null;
       focus_anchor?: { x: number; y: number } | null;
+      frame_crop?: { x: number; y: number; w: number; h: number } | null;
+      frame_crop_x?: number | null;
+      frame_crop_y?: number | null;
+      frame_crop_w?: number | null;
+      frame_crop_h?: number | null;
+      keyframe_start_crop?: { x: number; y: number; w: number; h: number } | null;
+      keyframe_end_crop?: { x: number; y: number; w: number; h: number } | null;
       lock_camera?: boolean;
       reset?: boolean;
     }
@@ -1378,6 +1592,17 @@ export const api = {
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: 'Clip reanalysis failed' }));
       throw new Error(err.detail || 'Clip reanalysis failed');
+    }
+    return res.json();
+  },
+
+  async applyRetentionFixes(projectId: number, clipId: number): Promise<any> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/apply-retention-fixes`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to apply smart retention fixes' }));
+      throw new Error(err.detail || 'Failed to apply smart retention fixes');
     }
     return res.json();
   },

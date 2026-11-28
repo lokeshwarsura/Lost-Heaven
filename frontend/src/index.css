@@ -7,12 +7,15 @@
 :root {
   --bg-canvas: #0D0D0D;
   --bg-surface: #121212;
+  --bg-elevated: #1F1F1F;
   --bg-card: #161616;
   --bg-input: #0D0D0D;
   --border-subtle: #262626;
   --text-primary: #F4F4F5;
   --text-secondary: #71717A;
+  --text-muted: #71717A;
   --accent-primary: #F59E0B;
+  --accent-secondary: #D97706;
   --accent-foreground: #000000;
 
   /* Backward compatibility */

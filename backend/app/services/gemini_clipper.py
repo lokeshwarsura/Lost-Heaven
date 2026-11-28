@@ -529,7 +529,11 @@ def build_gemini_prompt(
         emo_summ = multimodal_context.get("emotion_summary") or {}
         shifts = (multimodal_context.get("emotion_shifts") or [])[:8]
         ac_evs = (multimodal_context.get("acoustic_events") or [])[:10]
-        if peaks or cuts or emo_summ or ac_evs:
+        diar = multimodal_context.get("speaker_diarization") or {}
+        flu = multimodal_context.get("speech_fluency") or {}
+        mb = multimodal_context.get("music_bed_analysis") or {}
+        oz = multimodal_context.get("obstruction_zones") or {}
+        if peaks or cuts or emo_summ or ac_evs or diar or flu:
             peak_str = ", ".join(
                 f"{p.get('t', 0)}s (score {p.get('combined_score', 0)}, {p.get('reason', 'peak')})"
                 for p in peaks
@@ -542,13 +546,29 @@ def build_gemini_prompt(
                 f"{e.get('t', 0)}s {e.get('event_type', '')}"
                 for e in ac_evs
             )
+            ct_str = ", ".join(
+                f"{c.get('t', 0)}s-{c.get('end', 0)}s"
+                for c in (diar.get("crosstalk_overlaps") or [])[:8]
+            )
+            hk_str = ", ".join(
+                f"{h.get('t', 0)}s (fluency {h.get('fluency_score', 0)})"
+                for h in (flu.get("clean_hook_candidates") or [])[:8]
+            )
+            dom_ratios = diar.get("dominance_ratios") or summ.get("dominance_ratios") or {}
+            dom_str = ", ".join(f"{k} {int(round(float(v)*100))}%" for k, v in dom_ratios.items()) if dom_ratios else ""
             mm_clause = (
                 f"\nMULTIMODAL AUDIO, AFFECTIVE & VISUAL TELEMETRY (use these real energy spikes, emotional shifts & shot cuts):"
-                f"\n- Integrated LUFS: {summ.get('integrated_lufs', -24)} dB | Avg WPM: {summ.get('avg_wpm', 0)} | Avg Sharpness: {summ.get('avg_sharpness', 0)}/100"
+                f"\n- Integrated LUFS: {summ.get('integrated_lufs', -24)} dB | Avg WPM: {summ.get('avg_wpm', 0)} | Avg Fluency: {summ.get('avg_fluency_score', 78)}/100 | Avg Sharpness: {summ.get('avg_sharpness', 0)}/100"
+                f"\n- Gaze & Visual Novelty: Direct Eye-Contact={summ.get('avg_eye_contact_score', 0)}/100 | Visual Novelty={summ.get('avg_visual_novelty', 0)}/100 | Head Emphasis Spikes={summ.get('head_emphasis_count', 0)}"
                 + (
                     f"\n- Affective Profile: Facial={emo_summ.get('dominant_facial_emotion', 'neutral')} | Vocal={emo_summ.get('dominant_vocal_emotion', 'calm_storytelling')} | Peak Arousal={emo_summ.get('peak_arousal', 0)}/100 | Avg Valence={emo_summ.get('avg_valence', 0)}"
                     if emo_summ else ""
                 )
+                + (f"\n- Speaker Dominance: {dom_str}" if dom_str else "")
+                + (f"\n- Cross-Talk Debate Overlaps (viral clash cues): {ct_str}" if ct_str else "")
+                + (f"\n- Clean Hesitation-Free Hook Openings: {hk_str}" if hk_str else "")
+                + (f"\n- Existing Music Bed Detected: {bool(mb.get('has_existing_music', summ.get('has_existing_music', False)))}" if (mb or 'has_existing_music' in summ) else "")
+                + (f"\n- Safe Caption Y (HUD Check): {oz.get('recommended_caption_y', 0.78)}" if oz else "")
                 + (f"\n- Top Peak Moments: {peak_str}" if peak_str else "")
                 + (f"\n- Micro-Expression & Emotion Shifts: {shift_str}" if shift_str else "")
                 + (f"\n- Non-Verbal Acoustic Events: {ev_str}" if ev_str else "")

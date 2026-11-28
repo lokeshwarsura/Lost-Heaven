@@ -28,7 +28,7 @@ import numpy as np
 
 from app.config import settings
 from app.services import face_tracker
-from app.services.emotion_analyzer import analyze_facial_emotions
+from app.services.emotion_analyzer import analyze_facial_emotions, compute_head_pose_and_eye_contact
 from app.services.proxy import get_ffmpeg_cmd, probe_video
 
 logger = logging.getLogger("lost_heaven.video_analyzer")
@@ -349,7 +349,22 @@ def _evaluate_haar_eyes_and_expression(
             furrow = min(0.65, float(np.mean(np.abs(gx_b))) / 65.0)
             blend["browDownLeft"] = round(furrow, 4)
             blend["browDownRight"] = round(furrow, 4)
-    return prim, blend, eyes_open, round(float(max(0.0, min(100.0, 100.0 * (0.4 * blend["jawOpen"] + 0.3 * smile_est + 0.3 * eyes_open)))), 1), round(max(35.0, min(100.0, 100.0 - abs(float(prim.get("cx", 0.5)) - 0.5) * 75.0)), 1), next_rois
+
+    # Geometric bilateral eye-symmetry & horizontal iris alignment fallback
+    gaze_est = max(35.0, min(100.0, 100.0 - abs(float(prim.get("cx", 0.5)) - 0.5) * 75.0))
+    if upper_face.shape[0] >= 16 and upper_face.shape[1] >= 24:
+        uh_g, uw_g = upper_face.shape[:2]
+        lp = upper_face[int(uh_g * 0.45) : int(uh_g * 0.85), int(uw_g * 0.14) : int(uw_g * 0.44)]
+        rp = upper_face[int(uh_g * 0.45) : int(uh_g * 0.85), int(uw_g * 0.56) : int(uw_g * 0.86)]
+        if lp.size >= 12 and rp.size >= 12:
+            lp_norm_dark = float(np.mean(lp < np.percentile(lp, 30)))
+            rp_norm_dark = float(np.mean(rp < np.percentile(rp, 30)))
+            mean_bal = abs(float(np.mean(lp)) - float(np.mean(rp))) / max(20.0, float(np.std(upper_face)) + 18.0)
+            gaze_est = max(28.0, min(98.0, gaze_est * (1.0 - 0.38 * mean_bal) - abs(lp_norm_dark - rp_norm_dark) * 25.0))
+            if eye_count == 0 and len(faces) > 0:
+                gaze_est = min(gaze_est, 72.0)
+
+    return prim, blend, eyes_open, round(float(max(0.0, min(100.0, 100.0 * (0.4 * blend["jawOpen"] + 0.3 * smile_est + 0.3 * eyes_open)))), 1), round(gaze_est, 1), next_rois
 
 
 def _evaluate_mediapipe_face(
@@ -501,6 +516,224 @@ def compute_graphic_event_score(
     return round(max(0.0, min(100.0, best_zone_score)), 1)
 
 
+def _evaluate_band_text_hud_occupancy(band_gray: np.ndarray, zone_name: str, y_off: int, full_w: int, full_h: int) -> Tuple[bool, float, Optional[List[float]]]:
+    """
+    Detect crisp horizontal text / subtitle / HUD clusters inside `band_gray` using
+    morphological character stroke enhancement (`tophat + blackhat` + horizontal Sobel dx),
+    horizontal closing `(2, 13)`, and stroke-alternation validation (rejects solid blobs/backgrounds).
+    """
+    bh, bw = band_gray.shape[:2]
+    if bh < 10 or bw < 24:
+        return False, 0.0, None
+
+    k_stroke = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+    tophat = cv2.morphologyEx(band_gray, cv2.MORPH_TOPHAT, k_stroke)
+    blackhat = cv2.morphologyEx(band_gray, cv2.MORPH_BLACKHAT, k_stroke)
+    morph = cv2.max(tophat, blackhat)
+
+    gx = np.abs(cv2.Sobel(band_gray, cv2.CV_32F, 1, 0, ksize=3))
+    gx_u8 = np.clip(gx * 0.45, 0, 255).astype(np.uint8)
+    combined = cv2.max(morph, gx_u8)
+
+    # Require crisp high-contrast edges typical of captions/HUD overlays
+    _, mask = cv2.threshold(combined, 38, 255, cv2.THRESH_BINARY)
+    if float(np.mean(mask > 0)) < 0.01:
+        return False, 0.0, None
+
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 2))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+    num_lbl, _, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+
+    text_boxes: List[Tuple[int, int, int, int, float]] = []
+    min_box_w = max(14, int(round(bw * 0.08)))
+    for i in range(1, num_lbl):
+        bx, by, cw, ch, area = [int(v) for v in stats[i]]
+        if cw < min_box_w or ch < 5 or ch > int(bh * 0.72):
+            continue
+        aspect = float(cw) / float(max(1, ch))
+        if aspect < 1.65:
+            continue
+        roi_m = mask[by : by + ch, bx : bx + cw]
+        fill_raw = float(np.mean(roi_m > 0))
+        if fill_raw < 0.14 or fill_raw > 0.88:
+            continue
+        # Verify horizontal stroke transitions (text characters oscillate dark/light along row, solid rect does not)
+        row_mid = roi_m[ch // 2, :] > 0
+        crossings = int(np.sum(row_mid[1:] != row_mid[:-1]))
+        max_row_cross = max(
+            crossings,
+            int(np.max(np.sum((roi_m[:, 1:] > 0) != (roi_m[:, :-1] > 0), axis=1))) if ch > 0 else 0,
+        )
+        if max_row_cross < 5:
+            continue
+        roi_gray = band_gray[by : by + ch, bx : bx + cw]
+        p05, p95 = np.percentile(roi_gray, [5, 95])
+        contrast = float(p95 - p05)
+        if contrast < 55.0:
+            continue
+        box_score = min(100.0, (cw / float(max(1, bw))) * 140.0 + min(40.0, max_row_cross * 2.2) + min(25.0, (contrast - 55.0) * 0.25))
+        text_boxes.append((bx, by, cw, ch, box_score))
+
+    if not text_boxes:
+        return False, 0.0, None
+
+    tot_span_w = sum(b[2] for b in text_boxes)
+    best = max(text_boxes, key=lambda b: b[4])
+    x0_b = min(b[0] for b in text_boxes)
+    y0_b = min(b[1] for b in text_boxes)
+    x1_b = max(b[0] + b[2] for b in text_boxes)
+    y1_b = max(b[1] + b[3] for b in text_boxes)
+    occupied = (tot_span_w >= int(bw * 0.11)) or (best[4] >= 48.0)
+    score = round(min(100.0, max(best[4], (tot_span_w / float(max(1, bw))) * 120.0)), 1)
+    norm_rect = [
+        round((int(full_w * 0.08) + x0_b) / float(max(1, full_w)), 4),
+        round((y_off + y0_b) / float(max(1, full_h)), 4),
+        round((int(full_w * 0.08) + x1_b) / float(max(1, full_w)), 4),
+        round((y_off + y1_b) / float(max(1, full_h)), 4),
+        zone_name,
+    ]
+    return bool(occupied), score, norm_rect
+
+
+def detect_hud_obstruction_bands(frame_gray: np.ndarray) -> Dict[str, Any]:
+    """
+    Detect burned-in subtitles, lower-third banners, or game HUD bars in the top (5..28%)
+    and bottom (68..94%) bands of a frame, returning safe default caption Y placement.
+    """
+    h, w = frame_gray.shape[:2]
+    if h < 48 or w < 64:
+        return {
+            "top_hud_occupied": False,
+            "bottom_hud_occupied": False,
+            "top_hud_score": 0.0,
+            "bottom_hud_score": 0.0,
+            "recommended_caption_y": 0.78,
+            "detected_boxes": [],
+        }
+
+    x_s, x_e = int(w * 0.08), int(w * 0.92)
+    top_y0, top_y1 = int(h * 0.05), int(h * 0.28)
+    bot_y0, bot_y1 = int(h * 0.68), int(h * 0.94)
+
+    top_occ, top_sc, top_box = _evaluate_band_text_hud_occupancy(
+        frame_gray[top_y0:top_y1, x_s:x_e], "top_hud", top_y0, w, h
+    )
+    bot_occ, bot_sc, bot_box = _evaluate_band_text_hud_occupancy(
+        frame_gray[bot_y0:bot_y1, x_s:x_e], "bottom_hud", bot_y0, w, h
+    )
+
+    if bot_occ and not top_occ:
+        rec_y = 0.22
+    elif bot_occ and top_occ:
+        rec_y = 0.50
+    else:
+        rec_y = 0.78
+
+    boxes = [b for b in (top_box, bot_box) if b is not None]
+    return {
+        "top_hud_occupied": top_occ,
+        "bottom_hud_occupied": bot_occ,
+        "top_hud_score": top_sc,
+        "bottom_hud_score": bot_sc,
+        "recommended_caption_y": rec_y,
+        "detected_boxes": boxes,
+    }
+
+
+def compute_visual_saliency_and_novelty(
+    curr_gray: np.ndarray,
+    prev_state: Optional[Dict[str, Any]] = None,
+    *,
+    is_cut: bool = False,
+) -> Tuple[float, Dict[str, Any], Dict[str, Any]]:
+    """
+    Compute vectorized Spectral Residual Saliency + Local Contrast heatmaps on a `96x54` thumbnail:
+      - `saliency_rois`: `{primary_roi, secondary_roi}` up to 2 distinct focal zones
+      - `visual_novelty_score`: `0..100` measure of layout/B-roll/slide/HUD freshness vs previous frame
+    """
+    h, w = curr_gray.shape[:2]
+    sw, sh = 96, 54
+    tiny = cv2.resize(curr_gray, (sw, sh), interpolation=cv2.INTER_AREA).astype(np.float32)
+
+    # 1. Hou & Zhang Spectral Residual Saliency
+    fft = np.fft.fft2(tiny)
+    amp = np.abs(fft) + 1e-6
+    log_amp = np.log(amp)
+    phase = np.angle(fft)
+    avg_log = cv2.boxFilter(log_amp, -1, (3, 3))
+    spec_res = np.clip(log_amp - avg_log, -8.0, 8.0)
+    sal_spec = np.abs(np.fft.ifft2(np.exp(spec_res + 1j * phase))) ** 2
+    sal_spec = cv2.GaussianBlur(sal_spec.astype(np.float32), (5, 5), 1.5)
+    sp_max = float(np.max(sal_spec))
+    if sp_max > 1e-6:
+        sal_spec /= sp_max
+
+    # 2. Local contrast heatmap (DoG)
+    blur_wide = cv2.GaussianBlur(tiny, (9, 9), 2.2)
+    local_c = cv2.GaussianBlur(np.abs(tiny - blur_wide), (5, 5), 1.2)
+    lc_max = float(np.max(local_c))
+    if lc_max > 1e-6:
+        local_c /= lc_max
+
+    sal_map = np.clip(0.55 * sal_spec + 0.45 * local_c, 0.0, 1.0)
+    p85 = float(np.percentile(sal_map, 85))
+    thresh_val = max(0.32, p85)
+    sal_bin = ((sal_map >= thresh_val).astype(np.uint8)) * 255
+    num_lbl, _, stats, cents = cv2.connectedComponentsWithStats(sal_bin, connectivity=8)
+
+    candidates: List[Dict[str, float]] = []
+    for i in range(1, num_lbl):
+        bx, by, cw, ch, area = [int(v) for v in stats[i]]
+        if area < 6:
+            continue
+        mass = float(np.sum(sal_map[by : by + ch, bx : bx + cw]))
+        candidates.append({
+            "cx": round(max(0.05, min(0.95, float(cents[i][0]) / float(sw))), 4),
+            "cy": round(max(0.05, min(0.95, float(cents[i][1]) / float(sh))), 4),
+            "w": round(max(0.08, min(0.95, float(cw) / float(sw))), 4),
+            "h": round(max(0.08, min(0.95, float(ch) / float(sh))), 4),
+            "score": round(min(100.0, mass * 4.5), 1),
+        })
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+
+    primary_roi = candidates[0] if candidates else {"cx": 0.5, "cy": 0.45, "w": 0.4, "h": 0.4, "score": 20.0}
+    secondary_roi: Optional[Dict[str, float]] = None
+    for cand in candidates[1:]:
+        dist = math.hypot(cand["cx"] - primary_roi["cx"], cand["cy"] - primary_roi["cy"])
+        if dist >= 0.16 and cand["score"] >= primary_roi["score"] * 0.25:
+            secondary_roi = cand
+            break
+
+    saliency_rois: Dict[str, Any] = {
+        "primary_roi": primary_roi,
+        "secondary_roi": secondary_roi,
+    }
+
+    # 3. Visual novelty curve (layout structural diff + saliency redistribution + scene cut boost)
+    grid = cv2.resize(tiny, (12, 8), interpolation=cv2.INTER_AREA)
+    grid_norm = (grid - float(np.mean(grid))) / max(12.0, float(np.std(grid)))
+    sal_grid = cv2.resize(sal_map, (12, 8), interpolation=cv2.INTER_AREA)
+
+    novelty_score = 0.0
+    if isinstance(prev_state, dict) and prev_state.get("grid") is not None:
+        prev_grid = prev_state["grid"]
+        prev_raw = prev_state["raw_tiny"]
+        prev_sal = prev_state["sal_grid"]
+
+        raw_diff = float(np.mean(np.abs(grid - prev_raw))) / 72.0
+        struct_diff = float(np.mean(np.abs(grid_norm - prev_grid))) / 1.45
+        sal_diff = float(np.mean(np.abs(sal_grid - prev_sal))) / 0.30
+        nov_01 = min(1.0, 0.42 * raw_diff + 0.34 * struct_diff + 0.24 * sal_diff + (0.28 if is_cut else 0.0))
+        novelty_score = round(nov_01 * 100.0, 1)
+
+    next_state = {
+        "raw_tiny": grid,
+        "grid": grid_norm,
+        "sal_grid": sal_grid,
+    }
+    return novelty_score, saliency_rois, next_state
+
+
 def _compute_composition_score(
     primary_face: Optional[Dict[str, float]],
     salient_cx: float,
@@ -619,6 +852,8 @@ def analyze_video_track(
         prev_hist: Optional[np.ndarray] = None
         prev_mouth_rois: List[Tuple[float, float, np.ndarray]] = []
         emo_state: Dict[str, Any] = {}
+        head_state: Dict[str, Any] = {}
+        sal_state: Optional[Dict[str, Any]] = None
         active_speaker_sides: List[Optional[str]] = []
         cached_face_payload: Optional[Tuple[int, Optional[Dict[str, float]], Dict[str, float], float, float, float, Any]] = None
         black_start_t: Optional[float] = None
@@ -681,6 +916,10 @@ def analyze_video_track(
             sharpness, exposure = compute_frame_sharpness_and_exposure(small)
             action_score, scx, scy = _compute_optical_flow_action(gray, None if is_cut_here else prev_gray)
             graphic_event_score = compute_graphic_event_score(gray, prev_gray, is_cut=is_cut_here)
+            visual_novelty_score, saliency_rois, sal_state = compute_visual_saliency_and_novelty(
+                gray, sal_state, is_cut=is_cut_here
+            )
+            hud_info = detect_hud_obstruction_bands(gray)
             prev_gray = gray
 
             is_black = float(np.mean(gray)) < 16.0
@@ -715,6 +954,7 @@ def analyze_video_track(
 
             if is_cut_here:
                 emo_state.clear()
+                head_state.clear()
 
             if int(face_count or 0) > 0:
                 emo = analyze_facial_emotions(
@@ -723,6 +963,19 @@ def analyze_video_track(
                     prev_state=emo_state,
                     timestamp=float(t_abs),
                 )
+                gaze_pose = compute_head_pose_and_eye_contact(
+                    landmarks=mp_lms,
+                    primary_face=primary_face,
+                    prev_head_state=head_state,
+                    timestamp=float(t_abs),
+                    haar_gaze_proxy=gaze_score,
+                )
+                eye_contact_val = float(gaze_pose["eye_contact_score"])
+                gaze_eng_val = float(gaze_pose["gaze_engagement_score"])
+                head_yaw = float(gaze_pose["head_yaw_deg"])
+                head_pitch = float(gaze_pose["head_pitch_deg"])
+                head_roll = float(gaze_pose["head_roll_deg"])
+                head_spike = bool(gaze_pose["head_emphasis_spike"])
                 emotion_intensity = round(max(float(emotion_intensity or 0.0), float(emo["arousal"])), 1)
                 active_speaker_sides.append("left" if (primary_face and float(primary_face.get("cx", 0.5)) < 0.48) else "right")
             else:
@@ -734,6 +987,12 @@ def analyze_video_track(
                     "emotion_delta": 0.0,
                     "is_micro_expression_spike": False,
                 }
+                eye_contact_val = 0.0
+                gaze_eng_val = 0.0
+                head_yaw = 0.0
+                head_pitch = 0.0
+                head_roll = 0.0
+                head_spike = False
                 active_speaker_sides.append(None)
 
             shot_scale = classify_shot_scale(face_count, primary_face, action_score)
@@ -757,7 +1016,18 @@ def analyze_video_track(
                 "emotion_delta": emo["emotion_delta"],
                 "shot_scale": shot_scale,
                 "graphic_event_score": graphic_event_score,
-                "gaze_score": gaze_score,
+                "visual_novelty_score": visual_novelty_score,
+                "saliency_rois": saliency_rois,
+                "gaze_score": eye_contact_val if face_count > 0 else gaze_score,
+                "eye_contact_score": eye_contact_val,
+                "gaze_engagement_score": gaze_eng_val,
+                "head_yaw_deg": head_yaw,
+                "head_pitch_deg": head_pitch,
+                "head_roll_deg": head_roll,
+                "head_emphasis_spike": head_spike,
+                "top_hud_occupied": hud_info["top_hud_occupied"],
+                "bottom_hud_occupied": hud_info["bottom_hud_occupied"],
+                "recommended_caption_y": hud_info["recommended_caption_y"],
                 "is_black": bool(is_black),
                 "is_cut": bool(is_cut_here),
             })
@@ -866,6 +1136,40 @@ def analyze_video_track(
             prev_side = side
     speaker_switch_rate = round((switches / max(1.0, float(span_dur))) * 10.0, 2)
 
+    # Phase 2 aggregate gaze, visual novelty & HUD obstruction telemetry
+    face_frames = [f for f in frames_out if int(f.get("face_count", 0)) > 0]
+    avg_eye_contact = (
+        round(sum(float(f.get("eye_contact_score", 0.0)) for f in face_frames) / len(face_frames), 1)
+        if face_frames else 0.0
+    )
+    avg_gaze_engagement = (
+        round(sum(float(f.get("gaze_engagement_score", 0.0)) for f in face_frames) / len(face_frames), 1)
+        if face_frames else 0.0
+    )
+    head_emphasis_count = sum(1 for f in frames_out if f.get("head_emphasis_spike"))
+    avg_visual_novelty = (
+        round(sum(float(f.get("visual_novelty_score", 0.0)) for f in frames_out) / n_f, 1)
+        if frames_out else 0.0
+    )
+    top_occ_ratio = sum(1 for f in frames_out if f.get("top_hud_occupied")) / float(n_f)
+    bot_occ_ratio = sum(1 for f in frames_out if f.get("bottom_hud_occupied")) / float(n_f)
+    top_hud_occ = bool(top_occ_ratio >= 0.20)
+    bot_hud_occ = bool(bot_occ_ratio >= 0.20)
+    if bot_hud_occ and not top_hud_occ:
+        rec_cap_y = 0.22
+    elif bot_hud_occ and top_hud_occ:
+        rec_cap_y = 0.50
+    else:
+        rec_cap_y = 0.78
+    obstruction_zones = {
+        "top_hud_occupied": top_hud_occ,
+        "bottom_hud_occupied": bot_hud_occ,
+        "top_occupancy_ratio": round(top_occ_ratio, 3),
+        "bottom_occupancy_ratio": round(bot_occ_ratio, 3),
+        "recommended_caption_y": rec_cap_y,
+    }
+    dual_roi_frames = sum(1 for f in frames_out if (f.get("saliency_rois") or {}).get("secondary_roi"))
+
     return {
         "summary": {
             "duration": round(float(span_dur), 3),
@@ -887,8 +1191,17 @@ def analyze_video_track(
             "graphic_event_count": len(graphic_events),
             "micro_expression_count": len(micro_expression_spikes),
             "speaker_switch_rate": speaker_switch_rate,
+            "avg_eye_contact_score": avg_eye_contact,
+            "avg_gaze_engagement_score": avg_gaze_engagement,
+            "head_emphasis_count": head_emphasis_count,
+            "avg_visual_novelty": avg_visual_novelty,
+            "dual_roi_ratio": round(dual_roi_frames / float(n_f), 3),
+            "top_hud_occupied": top_hud_occ,
+            "bottom_hud_occupied": bot_hud_occ,
+            "recommended_caption_y": rec_cap_y,
             "timed_out": timed_out,
         },
+        "obstruction_zones": obstruction_zones,
         "scene_cuts": scene_cuts,
         "black_intervals": black_intervals,
         "graphic_events": graphic_events,

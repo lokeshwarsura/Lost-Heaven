@@ -250,6 +250,9 @@ export const HomeView: React.FC<HomeViewProps> = ({
   const [inspectingLocal, setInspectingLocal] = useState(false);
 
   const [ytUrl, setYtUrl] = useState('');
+  const [ytStartTime, setYtStartTime] = useState('');
+  const [ytEndTime, setYtEndTime] = useState('');
+  const [podcastMode, setPodcastMode] = useState(false);
   const [ytInfo, setYtInfo] = useState<YouTubeMetadataInfo | null>(null);
   const [fetchingYtInfo, setFetchingYtInfo] = useState(false);
   const [ytError, setYtError] = useState<string | null>(null);
@@ -395,11 +398,19 @@ export const HomeView: React.FC<HomeViewProps> = ({
 
   const handleLocalFilePicked = async (files: FileList | File[]) => {
     const arr = Array.from(files).filter((f) =>
-      /\.(mp4|mov|mkv|webm|avi)$/i.test(f.name) || f.type.startsWith('video/')
+      /\.(mp4|mov|mkv|webm|avi|mp3|wav|m4a|aac|flac|ogg)$/i.test(f.name) ||
+      f.type.startsWith('video/') ||
+      f.type.startsWith('audio/')
     );
     if (arr.length === 0) {
-      setSubmitError('Please select a supported video file (.mp4, .mov, .mkv, .webm).');
+      setSubmitError('Please select a supported video or audio file (.mp4, .mov, .mkv, .webm, .mp3, .wav, .m4a).');
       return;
+    }
+    const isAudioDrop = arr.some(
+      (f) => /\.(mp3|wav|m4a|aac|flac|ogg)$/i.test(f.name) || f.type.startsWith('audio/')
+    );
+    if (isAudioDrop) {
+      setPodcastMode(true);
     }
     setSubmitError(null);
     setYtError(null);
@@ -505,7 +516,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
             hardwareMode,
             chosenAiMode,
             defaultFraming,
-            allBatchFiles.length > 1
+            allBatchFiles.length > 1,
+            podcastMode
           );
           if (i === 0) {
             firstPid = res.project_id;
@@ -529,7 +541,8 @@ export const HomeView: React.FC<HomeViewProps> = ({
           hardwareMode,
           chosenAiMode,
           defaultFraming,
-          false
+          false,
+          podcastMode
         );
         notifyJobStarted(res.project_id, res.job_id ?? res.project_id);
         return;
@@ -547,7 +560,12 @@ export const HomeView: React.FC<HomeViewProps> = ({
           hardwareMode,
           chosenAiMode,
           defaultFraming,
-          false
+          false,
+          {
+            startTime: ytStartTime.trim() || undefined,
+            endTime: ytEndTime.trim() || undefined,
+            podcastMode,
+          }
         );
         notifyJobStarted(res.project_id, res.job_id ?? res.project_id);
         return;
@@ -708,7 +726,7 @@ export const HomeView: React.FC<HomeViewProps> = ({
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept=".mp4,.mov,.mkv,.webm,.avi,video/*"
+                accept=".mp4,.mov,.mkv,.webm,.avi,.mp3,.wav,.m4a,.aac,.flac,.ogg,video/*,audio/*"
                 className="hidden"
                 onChange={(e) => e.target.files && handleLocalFilePicked(e.target.files)}
               />
@@ -939,6 +957,49 @@ export const HomeView: React.FC<HomeViewProps> = ({
                     {ytError}
                   </p>
                 )}
+
+                {/* Chapter / Time-Range Trim + Podcast Visualizer Toggle */}
+                <div className="pt-2 grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
+                  <div className="sm:col-span-3">
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-1">
+                      Start (MM:SS)
+                    </label>
+                    <input
+                      type="text"
+                      value={ytStartTime}
+                      onChange={(e) => setYtStartTime(e.target.value)}
+                      placeholder="00:00"
+                      className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-primary)]"
+                    />
+                  </div>
+                  <div className="sm:col-span-3">
+                    <label className="block text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-1">
+                      End (MM:SS)
+                    </label>
+                    <input
+                      type="text"
+                      value={ytEndTime}
+                      onChange={(e) => setYtEndTime(e.target.value)}
+                      placeholder="Optional"
+                      className="w-full px-2.5 py-1.5 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-xs font-mono text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-primary)]"
+                    />
+                  </div>
+                  <div className="sm:col-span-6">
+                    <button
+                      type="button"
+                      onClick={() => setPodcastMode((v) => !v)}
+                      className={`w-full px-3 py-1.5 rounded-lg border text-xs font-bold flex items-center justify-between transition ${
+                        podcastMode
+                          ? 'bg-[var(--accent-soft)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
+                          : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                      }`}
+                      title="Download/accept audio-only podcast tracks and generate a sleek dark visualizer canvas + live spectrum"
+                    >
+                      <span>Podcast / Visualizer Mode</span>
+                      <span className="font-mono text-[10px]">{podcastMode ? 'ON' : 'OFF'}</span>
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
 

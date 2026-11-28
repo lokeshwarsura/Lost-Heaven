@@ -16,11 +16,14 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import cv2
-
+from app.services.proxy import get_ffmpeg_cmd
 from app.services.video_analyzer import analyze_video_track
 
 logger = logging.getLogger("lost_heaven.best_frame_engine")
@@ -80,6 +83,132 @@ def _score_roles(frame: Dict[str, Any], audio_exc: float) -> Dict[str, float]:
     }
 
 
+def _synthesize_clip_candidates_from_timeline(
+    all_frames: List[Dict[str, Any]],
+    existing_window: List[Dict[str, Any]],
+    s_t: float,
+    e_t: float,
+    max_frames: int,
+) -> List[Dict[str, Any]]:
+    """
+    Pure-Python (<1ms) candidate interpolation when a clip spans fewer than 3 frames
+    in the precomputed global `video_analysis["frames"]` list. Avoids slow 4K re-decoding.
+    """
+    existing_ts = [float(fr.get("t", -999.0)) for fr in existing_window]
+    span = max(0.25, e_t - s_t)
+    target_count = max(max_frames, 4)
+    step = span / float(target_count + 1)
+    interpolated: List[Dict[str, Any]] = []
+    for i in range(1, target_count + 1):
+        ts = round(min(e_t - 0.05, max(s_t, s_t + step * i)), 3)
+        if any(abs(ts - prev_t) < 0.35 for prev_t in existing_ts):
+            continue
+        nearest = min(all_frames, key=lambda fr: abs(float(fr.get("t", ts)) - ts))
+        cand = dict(nearest)
+        cand["t"] = ts
+        cand["synthetic_interp"] = True
+        interpolated.append(cand)
+        existing_ts.append(ts)
+    return interpolated
+
+
+def _extract_stills_ffmpeg(
+    video_path: str,
+    timestamps: List[float],
+    out_paths: List[Path],
+    budget_sec: float = 15.0,
+) -> List[bool]:
+    """
+    Extract up to 6 keyframe JPEG stills using fast FFmpeg input-seeking (`-ss <t> -i <video>`)
+    within a hard `budget_sec` deadline, capped to `min(1280,iw)` width to stay fast on 4K sources.
+    """
+    if not timestamps or not video_path or not os.path.exists(video_path):
+        return [False] * len(timestamps)
+
+    ffmpeg = get_ffmpeg_cmd()
+    resolved_video = str(Path(video_path).resolve())
+    results = [False] * len(timestamps)
+    deadline = time.monotonic() + max(2.0, float(budget_sec))
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="lost_heaven_bf_"))
+    try:
+        # 1. Single-invocation multi-input fast seek (avoids 6 separate container opens)
+        batched_tmp_files = [tmp_dir / f"still_{i}.jpg" for i in range(len(timestamps))]
+        batch_cmd: List[str] = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        for t_sec in timestamps:
+            batch_cmd.extend(["-hwaccel", "auto", "-ss", f"{max(0.0, float(t_sec)):.3f}", "-i", resolved_video])
+        for i, tmp_jpg in enumerate(batched_tmp_files):
+            batch_cmd.extend([
+                "-map", f"{i}:v:0",
+                "-frames:v", "1",
+                "-vf", "scale='min(1280,iw)':-2",
+                "-q:v", "3",
+                str(tmp_jpg),
+            ])
+
+        try:
+            rem = max(2.0, deadline - time.monotonic())
+            subprocess.run(
+                batch_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=rem,
+                check=False,
+            )
+            for i, (tmp_jpg, dst_jpg) in enumerate(zip(batched_tmp_files, out_paths)):
+                if tmp_jpg.exists() and tmp_jpg.stat().st_size > 0:
+                    dst_jpg.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(tmp_jpg), str(dst_jpg))
+                    results[i] = True
+            if all(results):
+                return results
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Batched FFmpeg keyframe extraction hit {budget_sec:.1f}s timeout")
+        except Exception as e:
+            logger.debug(f"Batched keyframe seek fallback triggered: {e}")
+
+        # 2. Per-frame software-seek fallback only for any missing stills, respecting remaining budget
+        for i, (t_sec, dst_jpg) in enumerate(zip(timestamps, out_paths)):
+            if results[i]:
+                continue
+            rem = deadline - time.monotonic()
+            if rem <= 0.5:
+                break
+            tmp_jpg = tmp_dir / f"single_{i}.jpg"
+            single_cmd = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-ss", f"{max(0.0, float(t_sec)):.3f}",
+                "-i", resolved_video,
+                "-frames:v", "1",
+                "-vf", "scale='min(1280,iw)':-2",
+                "-q:v", "3",
+                str(tmp_jpg),
+            ]
+            try:
+                subprocess.run(
+                    single_cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=max(1.0, rem),
+                    check=False,
+                )
+                if tmp_jpg.exists() and tmp_jpg.stat().st_size > 0:
+                    dst_jpg.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(str(tmp_jpg), str(dst_jpg))
+                    results[i] = True
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Keyframe extraction still {i} timed out at {t_sec:.2f}s")
+                break
+            except Exception:
+                continue
+        return results
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def extract_best_frames(
     video_path: str,
     video_analysis: Optional[Dict[str, Any]],
@@ -101,16 +230,37 @@ def extract_best_frames(
     s_t = max(0.0, float(start_time or 0.0))
     e_t = max(s_t + 0.25, float(end_time or (s_t + 5.0)))
 
-    # Reuse matching span from video_analysis or analyze window on demand
+    # Reuse precomputed video_analysis timeline scores in pure Python (<5 ms) without re-running 4K decode
     window_frames: List[Dict[str, Any]] = []
-    if isinstance(video_analysis, dict) and video_analysis.get("frames"):
+    precomputed_frames = (
+        list(video_analysis.get("frames") or [])
+        if isinstance(video_analysis, dict)
+        else []
+    )
+    if precomputed_frames:
         window_frames = [
-            dict(fr) for fr in video_analysis["frames"]
+            dict(fr) for fr in precomputed_frames
             if (s_t - 0.08) <= float(fr.get("t", -1.0)) <= (e_t + 0.08)
         ]
-
-    if len(window_frames) < 3 and video_path and os.path.exists(video_path):
-        local_va = analyze_video_track(video_path, sample_fps=4.0, start_time=s_t, end_time=e_t)
+        if len(window_frames) < 3:
+            window_frames.extend(
+                _synthesize_clip_candidates_from_timeline(
+                    precomputed_frames,
+                    window_frames,
+                    s_t,
+                    e_t,
+                    max_frames=max_frames,
+                )
+            )
+    elif video_path and os.path.exists(video_path):
+        local_va = analyze_video_track(
+            video_path,
+            sample_fps=min(2.0, 24.0 / max(1.0, e_t - s_t)),
+            start_time=s_t,
+            end_time=e_t,
+            max_frames=24,
+            watchdog_sec=12.0,
+        )
         window_frames = [
             dict(fr) for fr in (local_va.get("frames") or [])
             if (s_t - 0.08) <= float(fr.get("t", -1.0)) <= (e_t + 0.08)
@@ -201,50 +351,39 @@ def extract_best_frames(
                 if best_face_item["role"] == "highlight_moment":
                     best_face_item["role"] = "peak_emotion"
 
-    # Extract full-resolution quality=95 JPEG stills safely across Unicode paths
+    # Extract JPEG stills using fast FFmpeg input-seeking (15s cap per clip, no slow 4K OpenCV seeks)
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     selected.sort(key=lambda item: float(item["composite_score"]), reverse=True)
+    chosen = selected[:max_frames]
+
+    timestamps = [round(float(item["t"]), 3) for item in chosen]
+    img_files = [
+        out_path / f"best_frame_{project_id}_{clip_id}_{idx}_{item['role']}.jpg"
+        for idx, item in enumerate(chosen)
+    ]
+    saved_flags = _extract_stills_ffmpeg(video_path, timestamps, img_files, budget_sec=15.0)
 
     final_frames: List[Dict[str, Any]] = []
-    cap = cv2.VideoCapture(str(Path(video_path).resolve())) if (video_path and os.path.exists(video_path)) else None
-    try:
-        for idx, item in enumerate(selected[:max_frames]):
-            t_sec = round(float(item["t"]), 3)
-            img_name = f"best_frame_{project_id}_{clip_id}_{idx}_{item['role']}.jpg"
-            img_file = out_path / img_name
-            saved_ok = False
-
-            if cap is not None and cap.isOpened():
-                cap.set(cv2.CAP_PROP_POS_MSEC, t_sec * 1000.0)
-                ok, raw_fr = cap.read()
-                if ok and raw_fr is not None:
-                    enc_ok, buf = cv2.imencode(".jpg", raw_fr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-                    if enc_ok:
-                        img_file.write_bytes(buf.tobytes())
-                        saved_ok = True
-
-            final_frames.append({
-                "index": idx,
-                "role": item["role"],
-                "t": t_sec,
-                "rel_t": round(max(0.0, t_sec - s_t), 3),
-                "composite_score": float(item["composite_score"]),
-                "sharpness_score": float(item.get("sharpness_score", 0.0)),
-                "exposure_score": float(item.get("exposure_score", 0.0)),
-                "action_score": float(item.get("action_score", 0.0)),
-                "composition_score": float(item.get("composition_score", 50.0)),
-                "emotion_intensity": float(item.get("emotion_intensity", 0.0)),
-                "eyes_open_confidence": float(item.get("eyes_open_confidence", 1.0)),
-                "gaze_score": float(item.get("gaze_score", 50.0)),
-                "audio_excitement": float(item.get("audio_excitement", 50.0)),
-                "face_count": int(item.get("face_count", 0)),
-                "image_path": str(img_file.resolve()) if saved_ok else "",
-                "image_url": f"/api/clips/{project_id}/{clip_id}/best-frames/{idx}/image" if (project_id and clip_id and saved_ok) else "",
-            })
-    finally:
-        if cap is not None:
-            cap.release()
+    for idx, (item, t_sec, img_file, saved_ok) in enumerate(zip(chosen, timestamps, img_files, saved_flags)):
+        final_frames.append({
+            "index": idx,
+            "role": item["role"],
+            "t": t_sec,
+            "rel_t": round(max(0.0, t_sec - s_t), 3),
+            "composite_score": float(item["composite_score"]),
+            "sharpness_score": float(item.get("sharpness_score", 0.0)),
+            "exposure_score": float(item.get("exposure_score", 0.0)),
+            "action_score": float(item.get("action_score", 0.0)),
+            "composition_score": float(item.get("composition_score", 50.0)),
+            "emotion_intensity": float(item.get("emotion_intensity", 0.0)),
+            "eyes_open_confidence": float(item.get("eyes_open_confidence", 1.0)),
+            "gaze_score": float(item.get("gaze_score", 50.0)),
+            "audio_excitement": float(item.get("audio_excitement", 50.0)),
+            "face_count": int(item.get("face_count", 0)),
+            "image_path": str(img_file.resolve()) if saved_ok else "",
+            "image_url": f"/api/clips/{project_id}/{clip_id}/best-frames/{idx}/image" if (project_id and clip_id and saved_ok) else "",
+        })
 
     return {
         "clip_id": int(clip_id),

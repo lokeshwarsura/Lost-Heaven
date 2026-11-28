@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     WHISPER_BATCH_SIZE: int = 4
     VIDEO_ENCODER: str = "auto"
     DEFAULT_RESOLUTION: str = "1080p"
+    DEFAULT_FPS: str = "source"
+    LOUDNESS_TARGET: str = "-14 LUFS"
+    AUDIO_NORMALIZATION_ENABLED: bool = True
+    AUTO_CLEANUP_DAYS: int = 30
     VISION_SCAN_FPS: float = 1.2
 
     BACKEND_HOST: str = "0.0.0.0"
@@ -51,8 +55,8 @@ class Settings(BaseSettings):
 
     STORAGE_DIR: str = DEFAULT_STORAGE_DIR
 
-    YOUTUBE_CLIENT_SECRETS_FILE: str = str(BASE_DIR / "client_secrets.json")
-    YOUTUBE_TOKEN_FILE: str = str(BASE_DIR / "youtube_token.json")
+    YOUTUBE_CLIENT_SECRETS_FILE: str = str(Path(DEFAULT_STORAGE_DIR) / "youtube_client_secrets.json")
+    YOUTUBE_TOKEN_FILE: str = str(Path(DEFAULT_STORAGE_DIR) / "youtube_token.json")
 
     HARDWARE_ACCELERATION: str = "auto"
 

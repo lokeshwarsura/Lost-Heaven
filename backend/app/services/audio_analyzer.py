@@ -196,6 +196,781 @@ ACOUSTIC_EVENT_LABELS: Dict[str, str] = {
 }
 
 
+_MEL_CACHE: Dict[Tuple[int, int, int], Tuple[np.ndarray, np.ndarray]] = {}
+
+_FLUENCY_FILLERS_SINGLE = {"um", "uh", "ah", "er", "hmm", "like", "basically", "literally"}
+_FLUENCY_FILLERS_BIGRAM = {("you", "know"), ("sort", "of"), ("kind", "of"), ("i", "mean")}
+
+
+def _get_mel_dct_matrices(n_freqs: int, sr: int, n_mels: int = 26, n_mfcc: int = 13) -> Tuple[np.ndarray, np.ndarray]:
+    """Cached vectorized 26-band Mel filterbank & 13-band DCT-II transform matrices (pure NumPy)."""
+    key = (n_freqs, sr, n_mels)
+    if key in _MEL_CACHE:
+        return _MEL_CACHE[key]
+
+    fft_freqs = np.linspace(0.0, float(sr) / 2.0, n_freqs, dtype=np.float32)
+    fmin = 80.0
+    fmax = min(7600.0, float(sr) * 0.49)
+    mel_min = 2595.0 * math.log10(1.0 + fmin / 700.0)
+    mel_max = 2595.0 * math.log10(1.0 + fmax / 700.0)
+    mel_pts = np.linspace(mel_min, mel_max, n_mels + 2, dtype=np.float32)
+    hz_pts = 700.0 * (10.0 ** (mel_pts / 2595.0) - 1.0)
+
+    fb = np.zeros((n_mels, n_freqs), dtype=np.float32)
+    for m in range(n_mels):
+        left, center, right = float(hz_pts[m]), float(hz_pts[m + 1]), float(hz_pts[m + 2])
+        if center > left:
+            up = (fft_freqs - left) / (center - left)
+            fb[m] += np.maximum(0.0, np.minimum(1.0, up))
+        if right > center:
+            down = (right - fft_freqs) / (right - center)
+            fb[m] = np.minimum(fb[m], np.maximum(0.0, down))
+
+    dct = (
+        np.cos(np.pi * np.arange(n_mfcc, dtype=np.float32)[:, None] * (np.arange(n_mels, dtype=np.float32)[None, :] + 0.5) / float(n_mels))
+        * math.sqrt(2.0 / float(n_mels))
+    ).astype(np.float32)
+    _MEL_CACHE[key] = (fb, dct)
+    return fb, dct
+
+
+def _estimate_pitch_hnr_dual_batch(
+    chunks: np.ndarray,
+    sr: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized batched FFT autocorrelation across `(B, win_samples)` returning:
+      - f0_hz: (B,) primary fundamental frequency in [75..420 Hz]
+      - hnr_norm: (B,) harmonicity proxy in [0..0.995]
+      - dual_pitch_ratio: (B,) strength of competing non-octave secondary F0 peak [0..1]
+      - dual_f0_hz: (B,) secondary F0 frequency if detected
+    Runs ~2400 bins (10-minute WAV) in < 30ms with zero Python per-sample loops.
+    """
+    b_cnt, n_win = chunks.shape
+    f0_out = np.zeros(b_cnt, dtype=np.float32)
+    hnr_out = np.zeros(b_cnt, dtype=np.float32)
+    dual_ratio_out = np.zeros(b_cnt, dtype=np.float32)
+    dual_f0_out = np.zeros(b_cnt, dtype=np.float32)
+
+    if b_cnt == 0 or n_win < int(sr * 0.04):
+        return f0_out, hnr_out, dual_ratio_out, dual_f0_out
+
+    min_lag = max(1, int(sr / 420.0))
+    max_lag = min(n_win // 2, int(sr / 75.0))
+    n_sub = min(n_win, int(sr * 0.08))
+    if max_lag <= min_lag + 2 or n_sub < max_lag + 2:
+        return f0_out, hnr_out, dual_ratio_out, dual_f0_out
+
+    sub = chunks[:, :n_sub]
+    sub = sub - np.mean(sub, axis=1, keepdims=True)
+    rms = np.sqrt(np.mean(sub * sub, axis=1))
+    n_fft = 1 << int(math.ceil(math.log2(n_sub * 2)))
+
+    spec = np.fft.rfft(sub, n=n_fft, axis=1)
+    acf = np.fft.irfft(spec * np.conj(spec), n=n_fft, axis=1)[:, : max_lag + 1]
+
+    lags = np.arange(max_lag + 1, dtype=np.float32)
+    overlap_weight = np.maximum(0.25, 1.0 - (lags / float(max(1, n_sub))))
+    denom = np.maximum(1e-8, acf[:, :1]) * overlap_weight[None, :]
+    acf_norm = np.clip(acf / denom, 0.0, 0.995)
+
+    band = acf_norm[:, min_lag : max_lag + 1]  # (B, L)
+    cand_freqs = float(sr) / np.maximum(1.0, lags[min_lag : max_lag + 1])  # (L,)
+    best_rel = np.argmax(band, axis=1)
+    rows = np.arange(b_cnt)
+    peak_corr = band[rows, best_rel]
+    voiced = (rms >= 0.006) & (acf[:, 0] > 1e-8)
+
+    hnr_out = np.where(voiced, peak_corr, 0.0).astype(np.float32)
+    has_pitch = voiced & (peak_corr >= 0.30)
+    best_lag = min_lag + best_rel
+    f0_vals = float(sr) / np.maximum(1.0, best_lag.astype(np.float32))
+    f0_out = np.where(has_pitch, f0_vals, 0.0).astype(np.float32)
+
+    # Secondary non-octave F0 peak detection for simultaneous cross-talk overlap
+    if np.any(has_pitch):
+        freq_ratio = cand_freqs[None, :] / np.maximum(40.0, f0_vals[:, None])
+        harm_mask = (
+            (np.abs(freq_ratio - 1.0) < 0.16)
+            | (np.abs(freq_ratio - 0.5) < 0.12)
+            | (np.abs(freq_ratio - 2.0) < 0.16)
+            | (np.abs(freq_ratio - 3.0) < 0.16)
+            | (np.abs(freq_ratio - (1.0 / 3.0)) < 0.12)
+        )
+        masked_band = np.where(harm_mask, 0.0, band)
+        sec_rel = np.argmax(masked_band, axis=1)
+        sec_corr = masked_band[rows, sec_rel]
+        sec_lag = min_lag + sec_rel
+        sec_f0 = float(sr) / np.maximum(1.0, sec_lag.astype(np.float32))
+        ratio = np.where(has_pitch & (sec_corr >= 0.22), sec_corr / np.maximum(0.28, peak_corr), 0.0)
+        dual_ratio_out = np.clip(ratio, 0.0, 1.0).astype(np.float32)
+        dual_f0_out = np.where(ratio > 0.0, sec_f0, 0.0).astype(np.float32)
+
+    return f0_out, hnr_out, dual_ratio_out, dual_f0_out
+
+
+def _count_fillers_in_words(words: List[Dict[str, Any]]) -> int:
+    """Count single-word and bigram hesitation fillers inside `words`."""
+    if not words:
+        return 0
+    cleaned = [re.sub(r"[^\w']", "", str(w.get("word", "")).strip()).lower() for w in words]
+    flagged = set()
+    count = 0
+    for i, w in enumerate(words):
+        if bool(w.get("is_filler")):
+            count += 1
+            flagged.add(i)
+            continue
+        tok = cleaned[i]
+        if tok in _FLUENCY_FILLERS_SINGLE:
+            count += 1
+            flagged.add(i)
+            continue
+        if i + 1 < len(words) and (tok, cleaned[i + 1]) in _FLUENCY_FILLERS_BIGRAM and i not in flagged:
+            count += 1
+            flagged.add(i)
+            flagged.add(i + 1)
+    return count
+
+
+def _kmeans_deterministic(X: np.ndarray, k: int, max_iter: int = 25) -> Tuple[np.ndarray, float, np.ndarray]:
+    n = X.shape[0]
+    if n <= k:
+        labels = np.arange(n, dtype=np.int32) % max(1, k)
+        cents = np.stack([X[min(i, n - 1)] for i in range(max(1, k))], axis=0)
+        return labels, 0.0, cents
+
+    centers = [X[0].copy()]
+    for _ in range(1, k):
+        dists = np.min(np.stack([np.sum((X - c) ** 2, axis=1) for c in centers], axis=0), axis=0)
+        centers.append(X[int(np.argmax(dists))].copy())
+    centroids = np.stack(centers, axis=0)
+
+    labels = np.zeros(n, dtype=np.int32)
+    for _ in range(max_iter):
+        dmat = np.sum((X[:, None, :] - centroids[None, :, :]) ** 2, axis=2)
+        new_labels = np.argmin(dmat, axis=1).astype(np.int32)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for ci in range(k):
+            mask = labels == ci
+            if np.any(mask):
+                centroids[ci] = np.mean(X[mask], axis=0)
+
+    uniq = np.unique(labels)
+    if len(uniq) < 2:
+        return labels, 0.0, centroids
+    dist_mat = np.sqrt(np.maximum(0.0, np.sum((X[:, None, :] - X[None, :, :]) ** 2, axis=2)))
+    sils = np.zeros(n, dtype=np.float32)
+    for i in range(n):
+        own = labels[i]
+        same_mask = labels == own
+        same_mask[i] = False
+        a = float(np.mean(dist_mat[i, same_mask])) if np.any(same_mask) else 0.0
+        b = float("inf")
+        for other in uniq:
+            if other == own:
+                continue
+            other_mask = labels == other
+            if np.any(other_mask):
+                b = min(b, float(np.mean(dist_mat[i, other_mask])))
+        sils[i] = 0.0 if b == float("inf") else (b - a) / max(1e-6, max(a, b))
+    return labels, float(np.mean(sils)), centroids
+
+
+def _analyze_speaker_diarization(
+    *,
+    samples: np.ndarray,
+    sr: int,
+    step: float,
+    total_dur: float,
+    timeline: List[Dict[str, Any]],
+    clean_words: List[Dict[str, Any]],
+    raw_mfcc: np.ndarray,
+    raw_centroid: np.ndarray,
+    raw_rolloff: np.ndarray,
+    raw_pitch: np.ndarray,
+    raw_entropy: np.ndarray,
+    raw_dual_ratio: np.ndarray,
+    raw_dual_f0: np.ndarray,
+    mel_fb_small: np.ndarray,
+    dct_small: np.ndarray,
+) -> Dict[str, Any]:
+    """
+    Vectorized acoustic utterance speaker diarization (`Speaker A..D`), dominance ratios,
+    and cross-talk overlap detection (`high spectral entropy + dual-pitch energy bursts`).
+    """
+    n_bins = len(timeline)
+    if n_bins == 0:
+        return {
+            "speaker_count": 0,
+            "speakers": {},
+            "dominance_ratios": {},
+            "turns": [],
+            "speaker_switch_rate": 0.0,
+            "crosstalk_overlaps": [],
+            "crosstalk_count": 0,
+        }
+
+    # Build micro-utterances either from word segments or speech energy + pitch-step windows
+    utterances: List[Dict[str, Any]] = []
+    if clean_words:
+        cur_w: List[Dict[str, Any]] = []
+        for idx_w, w in enumerate(clean_words):
+            cur_w.append(w)
+            ws0 = float(cur_w[0]["start"])
+            we_cur = float(w["end"])
+            next_gap = (float(clean_words[idx_w + 1]["start"]) - we_cur) if (idx_w + 1 < len(clean_words)) else 9.9
+            has_term = bool(re.search(r"[\.\?\!\;]$", str(w["word"]).strip()))
+            if next_gap >= 0.35 or has_term or (we_cur - ws0) >= 2.2 or len(cur_w) >= 7:
+                utterances.append({"start": ws0, "end": max(ws0 + 0.15, we_cur), "word_count": len(cur_w)})
+                cur_w = []
+        if cur_w:
+            utterances.append({
+                "start": float(cur_w[0]["start"]),
+                "end": max(float(cur_w[0]["start"]) + 0.15, float(cur_w[-1]["end"])),
+                "word_count": len(cur_w),
+            })
+    else:
+        u_start: Optional[int] = None
+        last_voiced_f0: float = 0.0
+        for b in range(n_bins):
+            pt = timeline[b]
+            active = bool(pt["is_speech"] and float(pt["rms"]) >= 0.12)
+            cur_f0 = float(raw_pitch[b])
+            f0_jump = False
+            if active and u_start is not None and cur_f0 > 45.0 and last_voiced_f0 > 45.0:
+                semi_diff = abs(12.0 * math.log2(cur_f0 / last_voiced_f0))
+                if semi_diff >= 3.2:
+                    f0_jump = True
+            if active and (u_start is None or (b - u_start) * step >= 2.0 or f0_jump):
+                if u_start is not None and (b - u_start) * step >= 0.25:
+                    utterances.append({
+                        "start": round(u_start * step, 3),
+                        "end": round(b * step, 3),
+                        "word_count": 0,
+                    })
+                u_start = b
+            elif not active and u_start is not None:
+                if (b - u_start) * step >= 0.25:
+                    utterances.append({
+                        "start": round(u_start * step, 3),
+                        "end": round(b * step, 3),
+                        "word_count": 0,
+                    })
+                u_start = None
+            if active and cur_f0 > 45.0:
+                last_voiced_f0 = cur_f0
+        if u_start is not None and (n_bins - u_start) * step >= 0.25:
+            utterances.append({
+                "start": round(u_start * step, 3),
+                "end": round(n_bins * step, 3),
+                "word_count": 0,
+            })
+
+    # Filter out micro zero-energy blips and extract 29-dim embedding per utterance
+    valid_utts: List[Dict[str, Any]] = []
+    feats: List[np.ndarray] = []
+    for u in utterances:
+        b0 = max(0, int(math.floor(u["start"] / step)))
+        b1 = min(n_bins, max(b0 + 1, int(math.ceil(u["end"] / step))))
+        mfcc_slice = raw_mfcc[b0:b1]
+        rms_slice = np.array([float(timeline[bi]["rms"]) for bi in range(b0, b1)], dtype=np.float32)
+        if len(rms_slice) == 0 or float(np.max(rms_slice)) < 0.08:
+            continue
+
+        # Refine MFCC mean/std on 25ms sub-frames when bin count is small so std captures formant spread
+        i0 = max(0, int(round(u["start"] * sr)))
+        i1 = min(len(samples), int(round(u["end"] * sr)))
+        if (b1 - b0) < 4 and (i1 - i0) >= 512:
+            sub_len = 512
+            sub_hop = 160
+            n_frames_u = max(1, (i1 - i0 - sub_len) // sub_hop + 1)
+            idx_mat = i0 + np.arange(n_frames_u, dtype=np.int64)[:, None] * sub_hop + np.arange(sub_len, dtype=np.int64)[None, :]
+            sub_chunks = samples[idx_mat]
+            sub_hann = np.hanning(sub_len).astype(np.float32)
+            sub_pwr = (np.abs(np.fft.rfft(sub_chunks * sub_hann[None, :], axis=1)) ** 2).astype(np.float32)
+            sub_mel = np.log(np.maximum(1e-7, sub_pwr @ mel_fb_small.T))
+            sub_mfcc = sub_mel @ dct_small.T  # (F, 13)
+            mfcc_mean = np.mean(sub_mfcc, axis=0)
+            mfcc_std = np.std(sub_mfcc, axis=0)
+        else:
+            mfcc_mean = np.mean(mfcc_slice, axis=0)
+            mfcc_std = np.std(mfcc_slice, axis=0)
+
+        pitches = raw_pitch[b0:b1]
+        vp = pitches[pitches > 45.0]
+        med_f0 = float(np.median(vp)) if vp.size > 0 else 150.0
+        mean_cent = float(np.mean(raw_centroid[b0:b1]))
+        mean_roll = float(np.mean(raw_rolloff[b0:b1]))
+
+        vec = np.concatenate([
+            mfcc_mean.astype(np.float32),
+            mfcc_std.astype(np.float32),
+            np.array([med_f0, mean_cent, mean_roll], dtype=np.float32),
+        ])
+        valid_utts.append({**u, "b0": b0, "b1": b1, "med_f0": med_f0})
+        feats.append(vec)
+
+    if not valid_utts:
+        for pt in timeline:
+            pt["speaker_id"] = "Speaker A" if pt["is_speech"] else None
+        return {
+            "speaker_count": 1 if any(pt["is_speech"] for pt in timeline) else 0,
+            "speakers": {"Speaker A": {"id": "Speaker A", "dominance_ratio": 1.0, "duration_sec": 0.0, "turn_count": 0}} if any(pt["is_speech"] for pt in timeline) else {},
+            "dominance_ratios": {"Speaker A": 1.0} if any(pt["is_speech"] for pt in timeline) else {},
+            "turns": [],
+            "speaker_switch_rate": 0.0,
+            "crosstalk_overlaps": [],
+            "crosstalk_count": 0,
+        }
+
+    labels = np.zeros(len(valid_utts), dtype=np.int32)
+    if len(valid_utts) >= 2:
+        X = np.stack(feats, axis=0)
+        mu = np.mean(X, axis=0)
+        std = np.maximum(1e-3, np.std(X, axis=0))
+        Xn = (X - mu) / std
+        # Weight vocal tract MFCC mean + pitch + brightness/rolloff strongest for clean speaker separation
+        Xn[:, 0:6] *= 1.35
+        Xn[:, 13:26] *= 0.45
+        Xn[:, 26] *= 2.40  # median F0 pitch
+        Xn[:, 27] *= 1.15  # centroid
+        Xn[:, 28] *= 1.10  # rolloff
+
+        max_k = min(4, len(valid_utts))
+        if len(valid_utts) >= 4:
+            max_k = min(4, len(valid_utts) // 2)
+        best_sil = 0.0
+        best_labels = np.zeros(len(valid_utts), dtype=np.int32)
+        for k in range(2, max_k + 1):
+            lbls, sil, cents = _kmeans_deterministic(Xn, k)
+            counts = [int(np.sum(lbls == c)) for c in range(k)]
+            min_req = max(2, len(valid_utts) // 8) if len(valid_utts) >= 6 else 1
+            if min(counts) < min_req:
+                continue
+            # Ensure clusters genuinely diverge acoustically (F0 shift >= 2.2 semitones OR embedding gap >= 2.2)
+            pair_dists = [
+                float(np.linalg.norm(cents[a] - cents[b]))
+                for a in range(k)
+                for b in range(a + 1, k)
+            ]
+            f0_cl = [float(np.median([valid_utts[i]["med_f0"] for i in range(len(valid_utts)) if lbls[i] == c])) for c in range(k)]
+            f0_spread_semi = max(
+                abs(12.0 * math.log2(max(40.0, f0_cl[a]) / max(40.0, f0_cl[b])))
+                for a in range(k)
+                for b in range(a + 1, k)
+            )
+            if (min(pair_dists) >= 2.0 or f0_spread_semi >= 2.2) and sil > best_sil:
+                best_sil = sil
+                best_labels = lbls
+
+        if best_sil >= 0.24:
+            labels = best_labels
+
+    # Smooth isolated micro-glitches between identical neighbors
+    smoothed = labels.copy()
+    for i in range(1, len(smoothed) - 1):
+        if smoothed[i - 1] == smoothed[i + 1] and smoothed[i] != smoothed[i - 1]:
+            if (valid_utts[i]["end"] - valid_utts[i]["start"]) < 0.85:
+                smoothed[i] = smoothed[i - 1]
+
+    # Map chronologically to "Speaker A", "Speaker B", ...
+    cluster_to_name: Dict[int, str] = {}
+    for lbl in smoothed.tolist():
+        if lbl not in cluster_to_name:
+            idx_c = len(cluster_to_name)
+            cluster_to_name[lbl] = f"Speaker {chr(65 + idx_c)}"
+
+    for u_i, u in enumerate(valid_utts):
+        sp_name = cluster_to_name[int(smoothed[u_i])]
+        u["speaker_id"] = sp_name
+        for b in range(u["b0"], u["b1"]):
+            timeline[b]["speaker_id"] = sp_name
+
+    # Coalesce consecutive turns per speaker
+    turns: List[Dict[str, Any]] = []
+    dur_by_sp: Dict[str, float] = {}
+    f0_by_sp: Dict[str, List[float]] = {}
+    words_by_sp: Dict[str, int] = {}
+    for u in valid_utts:
+        sp = u["speaker_id"]
+        u_dur = max(step, float(u["end"] - u["start"]))
+        dur_by_sp[sp] = dur_by_sp.get(sp, 0.0) + u_dur
+        words_by_sp[sp] = words_by_sp.get(sp, 0) + int(u.get("word_count", 0))
+        f0_by_sp.setdefault(sp, []).append(float(u["med_f0"]))
+        if turns and turns[-1]["speaker_id"] == sp and (u["start"] - turns[-1]["end"]) <= 0.55:
+            turns[-1]["end"] = round(max(turns[-1]["end"], u["end"]), 3)
+            turns[-1]["duration"] = round(turns[-1]["end"] - turns[-1]["start"], 3)
+            turns[-1]["word_count"] += int(u.get("word_count", 0))
+        else:
+            turns.append({
+                "speaker_id": sp,
+                "start": round(u["start"], 3),
+                "end": round(u["end"], 3),
+                "duration": round(u_dur, 3),
+                "median_f0_hz": round(u["med_f0"], 1),
+                "word_count": int(u.get("word_count", 0)),
+            })
+
+    tot_sp_dur = max(1e-3, sum(dur_by_sp.values()))
+    dominance_ratios = {
+        sp: round(d / tot_sp_dur, 4)
+        for sp, d in sorted(dur_by_sp.items(), key=lambda kv: kv[0])
+    }
+    speakers_meta = {
+        sp: {
+            "id": sp,
+            "dominance_ratio": dominance_ratios[sp],
+            "duration_sec": round(dur_by_sp[sp], 2),
+            "median_f0_hz": round(float(np.median(f0_by_sp[sp])), 1) if f0_by_sp.get(sp) else 0.0,
+            "word_count": words_by_sp.get(sp, 0),
+        }
+        for sp in dominance_ratios
+    }
+    switches = sum(1 for i in range(1, len(turns)) if turns[i]["speaker_id"] != turns[i - 1]["speaker_id"])
+    switch_rate = round((switches / max(1.0, float(total_dur))) * 10.0, 2)
+
+    # Cross-talk overlap detection: high spectral entropy + dual-pitch competing bursts
+    turn_change_times = [turns[i]["start"] for i in range(1, len(turns))]
+    ct_overlaps: List[Dict[str, Any]] = []
+    ct_start_idx: Optional[int] = None
+    ct_confs: List[float] = []
+    ct_ents: List[float] = []
+    for b, pt in enumerate(timeline):
+        rms_v = float(pt["rms"])
+        ent = float(raw_entropy[b])
+        dual_r = float(raw_dual_ratio[b])
+        hnr_v = float(pt["hnr_norm"])
+        near_switch = any(abs(float(pt["t"]) - st) <= 0.65 for st in turn_change_times)
+        dual_hit = dual_r >= 0.44 and float(raw_dual_f0[b]) >= 75.0 and (ent >= 0.28 or hnr_v < 0.85)
+        dense_clash = ent >= 0.68 and rms_v >= 0.28 and (dual_r >= 0.28 or near_switch or float(pt["flux"]) >= 0.28)
+        is_ct = bool(rms_v >= 0.20 and (dual_hit or dense_clash))
+        pt["is_crosstalk"] = is_ct
+        pt["spectral_entropy"] = round(ent, 4)
+
+        if is_ct:
+            conf_b = min(0.98, 0.45 + 0.35 * dual_r + 0.25 * ent)
+            if ct_start_idx is None:
+                ct_start_idx = b
+                ct_confs = []
+                ct_ents = []
+            ct_confs.append(conf_b)
+            ct_ents.append(ent)
+        elif ct_start_idx is not None:
+            t0 = float(timeline[ct_start_idx]["t"])
+            t1 = round(float(timeline[b - 1]["t"]) + step, 3)
+            ct_overlaps.append({
+                "t": round(t0, 2),
+                "end": round(t1, 2),
+                "confidence": round(sum(ct_confs) / max(1, len(ct_confs)), 3),
+                "spectral_entropy": round(max(ct_ents), 3),
+            })
+            ct_start_idx = None
+    if ct_start_idx is not None:
+        t0 = float(timeline[ct_start_idx]["t"])
+        t1 = round(float(timeline[-1]["t"]) + step, 3)
+        ct_overlaps.append({
+            "t": round(t0, 2),
+            "end": round(t1, 2),
+            "confidence": round(sum(ct_confs) / max(1, len(ct_confs)), 3),
+            "spectral_entropy": round(max(ct_ents), 3),
+        })
+
+    return {
+        "speaker_count": len(speakers_meta),
+        "speakers": speakers_meta,
+        "dominance_ratios": dominance_ratios,
+        "turns": turns,
+        "speaker_switch_rate": switch_rate,
+        "crosstalk_overlaps": ct_overlaps,
+        "crosstalk_count": len(ct_overlaps),
+    }
+
+
+def _analyze_speech_fluency(
+    *,
+    clean_words: List[Dict[str, Any]],
+    timeline: List[Dict[str, Any]],
+    step: float,
+    total_dur: float,
+) -> Dict[str, Any]:
+    """
+    Combine Whisper word probability confidence, inter-word pause variance, and filler words
+    into a rolling 0..100 `fluency_score` plus `clean_hook_candidates` and `hesitation_intervals`.
+    """
+    n_bins = len(timeline)
+    if not clean_words:
+        # Derive conservative acoustic continuity score when transcript is absent
+        for pt in timeline:
+            pt["fluency_score"] = round(min(92.0, 58.0 + 30.0 * float(pt["hnr_norm"])), 1) if pt["is_speech"] else 75.0
+        sp_pts = [float(pt["fluency_score"]) for pt in timeline if pt["is_speech"]]
+        return {
+            "avg_fluency_score": round(sum(sp_pts) / len(sp_pts), 1) if sp_pts else 75.0,
+            "filler_count": 0,
+            "filler_rate_per_min": 0.0,
+            "clean_hook_candidates": [],
+            "hesitation_intervals": [],
+        }
+
+    total_fillers = _count_fillers_in_words(clean_words)
+    fluency_vals: List[float] = []
+
+    for b, pt in enumerate(timeline):
+        t_cur = float(pt["t"])
+        t_mid = min(total_dur, t_cur + step * 0.5)
+        w_s, w_e = max(0.0, t_mid - 1.5), min(total_dur, t_mid + 1.5)
+        win_words = [w for w in clean_words if float(w["end"]) >= w_s and float(w["start"]) <= w_e]
+
+        if not win_words:
+            f_sc = 80.0 if not pt["is_speech"] else 68.0
+        else:
+            probs = [
+                max(0.10, min(1.0, float(w.get("probability", w.get("confidence", 0.90)) or 0.90)))
+                for w in win_words
+            ]
+            avg_prob = sum(probs) / len(probs)
+            conf_pts = avg_prob * 40.0
+
+            n_fill = _count_fillers_in_words(win_words)
+            fill_ratio = n_fill / float(max(1, len(win_words)))
+            filler_pen = min(46.0, n_fill * 14.0 + fill_ratio * 34.0)
+
+            gaps = [
+                max(0.0, float(win_words[i + 1]["start"]) - float(win_words[i]["end"]))
+                for i in range(len(win_words) - 1)
+            ]
+            if gaps:
+                gap_arr = np.array(gaps, dtype=np.float32)
+                gap_std = float(np.std(gap_arr))
+                stall_gap = float(np.max(gap_arr))
+                # Penalize irregular hesitation gaps (>0.32s) and stalls (>0.8s)
+                stall_pen = min(22.0, max(0.0, stall_gap - 0.32) * 20.0)
+                var_pen = min(14.0, max(0.0, gap_std - 0.12) * 35.0)
+                pause_pts = max(4.0, 35.0 - stall_pen - var_pen)
+            else:
+                pause_pts = 32.0
+
+            non_fill = max(0, len(win_words) - n_fill)
+            flow_pts = min(25.0, non_fill * 5.0)
+            f_sc = max(5.0, min(100.0, conf_pts + pause_pts + flow_pts - filler_pen))
+
+        pt["fluency_score"] = round(f_sc, 1)
+        if pt["is_speech"]:
+            fluency_vals.append(f_sc)
+
+    # Tag punchy, hesitation-free opening sentences as clean_hook_candidates
+    sentences: List[List[Dict[str, Any]]] = []
+    cur_sent: List[Dict[str, Any]] = []
+    for i, w in enumerate(clean_words):
+        cur_sent.append(w)
+        nxt_gap = (float(clean_words[i + 1]["start"]) - float(w["end"])) if i + 1 < len(clean_words) else 9.9
+        is_term = bool(re.search(r"[\.\?\!\;]$", str(w["word"]).strip()))
+        if is_term or nxt_gap >= 0.60 or len(cur_sent) >= 20:
+            sentences.append(cur_sent)
+            cur_sent = []
+    if cur_sent:
+        sentences.append(cur_sent)
+
+    clean_hooks: List[Dict[str, Any]] = []
+    for sent in sentences:
+        if len(sent) < 2:
+            continue
+        s0 = float(sent[0]["start"])
+        s1 = float(sent[-1]["end"])
+        open_words = [w for w in sent if float(w["start"]) < (s0 + 2.0)]
+        if _count_fillers_in_words(open_words) > 0:
+            continue
+        # Require clean sentence-level fluency (>= 82)
+        sent_bins = [pt for pt in timeline if (s0 - 0.1) <= float(pt["t"]) <= min(s1, s0 + 3.0) + 0.1]
+        if not sent_bins:
+            continue
+        mean_fluency = sum(float(pt["fluency_score"]) for pt in sent_bins) / len(sent_bins)
+        if mean_fluency < 82.0:
+            continue
+        # Require strong initial vocal transient / clear onset energy
+        onset_bins = [pt for pt in timeline if (s0 - 0.25) <= float(pt["t"]) <= (s0 + 1.0)]
+        peak_rms = max((float(pt["rms"]) for pt in onset_bins), default=0.0)
+        peak_exc = max((float(pt["excitement_score"]) for pt in onset_bins), default=0.0)
+        if peak_rms < 0.20 and peak_exc < 28.0:
+            continue
+        first_bin = min(timeline, key=lambda pt: abs(float(pt["t"]) - s0)) if timeline else {}
+        clean_hooks.append({
+            "t": round(s0, 3),
+            "end": round(s1, 3),
+            "text": " ".join(str(w["word"]).strip() for w in sent[:12]),
+            "fluency_score": round(mean_fluency, 1),
+            "onset_rms": round(peak_rms, 3),
+            "speaker_id": first_bin.get("speaker_id") or "Speaker A",
+        })
+
+    # Detect low-fluency hesitation stretches >= 1.2s
+    hesitation_intervals: List[Dict[str, Any]] = []
+    for i in range(len(clean_words) - 1):
+        g_s = float(clean_words[i]["end"])
+        g_e = float(clean_words[i + 1]["start"])
+        if (g_e - g_s) >= 1.2:
+            hesitation_intervals.append({"t": round(g_s, 2), "end": round(g_e, 2), "duration": round(g_e - g_s, 2), "reason": "mid_speech_stall"})
+    run_s: Optional[float] = None
+    run_scores: List[float] = []
+    for pt in timeline:
+        if pt["is_speech"] and float(pt["fluency_score"]) < 60.0:
+            if run_s is None:
+                run_s = float(pt["t"])
+                run_scores = []
+            run_scores.append(float(pt["fluency_score"]))
+        elif run_s is not None:
+            t_end = float(pt["t"])
+            if (t_end - run_s) >= 1.2:
+                hesitation_intervals.append({
+                    "t": round(run_s, 2),
+                    "end": round(t_end, 2),
+                    "duration": round(t_end - run_s, 2),
+                    "fluency_avg": round(sum(run_scores) / len(run_scores), 1),
+                    "reason": "low_fluency_fillers",
+                })
+            run_s = None
+
+    spoken_dur_min = max(1.0 / 60.0, (clean_words[-1]["end"] - clean_words[0]["start"]) / 60.0)
+    return {
+        "avg_fluency_score": round(sum(fluency_vals) / len(fluency_vals), 1) if fluency_vals else 75.0,
+        "filler_count": total_fillers,
+        "filler_rate_per_min": round(total_fillers / spoken_dur_min, 2),
+        "clean_hook_candidates": clean_hooks[:24],
+        "hesitation_intervals": hesitation_intervals,
+    }
+
+
+def _analyze_music_bed(
+    *,
+    samples: np.ndarray,
+    sr: int,
+    step: float,
+    timeline: List[Dict[str, Any]],
+    clean_words: List[Dict[str, Any]],
+    raw_low_music_ratio: np.ndarray,
+    raw_tonal_ratio: np.ndarray,
+    raw_bin_db: np.ndarray,
+    raw_bin_rms: np.ndarray,
+) -> Dict[str, Any]:
+    """
+    Detect existing background music beds via 50-180 Hz sub-band rhythmic periodicity
+    and non-speech harmonic tonal persistence.
+    """
+    n_bins = len(timeline)
+    if n_bins == 0 or len(samples) < int(sr * 0.5):
+        return {
+            "has_existing_music": False,
+            "avg_music_intensity": 0.0,
+            "beat_periodicity": 0.0,
+            "estimated_bpm": 0.0,
+            "music_intensity_timeline": [],
+        }
+
+    # Vectorized 20 Hz (50ms) low-frequency (50..180 Hz) amplitude envelope for rhythmic beat detection
+    sub_win = max(64, int(round(0.05 * sr)))
+    n_sub = len(samples) // sub_win
+    beat_periodicity = 0.0
+    estimated_bpm = 0.0
+    if n_sub >= 24:
+        reshaped = samples[: n_sub * sub_win].reshape(n_sub, sub_win)
+        sub_hann = np.hanning(sub_win).astype(np.float32)
+        sub_fft = np.abs(np.fft.rfft(reshaped * sub_hann[None, :], axis=1))
+        sub_freqs = np.fft.rfftfreq(sub_win, d=1.0 / float(sr))
+        band_50_180 = (sub_freqs >= 45.0) & (sub_freqs <= 185.0)
+        if np.any(band_50_180):
+            low_env = np.sqrt(np.mean(sub_fft[:, band_50_180] ** 2, axis=1)) / float(sub_win)
+            # Detrend slow 0..0.7 Hz speech pause transitions so rhythmic beats (54..198 BPM) stand out clearly
+            k_smooth = min(len(low_env), 17)
+            if k_smooth >= 5:
+                kernel = np.ones(k_smooth, dtype=np.float32) / float(k_smooth)
+                low_trend = np.convolve(np.pad(low_env, (k_smooth // 2, k_smooth - 1 - k_smooth // 2), mode="edge"), kernel, mode="valid")
+                low_ac = low_env - low_trend
+            else:
+                low_ac = low_env - float(np.mean(low_env))
+            if float(np.mean(low_env)) > 0.0015 and float(np.std(low_ac)) > 1e-4:
+                env_rate = float(sr) / float(sub_win)  # 20 Hz
+                # Compute normalized autocorrelation over BPM beat lags (54..198 BPM -> 0.30s..1.11s)
+                min_b_lag = max(2, int(round(0.30 * env_rate)))
+                max_b_lag = min(len(low_ac) // 2, int(round(1.11 * env_rate)))
+                n_ac = len(low_ac)
+                n_fft_ac = 1 << int(math.ceil(math.log2(max(8, n_ac * 2))))
+                sp_ac = np.fft.rfft(low_ac, n=n_fft_ac)
+                acf_full = np.fft.irfft(sp_ac * np.conj(sp_ac), n=n_fft_ac)[: n_ac]
+                if acf_full[0] > 1e-10 and max_b_lag > min_b_lag:
+                    lags_ac = np.arange(n_ac, dtype=np.float32)
+                    # Unbiased lag normalization over overlap count (n_ac - lag)
+                    norm_acf = acf_full / (acf_full[0] * np.maximum(0.25, 1.0 - lags_ac / float(max(1, n_ac))))
+                    bpm_slice = norm_acf[min_b_lag : max_b_lag + 1]
+                    pk_rel = int(np.argmax(bpm_slice))
+                    pk_corr = float(max(0.0, min(1.0, bpm_slice[pk_rel])))
+                    best_lag = min_b_lag + pk_rel
+                    beat_periodicity = round(pk_corr, 4)
+                    estimated_bpm = round((env_rate / float(max(1, best_lag))) * 60.0, 1)
+
+    music_tl: List[Dict[str, Any]] = []
+    non_speech_hits = 0
+    non_speech_total = 0
+    non_speech_intensities: List[float] = []
+    all_intensities: List[float] = []
+
+    for b, pt in enumerate(timeline):
+        t_p = float(pt["t"])
+        tonal_n = max(0.0, min(1.0, (float(raw_tonal_ratio[b]) - 2.2) / 14.0))
+        low_n = max(0.0, min(1.0, float(raw_low_music_ratio[b]) / 0.35))
+        b_db = float(raw_bin_db[b])
+        b_rms = float(raw_bin_rms[b])
+        db_active = max(0.0, min(1.0, (b_db + 46.0) / 30.0))
+        if b_db <= -44.0 or b_rms <= 0.006:
+            m_int = 0.0
+        else:
+            m_raw = 100.0 * db_active * (0.40 * tonal_n + 0.32 * low_n + 0.28 * beat_periodicity)
+            m_int = round(max(0.0, min(100.0, m_raw)), 1)
+
+        pt["music_bed_intensity"] = m_int
+        music_tl.append({"t": pt["t"], "intensity": m_int})
+        all_intensities.append(m_int)
+
+        if clean_words:
+            # Guard 0.35s around every Whisper word boundary so voice onsets/tails don't leak into pauses
+            in_spoken_word = any(
+                float(w["end"]) >= (t_p - 0.35) and float(w["start"]) <= (t_p + step + 0.35)
+                for w in clean_words
+            )
+            is_ns = not in_spoken_word
+        else:
+            is_ns = not bool(pt["is_speech"])
+
+        if is_ns:
+            non_speech_total += 1
+            if m_int >= 14.0:
+                non_speech_hits += 1
+            non_speech_intensities.append(m_int)
+
+    ns_ratio = (non_speech_hits / float(non_speech_total)) if non_speech_total > 0 else 0.0
+    ns_avg = (sum(non_speech_intensities) / len(non_speech_intensities)) if non_speech_intensities else 0.0
+    overall_avg = (sum(all_intensities) / len(all_intensities)) if all_intensities else 0.0
+
+    # When clear non-speech windows exist, strictly rely on harmonic persistence + rhythm in non-speech windows
+    # (prevents voiced 120-200 Hz speech formants from mimicking background music).
+    if non_speech_total >= 3:
+        has_music = bool(
+            (ns_ratio >= 0.25 and ns_avg >= 18.0)
+            or (ns_ratio >= 0.20 and beat_periodicity >= 0.35)
+        )
+    else:
+        has_music = bool(beat_periodicity >= 0.42 and overall_avg >= 25.0)
+
+    return {
+        "has_existing_music": has_music,
+        "avg_music_intensity": round(overall_avg, 1),
+        "beat_periodicity": round(beat_periodicity, 4),
+        "estimated_bpm": estimated_bpm if has_music else 0.0,
+        "music_intensity_timeline": music_tl,
+    }
+
+
 def _estimate_pitch_and_hnr(window: np.ndarray, sr: int) -> Tuple[float, float]:
     """
     Fast unbiased FFT autocorrelation fundamental pitch (`f0_hz` in [75..420 Hz])
@@ -525,7 +1300,7 @@ def analyze_audio_track(
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
 
-    # Pre-clean transcript word timestamps
+    # Pre-clean transcript word timestamps (preserve Whisper word confidence probabilities)
     clean_words: List[Dict[str, Any]] = []
     for w in word_segments or []:
         txt = str(w.get("word", "")).strip()
@@ -533,7 +1308,18 @@ def analyze_audio_track(
             continue
         ws = float(w.get("start", 0.0))
         we = max(ws + 0.02, float(w.get("end", ws + 0.2)))
-        clean_words.append({"word": txt, "start": ws, "end": we})
+        prob_raw = w.get("probability", w.get("confidence", 0.90))
+        try:
+            prob_val = max(0.05, min(1.0, float(0.90 if prob_raw is None else prob_raw)))
+        except (TypeError, ValueError):
+            prob_val = 0.90
+        clean_words.append({
+            "word": txt,
+            "start": ws,
+            "end": we,
+            "probability": prob_val,
+            "is_filler": bool(w.get("is_filler", False)),
+        })
     clean_words.sort(key=lambda item: item["start"])
 
     # Compute window DSP features per 0.25s bucket
@@ -543,8 +1329,13 @@ def analyze_audio_track(
     hann = np.hanning(win_samples).astype(np.float32)
     freqs = np.fft.rfftfreq(win_samples, d=1.0 / float(max(1, sr)))
     sub_bass_mask = (freqs >= 25.0) & (freqs <= 180.0)
+    music_low_mask = (freqs >= 50.0) & (freqs <= 180.0)
+    tonal_band_mask = (freqs >= 50.0) & (freqs <= 2000.0)
+    entropy_band_mask = (freqs >= 100.0) & (freqs <= 4500.0)
     high_air_mask = (freqs >= 1200.0) & (freqs <= 6000.0)
     bright_mask = freqs >= 2000.0
+    mel_fb_main, dct_main = _get_mel_dct_matrices(len(freqs), sr, n_mels=26, n_mfcc=13)
+    mel_fb_small, dct_small = _get_mel_dct_matrices(257, sr, n_mels=26, n_mfcc=13)
 
     raw_rms = np.zeros(n_bins, dtype=np.float32)
     raw_bin_rms = np.zeros(n_bins, dtype=np.float32)
@@ -554,15 +1345,22 @@ def analyze_audio_track(
     raw_zcr = np.zeros(n_bins, dtype=np.float32)
     raw_pitch = np.zeros(n_bins, dtype=np.float32)
     raw_hnr = np.zeros(n_bins, dtype=np.float32)
+    raw_dual_ratio = np.zeros(n_bins, dtype=np.float32)
+    raw_dual_f0 = np.zeros(n_bins, dtype=np.float32)
     raw_centroid = np.zeros(n_bins, dtype=np.float32)
+    raw_rolloff = np.zeros(n_bins, dtype=np.float32)
+    raw_entropy = np.zeros(n_bins, dtype=np.float32)
+    raw_mfcc = np.zeros((n_bins, 13), dtype=np.float32)
     raw_brightness = np.zeros(n_bins, dtype=np.float32)
     raw_sub_bass_ratio = np.zeros(n_bins, dtype=np.float32)
     raw_sub_bass_db = np.full(n_bins, -70.0, dtype=np.float32)
+    raw_low_music_ratio = np.zeros(n_bins, dtype=np.float32)
+    raw_tonal_ratio = np.zeros(n_bins, dtype=np.float32)
     raw_high_air = np.zeros(n_bins, dtype=np.float32)
     raw_laugh = np.zeros(n_bins, dtype=np.float32)
     prev_norm_mag: Optional[np.ndarray] = None
 
-    # Fast vectorized 0.25s NumPy DSP pass (batched 2D windowing + single-shot batch rfft)
+    # Fast vectorized 0.25s NumPy DSP pass (batched 2D windowing + single-shot batch rfft & MFCC/ACF)
     pad_left = win_samples // 2 + env_samples // 2
     pad_right = win_samples + env_samples
     padded = np.pad(samples, (pad_left, pad_right), mode="constant").astype(np.float32, copy=False)
@@ -571,6 +1369,7 @@ def analyze_audio_track(
 
     bin_starts = np.minimum(len(samples), np.arange(n_bins, dtype=np.int64) * hop_samples)
     bin_ends = np.minimum(len(samples), (np.arange(n_bins, dtype=np.int64) + 1) * hop_samples)
+    ent_log_denom = max(1.0, math.log2(max(2, int(np.sum(entropy_band_mask)))))
 
     BATCH_BINS = 512
     for b0 in range(0, n_bins, BATCH_BINS):
@@ -603,6 +1402,38 @@ def analyze_audio_track(
         tot_pows = np.sum(power_mat, axis=1) + 1e-12
 
         raw_centroid[b0:b1] = np.where(valid, np.sum(spec_mat * freqs[None, :], axis=1) / spec_sums, 0.0)
+        cum_pow = np.cumsum(power_mat, axis=1)
+        roll_idx = np.argmax(cum_pow >= (0.85 * tot_pows[:, None]), axis=1)
+        raw_rolloff[b0:b1] = np.where(valid, freqs[roll_idx], 0.0)
+
+        # Vectorized 13-band MFCC
+        mel_e = np.log(np.maximum(1e-7, power_mat @ mel_fb_main.T))
+        mfcc_b = mel_e @ dct_main.T
+        raw_mfcc[b0:b1] = np.where(valid[:, None], mfcc_b, 0.0)
+
+        # Vectorized spectral entropy (vocal band) & tonal peak ratio (music bed cues)
+        if np.any(entropy_band_mask):
+            p_ent = power_mat[:, entropy_band_mask]
+            p_ent_norm = p_ent / np.maximum(1e-12, np.sum(p_ent, axis=1, keepdims=True))
+            ent_vals = -np.sum(p_ent_norm * np.log2(np.maximum(1e-12, p_ent_norm)), axis=1) / ent_log_denom
+            raw_entropy[b0:b1] = np.where(valid, np.clip(ent_vals, 0.0, 1.0), 0.0)
+
+        if np.any(tonal_band_mask):
+            p_ton = power_mat[:, tonal_band_mask]
+            ton_max = np.max(p_ton, axis=1)
+            ton_med = np.maximum(1e-12, np.median(p_ton, axis=1))
+            raw_tonal_ratio[b0:b1] = np.where(valid, np.minimum(100.0, ton_max / ton_med), 0.0)
+
+        if np.any(music_low_mask):
+            raw_low_music_ratio[b0:b1] = np.where(valid, np.sum(power_mat[:, music_low_mask], axis=1) / tot_pows, 0.0)
+
+        # Vectorized pitch + HNR + dual-pitch cross-talk cue
+        f0_b, hnr_b, dual_r_b, dual_f0_b = _estimate_pitch_hnr_dual_batch(chunks, sr)
+        raw_pitch[b0:b1] = f0_b
+        raw_hnr[b0:b1] = hnr_b
+        raw_dual_ratio[b0:b1] = dual_r_b
+        raw_dual_f0[b0:b1] = dual_f0_b
+
         if np.any(bright_mask):
             raw_brightness[b0:b1] = np.where(valid, np.sum(power_mat[:, bright_mask], axis=1) / tot_pows, 0.0)
         if np.any(sub_bass_mask):
@@ -628,16 +1459,12 @@ def analyze_audio_track(
                     diff_pos = np.maximum(0.0, norm_specs[local_i] - prev_norm_mag)
                     raw_flux[b] = float(np.sqrt(np.sum(diff_pos * diff_pos)))
                 prev_norm_mag = norm_specs[local_i]
-                f0_hz, hnr_norm = _estimate_pitch_and_hnr(chunks[local_i], sr)
-                raw_pitch[b] = f0_hz
-                raw_hnr[b] = hnr_norm
-                env_s = int(centers[local_i]) - (env_samples // 2)
-                raw_laugh[b] = _compute_laughter_modulation(padded[env_s : env_s + env_samples], sr)
+                if float(rms_batch[local_i]) >= 0.015:
+                    env_s = int(centers[local_i]) - (env_samples // 2)
+                    raw_laugh[b] = _compute_laughter_modulation(padded[env_s : env_s + env_samples], sr)
             else:
                 prev_norm_mag = None
                 raw_flux[b] = 0.0
-                raw_pitch[b] = 0.0
-                raw_hnr[b] = 0.0
                 raw_laugh[b] = 0.0
 
     # Global loudness fallback values if FFmpeg omitted Summary on ultra-short tracks
@@ -862,6 +1689,41 @@ def analyze_audio_track(
         if etype in event_counts:
             event_counts[etype] += 1
 
+    speaker_diarization = _analyze_speaker_diarization(
+        samples=samples,
+        sr=sr,
+        step=step,
+        total_dur=total_dur,
+        timeline=timeline,
+        clean_words=clean_words,
+        raw_mfcc=raw_mfcc,
+        raw_centroid=raw_centroid,
+        raw_rolloff=raw_rolloff,
+        raw_pitch=raw_pitch,
+        raw_entropy=raw_entropy,
+        raw_dual_ratio=raw_dual_ratio,
+        raw_dual_f0=raw_dual_f0,
+        mel_fb_small=mel_fb_small,
+        dct_small=dct_small,
+    )
+    speech_fluency = _analyze_speech_fluency(
+        clean_words=clean_words,
+        timeline=timeline,
+        step=step,
+        total_dur=total_dur,
+    )
+    music_bed_analysis = _analyze_music_bed(
+        samples=samples,
+        sr=sr,
+        step=step,
+        timeline=timeline,
+        clean_words=clean_words,
+        raw_low_music_ratio=raw_low_music_ratio,
+        raw_tonal_ratio=raw_tonal_ratio,
+        raw_bin_db=raw_bin_db,
+        raw_bin_rms=raw_bin_rms,
+    )
+
     return {
         "summary": {
             "integrated_lufs": round(float(integrated_lufs), 2),
@@ -877,9 +1739,21 @@ def analyze_audio_track(
             "pitch_range_semitones": pitch_range_semi,
             "acoustic_event_counts": event_counts,
             "acoustic_events": acoustic_events,
+            "speaker_count": speaker_diarization["speaker_count"],
+            "dominance_ratios": speaker_diarization["dominance_ratios"],
+            "crosstalk_count": speaker_diarization["crosstalk_count"],
+            "avg_fluency_score": speech_fluency["avg_fluency_score"],
+            "filler_count": speech_fluency["filler_count"],
+            "clean_hook_count": len(speech_fluency["clean_hook_candidates"]),
+            "has_existing_music": music_bed_analysis["has_existing_music"],
+            "avg_music_intensity": music_bed_analysis["avg_music_intensity"],
+            "beat_periodicity": music_bed_analysis["beat_periodicity"],
             "duration": round(float(total_dur), 3),
             "step_sec": step,
         },
         "acoustic_events": acoustic_events,
+        "speaker_diarization": speaker_diarization,
+        "speech_fluency": speech_fluency,
+        "music_bed_analysis": music_bed_analysis,
         "timeline": timeline,
     }

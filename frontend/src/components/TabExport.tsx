@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Download, Film, Copy, Check, ExternalLink, 
-  Loader2, AlertCircle, Sparkles
+  Loader2, AlertCircle, Sparkles, Package
 } from 'lucide-react';
 import { YoutubeIcon } from './Icons';
 import { ViralClip } from '../types';
@@ -21,9 +21,18 @@ export const TabExport: React.FC<TabExportProps> = ({
   isRendering
 }) => {
   const [copiedComment, setCopiedComment] = useState(false);
+  const [copiedMeta, setCopiedMeta] = useState(false);
+  const [isExportingPack, setIsExportingPack] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
-  const [publishResult, setPublishResult] = useState<{ url?: string; note?: string } | null>(null);
+  const [ytConnected, setYtConnected] = useState<boolean>(false);
+  const [publishResult, setPublishResult] = useState<{ url?: string; privacy_status?: string } | null>(null);
   const [publishError, setPublishError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.getYouTubeStatus()
+      .then((st) => setYtConnected(Boolean(st.connected)))
+      .catch(() => setYtConnected(false));
+  }, []);
 
   const copyPinnedComment = () => {
     if (!clip.pinned_comment) return;
@@ -32,15 +41,42 @@ export const TabExport: React.FC<TabExportProps> = ({
     setTimeout(() => setCopiedComment(false), 2000);
   };
 
+  const copyTitleAndHashtags = () => {
+    const text = `${clip.selected_title || ''}\n\n${clip.youtube_description || ''}`.trim();
+    navigator.clipboard?.writeText(text).catch(() => {});
+    setCopiedMeta(true);
+    setTimeout(() => setCopiedMeta(false), 2000);
+  };
+
+  const handleDownloadPack = async () => {
+    setIsExportingPack(true);
+    setPublishError(null);
+    try {
+      await api.exportPublishPack(clip.project_id, clip.id, 'fast_preview');
+    } catch (err: any) {
+      setPublishError(err?.message || 'Failed to build Social Pack .zip');
+    } finally {
+      setIsExportingPack(false);
+    }
+  };
+
   const handlePublishYouTube = async () => {
+    if (!ytConnected) {
+      setPublishError('YouTube account not linked. Connect your channel before uploading.');
+      return;
+    }
     setIsPublishing(true);
     setPublishError(null);
     try {
-      const res = await api.publishToYouTube(clip.id, {
-        title: clip.selected_title,
-        description: clip.youtube_description,
-        privacy_status: clip.privacy_status
-      });
+      const res = await api.publishToYouTube(
+        clip.id,
+        {
+          title: clip.selected_title,
+          description: clip.youtube_description,
+          privacy_status: clip.privacy_status
+        },
+        clip.project_id
+      );
       setPublishResult(res);
       onUpdateClip({ youtube_url: res.url });
     } catch (err: any) {
@@ -204,21 +240,41 @@ export const TabExport: React.FC<TabExportProps> = ({
 
         <button
           onClick={handlePublishYouTube}
-          disabled={isPublishing || !clip.rendered_video_path}
+          disabled={isPublishing || !ytConnected || !clip.rendered_video_path}
           className="w-full py-2.5 rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-xs tracking-wide shadow-lg shadow-red-600/20 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-40"
         >
           {isPublishing ? (
             <>
               <Loader2 className="w-4 h-4 animate-spin text-white" />
-              <span>Broadcasting to YouTube...</span>
+              <span>Uploading rendered MP4 to YouTube...</span>
             </>
           ) : (
             <>
               <YoutubeIcon className="w-4 h-4" />
-              <span>{clip.aspect_ratio === '9:16' ? 'Post to YouTube Shorts' : 'Post to YouTube'}</span>
+              <span>{ytConnected ? 'Upload Video' : 'Connect YouTube to Upload'}</span>
             </>
           )}
         </button>
+
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={copyTitleAndHashtags}
+            className="py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center justify-center gap-1.5 border border-zinc-700"
+          >
+            {copiedMeta ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copiedMeta ? 'Copied!' : 'Copy Title & Hashtags'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleDownloadPack}
+            disabled={isExportingPack}
+            className="py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center justify-center gap-1.5 border border-zinc-700 disabled:opacity-40"
+          >
+            {isExportingPack ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Package className="w-3.5 h-3.5 text-violet-400" />}
+            <span>Download Social Pack (.zip)</span>
+          </button>
+        </div>
 
         {!clip.rendered_video_path && (
           <p className="text-[10px] text-amber-400 flex items-center gap-1">
@@ -230,7 +286,7 @@ export const TabExport: React.FC<TabExportProps> = ({
         {publishResult?.url && (
           <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 space-y-1">
             <div className="flex items-center justify-between font-bold">
-              <span>Video Published!</span>
+              <span>Uploaded ({publishResult.privacy_status || 'private'})</span>
               <a
                 href={publishResult.url}
                 target="_blank"
@@ -241,9 +297,9 @@ export const TabExport: React.FC<TabExportProps> = ({
                 <ExternalLink className="w-3 h-3" />
               </a>
             </div>
-            {publishResult.note && (
-              <p className="text-[10px] text-zinc-400 leading-tight">{publishResult.note}</p>
-            )}
+            <p className="text-[10px] text-zinc-400 leading-tight">
+              Unverified Google Cloud OAuth apps default uploaded videos to Private in YouTube Studio until approved.
+            </p>
           </div>
         )}
 

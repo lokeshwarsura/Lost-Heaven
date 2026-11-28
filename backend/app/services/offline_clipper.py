@@ -213,6 +213,7 @@ NARRATIVE_ARCS: Tuple[str, ...] = (
     "shock_reaction",
     "setup_to_laughter",
     "heated_debate",
+    "crosstalk_debate_clash",
     "gameplay_climax",
     "hook_explanation",
 )
@@ -221,6 +222,7 @@ NARRATIVE_ARC_LABELS: Dict[str, str] = {
     "shock_reaction": "Shock & Reaction",
     "setup_to_laughter": "Setup to Laughter",
     "heated_debate": "Heated Debate",
+    "crosstalk_debate_clash": "Cross-Talk Debate Clash",
     "gameplay_climax": "Gameplay / Action Climax",
     "hook_explanation": "Hook Explanation",
 }
@@ -268,9 +270,13 @@ def classify_narrative_arc(
         "shock_reaction": 0.0,
         "setup_to_laughter": 0.0,
         "heated_debate": 0.0,
+        "crosstalk_debate_clash": 0.0,
         "gameplay_climax": 0.0,
         "hook_explanation": 0.0,
     }
+
+    crosstalk_bins = int(mm_win.get("crosstalk_bins", 0) or 0)
+    sp_count = int(mm_win.get("speaker_count", 1) or 1)
 
     # 1. Shock reaction: sudden surprise/fear delta or dramatic pause + surge
     if facial in ("surprise", "fear"):
@@ -301,6 +307,14 @@ def classify_narrative_arc(
         scores["heated_debate"] += 30.0
     if wpm >= 155.0:
         scores["heated_debate"] += 12.0
+
+    # 3b. Cross-talk debate clash (6th arc): overlapping simultaneous voices during debate/disagreement
+    if crosstalk_bins >= 1:
+        scores["crosstalk_debate_clash"] += 58.0 + min(30.0, crosstalk_bins * 8.0)
+        if sp_count >= 2 or shot_scale == "dual_speaker" or speaker_switch_rate >= 1.2:
+            scores["crosstalk_debate_clash"] += 30.0
+        if vocal in ("urgent_tense", "excited_hype") or aud_s >= 55.0:
+            scores["crosstalk_debate_clash"] += 16.0
 
     # 4. Gameplay / Action climax: wide shot, HUD/graphic popups, bass drop, crowd roar
     if shot_scale == "wide_gameplay":
@@ -359,6 +373,7 @@ def generate_clean_headline(
         "shock_reaction": "UNBELIEVABLE REACTION CAUGHT LIVE",
         "setup_to_laughter": "TRY NOT TO LAUGH MOMENT",
         "heated_debate": "THE ARGUMENT NOBODY EXPECTED",
+        "crosstalk_debate_clash": "BOTH HOSTS COLLIDE AT ONCE",
         "gameplay_climax": "INSANE CLUTCH PLAY BREAKDOWN",
         "hook_explanation": "THE SECRET NOBODY TELLS YOU",
     }
@@ -412,6 +427,11 @@ def _build_smart_packaging(
             f"Things Got Intense Fast... #Shorts",
             f"Who Was Right In This Debate? #Shorts",
         ],
+        "crosstalk_debate_clash": [
+            f"{short_h} #Shorts",
+            f"They Couldn't Stop Interrupting Each Other #Shorts",
+            f"Heated Cross-Talk Clash Live #Shorts",
+        ],
         "gameplay_climax": [
             f"{short_h} #Shorts",
             f"Unreal Climax Sequence Caught Live #Shorts",
@@ -435,6 +455,7 @@ def _build_smart_packaging(
         "shock_reaction": "What was your exact reaction to this twist? Drop it below!",
         "setup_to_laughter": "Which second made you laugh the hardest? Comment the timestamp!",
         "heated_debate": "Who made the stronger point here — Side A or Side B?",
+        "crosstalk_debate_clash": "Both talked over each other here — who won this clash?",
         "gameplay_climax": "Rate this clutch moment from 1 to 10!",
         "hook_explanation": "Did you already know this trick or was this new to you?",
     }
@@ -520,16 +541,23 @@ def extract_viral_clips_offline(
                         arousal_pk = float(mm_win.get("peak_arousal", 45.0))
                         delta_pk = float(mm_win.get("emotion_delta_peak", 0.0))
                         ev_list = mm_win.get("acoustic_events_in_window") or []
+                        eye_c = float(mm_win.get("avg_eye_contact", 0.0) or 0.0)
+                        head_spikes = int(mm_win.get("head_emphasis_count", 0) or 0)
+                        vis_nov = float(mm_win.get("avg_visual_novelty", 0.0) or 0.0)
+                        fluency_avg = float(mm_win.get("avg_fluency", 78.0) or 78.0)
+
+                        eye_boost = (5.0 if eye_c >= 75.0 else (2.5 if eye_c >= 60.0 else 0.0)) + min(4.0, head_spikes * 2.0)
+                        hook_score = int(min(99, max(50, round(hook_score + eye_boost * 0.8 + (3.0 if fluency_avg >= 84.0 else 0.0)))))
 
                         fused_0_100 = 0.40 * text_sem + 0.30 * audio_p + 0.30 * visual_p
-                        arc_bonus = min(10.0, (0.20 * max(0.0, delta_pk - 18.0)) + (4.5 * len(ev_list)))
-                        emotional_score = int(min(99, max(50, round(0.42 * audio_p + 0.48 * visual_p + 0.10 * arousal_pk))))
+                        arc_bonus = min(12.0, (0.20 * max(0.0, delta_pk - 18.0)) + (4.5 * len(ev_list)) + (2.5 if eye_c >= 75.0 else 0.0) + (2.0 if vis_nov >= 28.0 else 0.0))
+                        emotional_score = int(min(99, max(50, round(0.42 * audio_p + 0.46 * visual_p + 0.12 * arousal_pk + (3.0 if head_spikes > 0 else 0.0)))))
                         virality_score = int(min(99, max(50, round(
                             0.62 * fused_0_100
                             + 0.38 * (0.35 * hook_score + 0.25 * retention_score + 0.20 * emotional_score + 0.20 * standalone_score)
                             + arc_bonus * 0.45
                         ))))
-                        mm_tag = f" [MM: audio {audio_p:.0f}, visual {visual_p:.0f}, sharp {mm_win['sharpness_avg']:.0f}]"
+                        mm_tag = f" [MM: audio {audio_p:.0f}, visual {visual_p:.0f}, eye {eye_c:.0f}, sharp {mm_win['sharpness_avg']:.0f}]"
                     else:
                         virality_score = int(round(0.35 * hook_score + 0.25 * retention_score + 0.20 * emotional_score + 0.20 * standalone_score))
                 else:

@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   CheckSquare,
+  Copy,
   Eraser,
   Film,
   Folder,
@@ -14,11 +15,13 @@ import {
   Key,
   Loader2,
   Play,
+  Plus,
   RefreshCw,
   RotateCcw,
   Search,
   Sparkles,
   Square,
+  Tag,
   Terminal,
   Trash2,
   Video,
@@ -126,6 +129,7 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
 
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+  const [selectedTagFilter, setSelectedTagFilter] = useState<string>('all');
   const [sortBy, setSortBy] = useState<SortKey>('newest');
 
   // Bulk Selection & Cleanup Popover
@@ -139,6 +143,9 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
   const [noticeBanner, setNoticeBanner] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [startingId, setStartingId] = useState<number | null>(null);
+  const [duplicatingId, setDuplicatingId] = useState<number | null>(null);
+  const [addingTagProjectId, setAddingTagProjectId] = useState<number | null>(null);
+  const [tagInputValue, setTagInputValue] = useState('');
   const [brokenThumbs, setBrokenThumbs] = useState<Set<number>>(new Set());
 
   // Add API Key & Run Modal Target
@@ -247,6 +254,33 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
       showNotice(err?.message || `Failed to start "${proj.title}".`, 'error');
     } finally {
       setStartingId(null);
+    }
+  };
+
+  const handleDuplicateProject = async (proj: Project, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDuplicatingId(proj.id);
+    try {
+      const res = await api.duplicateProject(proj.id);
+      showNotice(`Cloned "${proj.title}" as "${res.project?.title || `${proj.title} (Copy)`}".`);
+      await loadProjects();
+    } catch (err: any) {
+      showNotice(err?.message || `Failed to duplicate "${proj.title}".`, 'error');
+    } finally {
+      setDuplicatingId(null);
+    }
+  };
+
+  const handleUpdateProjectTags = async (proj: Project, nextTags: string[]) => {
+    const clean = Array.from(new Set(nextTags.map((t) => t.trim()).filter(Boolean)));
+    try {
+      await api.updateProject(proj.id, { tags: clean });
+      setProjectsData((prev) => ({
+        ...prev,
+        projects: prev.projects.map((p) => (p.id === proj.id ? { ...p, tags: clean } : p)),
+      }));
+    } catch (err: any) {
+      showNotice(err?.message || 'Failed to update project tags.', 'error');
     }
   };
 
@@ -377,6 +411,16 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
   const clipsPct = Math.round((breakdown.clips_bytes / storageTotalForBar) * 100);
   const cachePct = Math.max(0, 100 - srcPct - clipsPct);
 
+  const allProjectTags = useMemo(() => {
+    const set = new Set<string>();
+    projectsData.projects.forEach((p) => {
+      (p.tags || []).forEach((t) => {
+        if (t && t.trim()) set.add(t.trim());
+      });
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [projectsData.projects]);
+
   // Filtered + Sorted list
   const filteredAndSortedProjects = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -384,10 +428,12 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
       if (statusFilter === 'ready' && !isReadyProject(p)) return false;
       if (statusFilter === 'created' && !isCreatedProject(p)) return false;
       if (statusFilter === 'failed' && !isFailedOrInterruptedProject(p)) return false;
+      if (selectedTagFilter !== 'all' && !(p.tags || []).includes(selectedTagFilter)) return false;
       if (q) {
         const titleMatch = p.title?.toLowerCase().includes(q);
         const fileMatch = p.source_filename?.toLowerCase().includes(q);
-        if (!titleMatch && !fileMatch) return false;
+        const tagMatch = (p.tags || []).some((t) => t.toLowerCase().includes(q));
+        if (!titleMatch && !fileMatch && !tagMatch) return false;
       }
       return true;
     });
@@ -410,7 +456,7 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
       return b.id - a.id;
     });
     return sorted;
-  }, [projectsData.projects, searchQuery, statusFilter, sortBy]);
+  }, [projectsData.projects, searchQuery, statusFilter, selectedTagFilter, sortBy]);
 
   const allVisibleSelected =
     filteredAndSortedProjects.length > 0 &&
@@ -752,6 +798,41 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
             </button>
           </div>
 
+          {/* Custom Project Tag Filter Pills */}
+          {allProjectTags.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] flex items-center gap-1 mr-1">
+                <Tag className="w-3 h-3 text-[var(--accent-primary)]" />
+                Tags:
+              </span>
+              <button
+                type="button"
+                onClick={() => setSelectedTagFilter('all')}
+                className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border transition ${
+                  selectedTagFilter === 'all'
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                    : 'bg-[var(--bg-card)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:text-[var(--text-primary)]'
+                }`}
+              >
+                All Tags
+              </button>
+              {allProjectTags.map((tag) => (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() => setSelectedTagFilter((prev) => (prev === tag ? 'all' : tag))}
+                  className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border transition ${
+                    selectedTagFilter === tag
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                      : 'bg-[var(--bg-card)] text-[var(--text-secondary)] border-[var(--border-subtle)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  #{tag}
+                </button>
+              ))}
+            </div>
+          )}
+
           <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3">
             <div className="flex flex-1 flex-wrap items-center gap-2.5">
               {/* Search Box */}
@@ -992,6 +1073,89 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
                           {proj.error_message}
                         </p>
                       )}
+
+                      {/* Custom Project Tags Row */}
+                      <div className="flex flex-wrap items-center gap-1 pt-1">
+                        {proj.podcast_mode && (
+                          <span className="px-1.5 py-0.5 rounded bg-[var(--accent-subtle)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/30 text-[10px] font-bold">
+                            Podcast
+                          </span>
+                        )}
+                        {(proj.tags || []).map((tag) => (
+                          <span
+                            key={tag}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedTagFilter((prev) => (prev === tag ? 'all' : tag));
+                            }}
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[10px] font-semibold text-[var(--text-secondary)] hover:border-[var(--accent-primary)] cursor-pointer"
+                          >
+                            <span>#{tag}</span>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleUpdateProjectTags(
+                                  proj,
+                                  (proj.tags || []).filter((t) => t !== tag)
+                                );
+                              }}
+                              className="text-[var(--text-muted)] hover:text-red-400"
+                              title={`Remove tag ${tag}`}
+                            >
+                              ×
+                            </button>
+                          </span>
+                        ))}
+
+                        {addingTagProjectId === proj.id ? (
+                          <input
+                            type="text"
+                            autoFocus
+                            value={tagInputValue}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => setTagInputValue(e.target.value)}
+                            onBlur={() => {
+                              const trimmed = tagInputValue.trim();
+                              if (trimmed) {
+                                void handleUpdateProjectTags(proj, [...(proj.tags || []), trimmed]);
+                              }
+                              setAddingTagProjectId(null);
+                              setTagInputValue('');
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                const trimmed = tagInputValue.trim();
+                                if (trimmed) {
+                                  void handleUpdateProjectTags(proj, [...(proj.tags || []), trimmed]);
+                                }
+                                setAddingTagProjectId(null);
+                                setTagInputValue('');
+                              } else if (e.key === 'Escape') {
+                                setAddingTagProjectId(null);
+                                setTagInputValue('');
+                              }
+                            }}
+                            placeholder="tag name..."
+                            className="w-20 px-1.5 py-0.5 rounded bg-[var(--bg-input)] border border-[var(--accent-primary)] text-[10px] text-[var(--text-primary)] outline-none"
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setAddingTagProjectId(proj.id);
+                              setTagInputValue('');
+                            }}
+                            className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md border border-dashed border-[var(--border-subtle)] text-[10px] text-[var(--text-muted)] hover:text-[var(--accent-primary)] hover:border-[var(--accent-primary)] transition"
+                            title="Add custom organization tag"
+                          >
+                            <Plus className="w-2.5 h-2.5" />
+                            <span>Tag</span>
+                          </button>
+                        )}
+                      </div>
                     </div>
 
                     {/* Smart Action Row */}
@@ -1065,6 +1229,17 @@ export const ViewProjects: React.FC<ViewProjectsProps> = ({
                       >
                         <Terminal className="w-3.5 h-3.5 text-[var(--text-secondary)]" />
                         <span>Logs</span>
+                      </button>
+
+                      {/* Duplicate Project Icon Button */}
+                      <button
+                        type="button"
+                        onClick={(e) => handleDuplicateProject(proj, e)}
+                        disabled={duplicatingId === proj.id}
+                        title="Duplicate project & non-destructively branch clips"
+                        className="p-2 bg-[var(--bg-input)] hover:border-[var(--accent-primary)]/40 text-[var(--text-secondary)] hover:text-[var(--accent-primary)] rounded-xl border border-[var(--border-subtle)] transition disabled:opacity-50"
+                      >
+                        <Copy className={`w-4 h-4 ${duplicatingId === proj.id ? 'animate-pulse' : ''}`} />
                       </button>
 
                       {/* Delete Secondary Icon Button */}

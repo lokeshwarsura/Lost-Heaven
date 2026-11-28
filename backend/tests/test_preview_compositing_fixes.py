@@ -205,7 +205,7 @@ def test_gameplay_webcam_pip_detects_corner_and_composites_rounded_pip(
     assert det["corner"] == "bottom_left"
     assert det["norm_box"] is not None
 
-    # 2. Pure gameplay frame with zero facecam gracefully falls back without empty black PiP
+    # 2. Pure gameplay frame with zero facecam still composites deterministic PiP corner region
     pure_game = np.full((360, 640, 3), (120, 85, 22), dtype=np.uint8)
     cv2.rectangle(pure_game, (220, 120), (420, 240), (160, 200, 60), -1)
     det_pure = detect_webcam_corner_in_frame(pure_game)
@@ -218,7 +218,7 @@ def test_gameplay_webcam_pip_detects_corner_and_composites_rounded_pip(
         webcam_corner="top_right",
         face_track_data={"webcam_detection": det_pure},
     )
-    assert "pad=" not in vf_pure and "crop=" in vf_pure
+    assert "overlay=" in vf_pure and "geq=" in vf_pure and "crop=" in vf_pure
 
     # 3. Preview frame with gameplay_webcam_pip places bottom_left source cam into requested top_right output
     prev = render_exact_preview_frame(

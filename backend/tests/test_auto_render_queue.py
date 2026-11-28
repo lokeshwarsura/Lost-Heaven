@@ -136,7 +136,7 @@ def test_supersede_cancels_active_ffmpeg_and_returns_superseded(queue_env):
                 clip_id=clip_id,
                 background_tasks=BackgroundTasks(),
                 project_id=proj_id,
-                req=RenderClipRequest(quality_mode="fast_preview"),
+                req=RenderClipRequest(quality_mode="fast_preview", punch_zoom=(tag == "second")),
                 session=s,
             )
 

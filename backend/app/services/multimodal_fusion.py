@@ -112,10 +112,15 @@ def fuse_multimodal_tracks(
             vocal_arousal = float(a_pt.get("vocal_arousal", audio_score))
             vocal_valence = float(a_pt.get("vocal_valence", 0.0))
             ac_ev = a_pt.get("acoustic_event")
+            speaker_id_a = a_pt.get("speaker_id")
+            is_crosstalk_a = bool(a_pt.get("is_crosstalk", False))
+            fluency_val = float(a_pt.get("fluency_score", 78.0))
+            music_int_val = float(a_pt.get("music_bed_intensity", 0.0))
         else:
             audio_score, rms_val, lufs_m, wpm_val = 50.0, 0.4, -24.0, 0.0
             vocal_emo, f0_hz, pitch_semi, spec_bright, hnr_db = "calm_storytelling", 0.0, 0.0, 0.2, 10.0
             vocal_arousal, vocal_valence, ac_ev = 45.0, 0.0, None
+            speaker_id_a, is_crosstalk_a, fluency_val, music_int_val = None, False, 78.0, 0.0
 
         if not ac_ev and aud_events:
             matched_ev = next(
@@ -141,6 +146,13 @@ def fuse_multimodal_tracks(
             emo_delta = float(v_fr.get("emotion_delta", 0.0))
             shot_scale = str(v_fr.get("shot_scale") or vid_summary.get("dominant_shot_scale") or "talking_head")
             graphic_score = float(v_fr.get("graphic_event_score", 0.0))
+            eye_contact_val = float(v_fr.get("eye_contact_score", v_fr.get("gaze_score", 0.0))) if fc > 0 else 0.0
+            gaze_eng_val = float(v_fr.get("gaze_engagement_score", eye_contact_val)) if fc > 0 else 0.0
+            head_spike = bool(v_fr.get("head_emphasis_spike", False))
+            vis_novelty = float(v_fr.get("visual_novelty_score", 0.0))
+            sal_rois = v_fr.get("saliency_rois")
+            top_hud_occ = bool(v_fr.get("top_hud_occupied", False))
+            bot_hud_occ = bool(v_fr.get("bottom_hud_occupied", False))
             if fc > 0:
                 vis_raw = max(emo, 0.55 * emo + 0.45 * act)
             else:
@@ -154,6 +166,8 @@ def fuse_multimodal_tracks(
             sharp, exp, emo, act, fc, eyes, is_black = 65.0, 65.0, 50.0, 40.0, 0, 1.0, False
             dom_facial, facial_scores, facial_valence, facial_arousal, emo_delta = "neutral", {"neutral": 1.0}, 0.0, 30.0, 0.0
             shot_scale, graphic_score = "talking_head", 0.0
+            eye_contact_val, gaze_eng_val, head_spike, vis_novelty = 0.0, 0.0, False, 0.0
+            sal_rois, top_hud_occ, bot_hud_occ = None, False, False
             visual_score = 50.0
 
         facial_counts[dom_facial] = facial_counts.get(dom_facial, 0) + 1
@@ -224,6 +238,17 @@ def fuse_multimodal_tracks(
             "fused_arousal": fused_arousal,
             "fused_valence": fused_valence,
             "acoustic_event": ac_ev,
+            "speaker_id": speaker_id_a,
+            "is_crosstalk": is_crosstalk_a,
+            "fluency_score": round(fluency_val, 1),
+            "music_bed_intensity": round(music_int_val, 1),
+            "eye_contact_score": round(eye_contact_val, 1),
+            "gaze_engagement_score": round(gaze_eng_val, 1),
+            "head_emphasis_spike": head_spike,
+            "visual_novelty_score": round(vis_novelty, 1),
+            "saliency_rois": sal_rois,
+            "top_hud_occupied": top_hud_occ,
+            "bottom_hud_occupied": bot_hud_occ,
             "is_cut": any(abs(float(sc.get("t", -9.0)) - t_val) <= step * 0.6 for sc in scene_cuts),
         })
 
@@ -310,17 +335,79 @@ def fuse_multimodal_tracks(
             "avg_arousal": avg_arousal,
             "peak_arousal": peak_arousal,
             "avg_valence": avg_valence,
-            "speaker_switch_rate": float(vid_summary.get("speaker_switch_rate", 0.0)),
+            "speaker_switch_rate": float(
+                ((audio_analysis or {}).get("speaker_diarization") or {}).get("speaker_switch_rate")
+                or vid_summary.get("speaker_switch_rate", 0.0)
+            ),
+            "speaker_count": int(aud_summary.get("speaker_count", 1) or 1),
+            "dominance_ratios": aud_summary.get("dominance_ratios") or {},
+            "crosstalk_count": int(aud_summary.get("crosstalk_count", 0) or 0),
+            "avg_fluency_score": float(aud_summary.get("avg_fluency_score", 78.0) or 78.0),
+            "filler_count": int(aud_summary.get("filler_count", 0) or 0),
+            "clean_hook_count": int(aud_summary.get("clean_hook_count", 0) or 0),
+            "has_existing_music": bool(aud_summary.get("has_existing_music", False)),
+            "avg_music_intensity": float(aud_summary.get("avg_music_intensity", 0.0) or 0.0),
+            "avg_eye_contact_score": float(vid_summary.get("avg_eye_contact_score", 0.0) or 0.0),
+            "avg_gaze_engagement_score": float(vid_summary.get("avg_gaze_engagement_score", 0.0) or 0.0),
+            "head_emphasis_count": int(vid_summary.get("head_emphasis_count", 0) or 0),
+            "avg_visual_novelty": float(vid_summary.get("avg_visual_novelty", 0.0) or 0.0),
+            "top_hud_occupied": bool(vid_summary.get("top_hud_occupied", False)),
+            "bottom_hud_occupied": bool(vid_summary.get("bottom_hud_occupied", False)),
+            "recommended_caption_y": float(vid_summary.get("recommended_caption_y", 0.78) or 0.78),
             "acoustic_event_counts": event_counts,
         },
         "emotion_summary": emotion_summary,
         "emotion_shifts": emotion_shifts,
         "acoustic_events": aud_events,
+        "speaker_diarization": (audio_analysis or {}).get("speaker_diarization") or {},
+        "speech_fluency": (audio_analysis or {}).get("speech_fluency") or {},
+        "music_bed_analysis": (audio_analysis or {}).get("music_bed_analysis") or {},
+        "obstruction_zones": (video_analysis or {}).get("obstruction_zones") or {
+            "top_hud_occupied": bool(vid_summary.get("top_hud_occupied", False)),
+            "bottom_hud_occupied": bool(vid_summary.get("bottom_hud_occupied", False)),
+            "recommended_caption_y": float(vid_summary.get("recommended_caption_y", 0.78) or 0.78),
+        },
         "scene_cuts": scene_cuts,
         "black_intervals": black_intervals,
         "peak_moments": peak_moments,
         "multimodal_timeline": unified,
     }
+
+
+def evaluate_clip_obstruction_zones(
+    multimodal_context: Optional[Dict[str, Any]],
+    start_t: float,
+    end_t: float,
+) -> Dict[str, Any]:
+    """Compute clip-window HUD/subtitle obstruction state and safe `recommended_caption_y`."""
+    default = {
+        "top_hud_occupied": False,
+        "bottom_hud_occupied": False,
+        "recommended_caption_y": 0.78,
+    }
+    if not isinstance(multimodal_context, dict):
+        return default
+    tl = multimodal_context.get("multimodal_timeline") or []
+    pts = [pt for pt in tl if (start_t - 0.15) <= float(pt.get("t", -1.0)) <= (end_t + 0.15)]
+    if pts:
+        top_r = sum(1 for p in pts if p.get("top_hud_occupied")) / float(len(pts))
+        bot_r = sum(1 for p in pts if p.get("bottom_hud_occupied")) / float(len(pts))
+        top_occ = bool(top_r >= 0.20)
+        bot_occ = bool(bot_r >= 0.20)
+        rec_y = 0.22 if (bot_occ and not top_occ) else (0.50 if (bot_occ and top_occ) else 0.78)
+        return {
+            "top_hud_occupied": top_occ,
+            "bottom_hud_occupied": bot_occ,
+            "recommended_caption_y": rec_y,
+        }
+    oz = multimodal_context.get("obstruction_zones") or {}
+    if oz:
+        return {
+            "top_hud_occupied": bool(oz.get("top_hud_occupied", False)),
+            "bottom_hud_occupied": bool(oz.get("bottom_hud_occupied", False)),
+            "recommended_caption_y": float(oz.get("recommended_caption_y", 0.78) or 0.78),
+        }
+    return default
 
 
 def score_window_from_fusion(
@@ -351,6 +438,19 @@ def score_window_from_fusion(
     emo_delta_peak = max(float(p.get("emotion_delta", 0.0)) for p in pts)
     graphic_peak = max(float(p.get("graphic_event_score", 0.0)) for p in pts)
     wpm_avg = sum(float(p.get("wpm", 0.0)) for p in pts) / n
+    face_pts = [p for p in pts if int(p.get("face_count", 0)) > 0]
+    avg_eye_contact = (
+        sum(float(p.get("eye_contact_score", 0.0)) for p in face_pts) / float(len(face_pts))
+        if face_pts else 0.0
+    )
+    avg_gaze_eng = (
+        sum(float(p.get("gaze_engagement_score", 0.0)) for p in face_pts) / float(len(face_pts))
+        if face_pts else 0.0
+    )
+    head_emphasis_cnt = sum(1 for p in pts if p.get("head_emphasis_spike"))
+    avg_vis_novelty = sum(float(p.get("visual_novelty_score", 0.0)) for p in pts) / n
+    avg_fluency = sum(float(p.get("fluency_score", 78.0)) for p in pts) / n
+    crosstalk_cnt = sum(1 for p in pts if p.get("is_crosstalk"))
 
     f_counts: Dict[str, int] = {}
     v_counts: Dict[str, int] = {}
@@ -391,5 +491,213 @@ def score_window_from_fusion(
         "graphic_peak": round(graphic_peak, 1),
         "shot_scale": dom_shot,
         "wpm_avg": round(wpm_avg, 1),
+        "avg_eye_contact": round(avg_eye_contact, 1),
+        "avg_gaze_engagement": round(avg_gaze_eng, 1),
+        "head_emphasis_count": head_emphasis_cnt,
+        "avg_visual_novelty": round(avg_vis_novelty, 1),
+        "avg_fluency": round(avg_fluency, 1),
+        "crosstalk_bins": crosstalk_cnt,
+        "speaker_count": int((multimodal_context.get("summary") or {}).get("speaker_count", 1) or 1),
         "acoustic_events_in_window": ev_types,
+    }
+
+
+def diagnose_clip_retention(
+    multimodal_context: Optional[Dict[str, Any]],
+    start_t: float,
+    end_t: float,
+    *,
+    current_caption_y: float = 0.78,
+    dynamic_punch_zoom: bool = False,
+    auto_trim_dead_air: bool = False,
+    clip_words: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Scan a clip window for Retention Risk Zones (>= 4.0s stretches with
+    visual_novelty_score < 25, arousal < 30, and fluency_score < 60), summarize
+    speaker dominance / crosstalk / fluency / music-bed / HUD collision signals,
+    assign `retention_grade` (`S`, `A`, `B`, `C`), and propose actionable `smart_fixes`.
+    """
+    ctx = multimodal_context if isinstance(multimodal_context, dict) else {}
+    summary = ctx.get("summary") or {}
+    full_tl = ctx.get("multimodal_timeline") or []
+    pts = [pt for pt in full_tl if (start_t - 0.15) <= float(pt.get("t", -1.0)) <= (end_t + 0.15)]
+    step = float(summary.get("step_sec", 0.25) or 0.25)
+
+    # 1. Retention Risk Zones: >= 4.0s stretch where novelty < 25, arousal < 30, fluency < 60
+    risk_zones: List[Dict[str, Any]] = []
+    run_pts: List[Dict[str, Any]] = []
+    for pt in pts:
+        nov = float(pt.get("visual_novelty_score", 0.0))
+        aro = float(pt.get("fused_arousal", pt.get("arousal", 50.0)))
+        flu = float(pt.get("fluency_score", 78.0))
+        if nov < 25.0 and aro < 30.0 and flu < 60.0:
+            run_pts.append(pt)
+        else:
+            if run_pts:
+                r_start = float(run_pts[0].get("t", 0.0))
+                r_end = round(float(run_pts[-1].get("t", r_start)) + step, 3)
+                r_dur = round(r_end - r_start, 2)
+                if r_dur >= 4.0:
+                    risk_zones.append({
+                        "start": round(r_start, 2),
+                        "end": round(r_end, 2),
+                        "duration": r_dur,
+                        "avg_novelty": round(sum(float(x.get("visual_novelty_score", 0.0)) for x in run_pts) / len(run_pts), 1),
+                        "avg_arousal": round(sum(float(x.get("fused_arousal", 0.0)) for x in run_pts) / len(run_pts), 1),
+                        "avg_fluency": round(sum(float(x.get("fluency_score", 50.0)) for x in run_pts) / len(run_pts), 1),
+                        "reason": "Low visual novelty, muted energy & hesitant pacing (>= 4.0s)",
+                    })
+                run_pts = []
+    if run_pts:
+        r_start = float(run_pts[0].get("t", 0.0))
+        r_end = round(float(run_pts[-1].get("t", r_start)) + step, 3)
+        r_dur = round(r_end - r_start, 2)
+        if r_dur >= 4.0:
+            risk_zones.append({
+                "start": round(r_start, 2),
+                "end": round(r_end, 2),
+                "duration": r_dur,
+                "avg_novelty": round(sum(float(x.get("visual_novelty_score", 0.0)) for x in run_pts) / len(run_pts), 1),
+                "avg_arousal": round(sum(float(x.get("fused_arousal", 0.0)) for x in run_pts) / len(run_pts), 1),
+                "avg_fluency": round(sum(float(x.get("fluency_score", 50.0)) for x in run_pts) / len(run_pts), 1),
+                "reason": "Low visual novelty, muted energy & hesitant pacing (>= 4.0s)",
+            })
+
+    # 2. Clip-window Speaker Breakdown & Cross-Talk Overlaps
+    sp_counts: Dict[str, int] = {}
+    for pt in pts:
+        sp = pt.get("speaker_id")
+        if sp:
+            sp_counts[str(sp)] = sp_counts.get(str(sp), 0) + 1
+    if sp_counts:
+        tot_sp = float(sum(sp_counts.values()))
+        clip_dom_ratios = {k: round(v / tot_sp, 4) for k, v in sorted(sp_counts.items())}
+    else:
+        clip_dom_ratios = dict((ctx.get("speaker_diarization") or {}).get("dominance_ratios") or summary.get("dominance_ratios") or {})
+
+    diar = ctx.get("speaker_diarization") or {}
+    crosstalk_in_clip = [
+        ov for ov in (diar.get("crosstalk_overlaps") or [])
+        if float(ov.get("end", ov.get("t", -1.0))) >= (start_t - 0.25) and float(ov.get("t", -1.0)) <= (end_t + 0.25)
+    ]
+
+    # 3. Hesitation / Dead-Air (> 1.2s) & Fluency
+    flu_info = ctx.get("speech_fluency") or {}
+    hes_in_clip = [
+        h for h in (flu_info.get("hesitation_intervals") or [])
+        if float(h.get("end", h.get("t", -1.0))) >= (start_t - 0.15) and float(h.get("t", -1.0)) <= (end_t + 0.15)
+    ]
+    max_hes_sec = max((float(h.get("duration", 0.0)) for h in hes_in_clip), default=0.0)
+    if clip_words:
+        spoken_w = [w for w in clip_words if not w.get("deleted") and str(w.get("word", "")).strip()]
+        for i in range(len(spoken_w) - 1):
+            gap = float(spoken_w[i + 1].get("start", 0.0)) - float(spoken_w[i].get("end", 0.0))
+            if gap > max_hes_sec:
+                max_hes_sec = round(gap, 2)
+
+    spoken_flu = [float(p.get("fluency_score", 78.0)) for p in pts if p.get("fluency_score") is not None]
+    avg_fluency = round(sum(spoken_flu) / len(spoken_flu), 1) if spoken_flu else float(summary.get("avg_fluency_score", 78.0) or 78.0)
+
+    face_pts = [p for p in pts if int(p.get("face_count", 0)) > 0]
+    avg_eye = round(sum(float(p.get("eye_contact_score", 0.0)) for p in face_pts) / len(face_pts), 1) if face_pts else float(summary.get("avg_eye_contact_score", 0.0) or 0.0)
+    avg_nov = round(sum(float(p.get("visual_novelty_score", 0.0)) for p in pts) / len(pts), 1) if pts else float(summary.get("avg_visual_novelty", 0.0) or 0.0)
+    avg_comb = round(sum(float(p.get("combined_engagement_score", 50.0)) for p in pts) / len(pts), 1) if pts else float(summary.get("overall_engagement_score", 60.0) or 60.0)
+
+    # 4. HUD / Subtitle Collision Detection
+    hud = evaluate_clip_obstruction_zones(ctx, start_t, end_t)
+    rec_cap_y = float(hud["recommended_caption_y"])
+    cur_y = float(current_caption_y if current_caption_y <= 1.0 else (current_caption_y / 100.0))
+    hud_collision = bool(
+        (hud["bottom_hud_occupied"] and cur_y > 0.56 and rec_cap_y <= 0.35)
+        or (hud["top_hud_occupied"] and cur_y < 0.34 and rec_cap_y >= 0.65)
+        or ((hud["bottom_hud_occupied"] or hud["top_hud_occupied"]) and abs(cur_y - rec_cap_y) >= 0.20)
+    )
+
+    # 5. Actionable Smart Fixes
+    peaks_in_clip = [
+        pk for pk in (ctx.get("peak_moments") or [])
+        if (start_t - 0.15) <= float(pk.get("t", -1.0)) <= (end_t + 0.15)
+    ]
+    smart_fixes: List[Dict[str, Any]] = []
+    if hud_collision:
+        smart_fixes.append({
+            "id": "shift_captions_clear_hud",
+            "label": f"Move Captions to Top Safe Zone (Y={rec_cap_y:.2f})",
+            "reason": "Avoids colliding with burned-in subtitles / bottom HUD overlays",
+            "target_caption_y": rec_cap_y,
+            "applied": False,
+        })
+    if not dynamic_punch_zoom and (len(risk_zones) >= 1 or avg_nov < 42.0 or len(peaks_in_clip) >= 1):
+        smart_fixes.append({
+            "id": "enable_punch_zoom_on_peaks",
+            "label": "Enable Dynamic Punch-Zoom on Peaks",
+            "reason": "Injects visual energy into static stretches and vocal/gaze peaks",
+            "applied": False,
+        })
+    if not auto_trim_dead_air and max_hes_sec > 1.2:
+        smart_fixes.append({
+            "id": "trim_hesitation_dead_air",
+            "label": f"Auto-Trim Hesitation Pauses ({max_hes_sec:.1f}s max)",
+            "reason": "Tightens stalled delivery gaps exceeding 1.2s for higher retention",
+            "max_gap_sec": round(max_hes_sec, 2),
+            "applied": False,
+        })
+
+    # 6. Composite Grade (S, A, B, C)
+    vis_eng_bonus = avg_eye if face_pts else min(100.0, avg_nov * 1.6 + 25.0)
+    score_num = (
+        0.38 * avg_comb
+        + 0.28 * avg_fluency
+        + 0.18 * vis_eng_bonus
+        + 0.16 * min(100.0, avg_nov * 2.0 + (20.0 if dynamic_punch_zoom else 0.0))
+        - 16.0 * len(risk_zones)
+        - (9.0 if hud_collision else 0.0)
+        - (8.0 if (not auto_trim_dead_air and max_hes_sec > 1.5) else 0.0)
+    )
+    score_num = round(max(0.0, min(100.0, score_num)), 1)
+    if score_num >= 84.0 and not risk_zones and not hud_collision:
+        grade = "S"
+    elif score_num >= 68.0 and len(risk_zones) <= 1:
+        grade = "A"
+    elif score_num >= 48.0:
+        grade = "B"
+    else:
+        grade = "C"
+
+    mb = ctx.get("music_bed_analysis") or {}
+    return {
+        "retention_grade": grade,
+        "retention_score": score_num,
+        "risk_zones": risk_zones,
+        "risk_zone_count": len(risk_zones),
+        "smart_fixes": smart_fixes,
+        "speaker_breakdown": {
+            "speaker_count": len(clip_dom_ratios) or int(summary.get("speaker_count", 1) or 1),
+            "dominance_ratios": clip_dom_ratios,
+            "crosstalk_overlaps": crosstalk_in_clip,
+            "crosstalk_count": len(crosstalk_in_clip),
+        },
+        "speech_fluency": {
+            "avg_fluency_score": avg_fluency,
+            "filler_count": int(flu_info.get("filler_count", summary.get("filler_count", 0)) or 0),
+            "clean_hook_candidates": [
+                hk for hk in (flu_info.get("clean_hook_candidates") or [])
+                if (start_t - 0.5) <= float(hk.get("t", -9.0)) <= (end_t + 0.5)
+            ],
+            "hesitation_intervals": hes_in_clip,
+            "max_hesitation_sec": round(max_hes_sec, 2),
+        },
+        "music_bed_summary": {
+            "has_existing_music": bool(mb.get("has_existing_music", summary.get("has_existing_music", False))),
+            "avg_music_intensity": float(mb.get("avg_music_intensity", summary.get("avg_music_intensity", 0.0)) or 0.0),
+            "estimated_bpm": float(mb.get("estimated_bpm", 0.0) or 0.0),
+        },
+        "hud_obstruction": {
+            **hud,
+            "current_caption_y": round(cur_y, 3),
+            "hud_collision": hud_collision,
+        },
+        "avg_eye_contact_score": avg_eye,
+        "avg_visual_novelty": avg_nov,
     }

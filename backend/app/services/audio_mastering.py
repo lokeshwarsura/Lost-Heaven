@@ -72,6 +72,7 @@ def build_voice_filter_chain(
     tighten_pacing: bool = False,
     voice_isolation: bool = False,
     vocal_clarity: bool = False,
+    voice_enhancer: bool = False,
     audio_volume: float = 1.0,
     normalize_audio: bool = True,
     voice_eq_preset: str = "Raw",
@@ -116,6 +117,13 @@ def build_voice_filter_chain(
             "equalizer=f=7500:t=q:w=1.0:g=2.4",
         ])
 
+    if voice_enhancer:
+        filters.extend([
+            "highpass=f=80",
+            "equalizer=f=3200:t=q:w=1.2:g=3.0",
+            "acompressor=threshold=-18dB:ratio=2.5:attack=10:release=140:makeup=1.5dB",
+        ])
+
     if voice_isolation:
         filters.extend([
             "highpass=f=90",
@@ -124,7 +132,7 @@ def build_voice_filter_chain(
             "acompressor=threshold=-20dB:ratio=3.0:attack=8:release=120:makeup=2.5dB",
             "equalizer=f=3200:t=q:w=1.2:g=2.5",
         ])
-    elif vocal_clarity:
+    elif vocal_clarity and not voice_enhancer:
         filters.extend(["highpass=f=80", "afftdn=nf=-25"])
 
     if de_esser:
@@ -141,12 +149,16 @@ def build_voice_filter_chain(
         vol = max(0.0, min(3.0, float(audio_volume)))
         filters.append(f"volume={vol:.2f}")
 
-    if normalize_audio:
+    if normalize_audio or voice_enhancer:
         lt_str = str(loudness_target or "-14 LUFS")
-        lufs = -16 if "-16" in lt_str else (-11 if "-11" in lt_str else -14)
+        lufs = -14 if voice_enhancer and "-14" in lt_str else (-16 if "-16" in lt_str else (-11 if "-11" in lt_str else -14))
         filters.append(f"loudnorm=I={lufs}:TP=-1.5:LRA=11")
 
-    filters.extend(["aresample=48000", "aformat=sample_rates=48000:channel_layouts=stereo"])
+    filters.extend([
+        "aresample=async=1:first_pts=0",
+        "aresample=48000",
+        "aformat=sample_rates=48000:channel_layouts=stereo",
+    ])
     return ",".join(filters)
 
 

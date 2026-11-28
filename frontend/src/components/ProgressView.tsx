@@ -21,6 +21,7 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Search,
   Sparkles,
   Square,
   Terminal,
@@ -93,6 +94,7 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
 
   // Terminal controls (open by default!)
   const [stageFilter, setStageFilter] = useState<StageFilterKey>('ALL');
+  const [logSearchQuery, setLogSearchQuery] = useState('');
   const [autoScroll, setAutoScroll] = useState(true);
   const [copiedLogs, setCopiedLogs] = useState(false);
   const logViewportRef = useRef<HTMLDivElement>(null);
@@ -115,6 +117,7 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
     wasObservedRunningRef.current = false;
     autoTransitionTriggeredRef.current = false;
     setStageFilter('ALL');
+    setLogSearchQuery('');
   }, [projectId]);
 
   // Poll GET /api/jobs to keep Command Center & Auto-Binding fresh
@@ -224,11 +227,30 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
     return () => window.clearInterval(tick);
   }, [isRunningStatus]);
 
+  const throughputMult = useMemo(() => {
+    if (typeof job?.throughput_speed === 'number' && job.throughput_speed > 0) {
+      return job.throughput_speed;
+    }
+    if ((job?.duration_sec ?? 0) > 0 && liveElapsedSec > 0) {
+      return Number((job!.duration_sec! / liveElapsedSec).toFixed(1));
+    }
+    return null;
+  }, [job?.throughput_speed, job?.duration_sec, liveElapsedSec]);
+
   // Auto-scroll terminal console when enabled
   const filteredLogs = useMemo(() => {
     const allLogs = job?.logs || [];
-    return allLogs.filter((l) => logMatchesStageFilter(l, stageFilter));
-  }, [job?.logs, stageFilter]);
+    const q = logSearchQuery.trim().toLowerCase();
+    return allLogs.filter((l) => {
+      if (!logMatchesStageFilter(l, stageFilter)) return false;
+      if (q) {
+        const msgMatch = (l.message || '').toLowerCase().includes(q);
+        const stgMatch = (l.stage || '').toLowerCase().includes(q);
+        if (!msgMatch && !stgMatch) return false;
+      }
+      return true;
+    });
+  }, [job?.logs, stageFilter, logSearchQuery]);
 
   useEffect(() => {
     if (autoScroll && logViewportRef.current) {
@@ -251,14 +273,14 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
     }
   };
 
-  const handleRetryJob = async (targetId: number, forceOffline: boolean = false) => {
+  const handleRetryJob = async (targetId: number, forceOffline: boolean = false, stage?: string) => {
     if (retrying) return;
     setRetrying(true);
     setKeyError(null);
     wasObservedRunningRef.current = true;
     autoTransitionTriggeredRef.current = false;
     try {
-      await api.retryProject(targetId, forceOffline);
+      await api.retryProject(targetId, forceOffline, stage);
       setSelectedJobId(targetId);
       setInspectingHistorical(false);
       const updated = await api.getProjectProgress(targetId);
@@ -615,6 +637,16 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
                     {hwLabel}
                   </span>
 
+                  {throughputMult !== null && (
+                    <span
+                      title="Pipeline processing speed vs video realtime"
+                      className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-mono font-bold bg-[var(--accent-soft)] border border-[var(--accent-primary)]/40 text-[var(--accent-primary)]"
+                    >
+                      <Activity className="w-3 h-3" />
+                      {throughputMult.toFixed(1)}× Realtime
+                    </span>
+                  )}
+
                   <span
                     className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
                       isOfflineEngine
@@ -850,11 +882,18 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
               const stepDur = formatStepDuration(st.duration_sec);
 
               return (
-                <button
+                <div
                   key={st.id || idx}
-                  type="button"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => setStageFilter((prev) => (prev === filterId ? 'ALL' : filterId))}
-                  className={`p-3 rounded-xl border text-left transition-all flex flex-col justify-between gap-2 ${
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setStageFilter((prev) => (prev === filterId ? 'ALL' : filterId));
+                    }
+                  }}
+                  className={`p-3 rounded-xl border text-left transition-all flex flex-col justify-between gap-2 cursor-pointer ${
                     isSelectedFilter
                       ? 'bg-[var(--accent-soft)] border-[var(--accent-primary)] ring-1 ring-[var(--accent-primary)]/40'
                       : st.status === 'running'
@@ -899,7 +938,23 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
                       Active · {st.percent}%
                     </div>
                   )}
-                </button>
+
+                  {st.status === 'failed' && selectedJobId && (
+                    <button
+                      type="button"
+                      disabled={retrying}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void handleRetryJob(selectedJobId, false, st.id);
+                      }}
+                      className="mt-0.5 inline-flex items-center justify-center gap-1 px-2 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-[10px] font-bold text-rose-200 transition disabled:opacity-50"
+                      title={`Retry pipeline starting from stage ${st.name}`}
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      <span>Retry Stage</span>
+                    </button>
+                  )}
+                </div>
               );
             })}
           </div>
@@ -944,7 +999,19 @@ export const ProgressView: React.FC<ProgressViewProps> = ({
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative">
+                <Search className="w-3 h-3 text-[var(--text-muted)] absolute left-2 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={logSearchQuery}
+                  onChange={(e) => setLogSearchQuery(e.target.value)}
+                  placeholder="Search logs..."
+                  aria-label="Filter telemetry logs"
+                  className="w-36 sm:w-44 pl-6 pr-2 py-1 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[11px] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent-primary)]"
+                />
+              </div>
+
               <button
                 type="button"
                 onClick={() => setAutoScroll((v) => !v)}

@@ -157,7 +157,8 @@ def test_no_webcam_detected_guard_falls_back_gracefully(tmp_path: Path):
         face_track_data={"webcam_detection": reg},
     )
     assert "vignette=" not in vf
-    assert "crop=" in vf and "geq=" not in vf
+    # Pure gameplay with gameplay_webcam_pip now deterministically crops top_left secondary_box into rounded PiP
+    assert "crop=" in vf and "geq=" in vf and "overlay=" in vf
 
 
 def test_pip_rounded_card_zero_vignette_and_safe_positions(
@@ -245,7 +246,7 @@ def test_split_top_40_and_auto_track_headroom_smoothing():
         },
     )
     assert "vstack=inputs=2" in vf_split
-    assert "h=3:color=0xFFFFFF@0.28" in vf_split
+    assert "h=2:color=0xFFFFFF@0.28" in vf_split
 
     # EMA alpha=0.14 & deadzone=0.03 filter out small jitter
     assert _smooth_step((0.50, 0.50), (0.52, 0.50), is_cut=False, alpha=0.14, deadzone=0.03) == (0.50, 0.50)

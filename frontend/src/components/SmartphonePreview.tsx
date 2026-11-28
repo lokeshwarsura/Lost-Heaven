@@ -3,9 +3,10 @@ import {
   Play, Pause, RefreshCw, Eye, Smartphone, Heart, MessageCircle,
   Share2, Music, Volume2, VolumeX, Download, Zap, CheckCircle2, Loader2, X, Scissors,
   Sparkles, Package, Copy, Check, Activity, Trash2, Image as ImageIcon, Shield,
-  Crop, Crosshair, Lock, Unlock, Move, RotateCcw
+  Crop, Crosshair, Lock, Unlock, Move, RotateCcw, AlertTriangle, ExternalLink, Link2,
+  Unlink, Upload, ChevronDown, ChevronUp, StepBack, StepForward, Grid
 } from 'lucide-react';
-import { ViralClip, PlatformCopyMap, RetentionAuditReport, RetentionWarning, PrivacyBlurBox, PreflightReport, PreflightCheck, FramingOverride, BestFrameItem } from '../types';
+import { ViralClip, PlatformCopyMap, RetentionAuditReport, RetentionWarning, PrivacyBlurBox, PreflightReport, PreflightCheck, FramingOverride, FramingBox, BestFrameItem } from '../types';
 import { api } from '../api/client';
 
 const YouTubeIcon = ({ className = 'w-4 h-4' }: { className?: string }) => (
@@ -90,7 +91,8 @@ interface SmartphonePreviewProps {
   onAutoRenderClip?: (
     projectId: number,
     clipId: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    overrides?: Record<string, any>
   ) => Promise<{
     status: string;
     video_url?: string;
@@ -171,6 +173,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   };
 
   const [stageSize, setStageSize] = useState<{ w: number; h: number }>({ w: 280, h: 460 });
+  const [canvasZoom, setCanvasZoom] = useState<'fit' | '75' | '100'>('fit');
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -211,25 +214,58 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const [blurDraftBoxes, setBlurDraftBoxes] = useState<PrivacyBlurBox[] | null>(null);
   const [isEditFrameOpen, setIsEditFrameOpen] = useState(false);
   const [sourceFrameUrl, setSourceFrameUrl] = useState<string | null>(null);
+  const DEFAULT_FRAME_CROP: FramingBox = { x: 0.34, y: 0.04, w: 0.32, h: 0.92 };
   const [frameBoxDraft, setFrameBoxDraft] = useState<{
-    webcam_box: { x: number; y: number; w: number; h: number };
+    webcam_box: FramingBox;
     focus_anchor: { x: number; y: number };
+    frame_crop: FramingBox;
+    keyframe_start_crop: FramingBox | null;
+    keyframe_end_crop: FramingBox | null;
     lock_camera: boolean;
   }>({
     webcam_box: { x: 0.02, y: 0.02, w: 0.28, h: 0.30 },
     focus_anchor: { x: 0.5, y: 0.42 },
+    frame_crop: DEFAULT_FRAME_CROP,
+    keyframe_start_crop: null,
+    keyframe_end_crop: null,
     lock_camera: false,
   });
+  const [frameEditTarget, setFrameEditTarget] = useState<'frame_crop' | 'start_kf' | 'end_kf' | 'webcam'>('frame_crop');
+  const [showRuleOfThirds, setShowRuleOfThirds] = useState<boolean>(true);
+  const [showCanvasThirds, setShowCanvasThirds] = useState<boolean>(false);
+  const [cropSnapGuides, setCropSnapGuides] = useState<{ x: boolean; y: boolean }>({ x: false, y: false });
+
+  useEffect(() => {
+    const onToggleThirds = () => setShowCanvasThirds((v) => !v);
+    window.addEventListener('lh-toggle-thirds', onToggleThirds);
+    return () => window.removeEventListener('lh-toggle-thirds', onToggleThirds);
+  }, []);
   const frameBoxCanvasRef = useRef<HTMLDivElement>(null);
   const frameDragRef = useRef<{
-    target: 'box_move' | 'box_nw' | 'box_ne' | 'box_sw' | 'box_se' | 'anchor';
+    target:
+      | 'box_move'
+      | 'box_nw'
+      | 'box_ne'
+      | 'box_sw'
+      | 'box_se'
+      | 'crop_move'
+      | 'crop_nw'
+      | 'crop_ne'
+      | 'crop_sw'
+      | 'crop_se'
+      | 'anchor';
+    cropField: 'frame_crop' | 'keyframe_start_crop' | 'keyframe_end_crop';
     startX: number;
     startY: number;
-    origBox: { x: number; y: number; w: number; h: number };
+    origBox: FramingBox;
+    origCrop: FramingBox;
     origAnchor: { x: number; y: number };
     latest: {
-      webcam_box: { x: number; y: number; w: number; h: number };
+      webcam_box: FramingBox;
       focus_anchor: { x: number; y: number };
+      frame_crop: FramingBox;
+      keyframe_start_crop: FramingBox | null;
+      keyframe_end_crop: FramingBox | null;
       lock_camera: boolean;
     };
   } | null>(null);
@@ -291,6 +327,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         const capPatch: Partial<ViralClip> = {
           caption_x: dr.latestX,
           caption_y: dr.latestY,
+          caption_custom_position: true,
+          face_safe_captions: false,
           position_x: Math.round(dr.latestX * 100),
           position_y: Math.round(dr.latestY * 100),
           position_grid: Math.abs(dr.latestX - 0.5) < 0.03 && Math.abs(dr.latestY - 0.5) < 0.03
@@ -326,13 +364,21 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       focus_anchor: ov?.focus_anchor
         ? { ...ov.focus_anchor }
         : { x: cam?.face_cx ?? 0.5, y: cam?.face_cy ?? 0.42 },
+      frame_crop: ov?.frame_crop
+        ? { ...ov.frame_crop }
+        : { ...DEFAULT_FRAME_CROP },
+      keyframe_start_crop: ov?.keyframe_start_crop ? { ...ov.keyframe_start_crop } : null,
+      keyframe_end_crop: ov?.keyframe_end_crop ? { ...ov.keyframe_end_crop } : null,
       lock_camera: Boolean(ov?.lock_camera),
     });
   }, [clip?.id, JSON.stringify(clip?.framing_override || null)]);
 
   const persistFramingOverride = async (next: {
-    webcam_box?: { x: number; y: number; w: number; h: number };
+    webcam_box?: FramingBox;
     focus_anchor?: { x: number; y: number };
+    frame_crop?: FramingBox | null;
+    keyframe_start_crop?: FramingBox | null;
+    keyframe_end_crop?: FramingBox | null;
     lock_camera?: boolean;
     reset?: boolean;
   }) => {
@@ -383,6 +429,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           focus_anchor: ov?.focus_anchor
             ? { ...ov.focus_anchor }
             : { x: sh?.cx ?? 0.5, y: sh?.cy ?? 0.42 },
+          frame_crop: ov?.frame_crop
+            ? { ...ov.frame_crop }
+            : { ...DEFAULT_FRAME_CROP },
+          keyframe_start_crop: ov?.keyframe_start_crop ? { ...ov.keyframe_start_crop } : null,
+          keyframe_end_crop: ov?.keyframe_end_crop ? { ...ov.keyframe_end_crop } : null,
           lock_camera: Boolean(ov?.lock_camera),
         });
       }
@@ -402,12 +453,17 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       const dx = (ev.clientX - dr.startX) / Math.max(1, rect.width);
       const dy = (ev.clientY - dr.startY) / Math.max(1, rect.height);
       const b = { ...dr.origBox };
+      const c = { ...dr.origCrop };
       let anchor = { ...dr.origAnchor };
+      let snapX = false;
+      let snapY = false;
+
       if (dr.target === 'anchor') {
-        anchor = {
-          x: Number(Math.max(0.05, Math.min(0.95, dr.origAnchor.x + dx)).toFixed(3)),
-          y: Number(Math.max(0.05, Math.min(0.95, dr.origAnchor.y + dy)).toFixed(3)),
-        };
+        let ax = Math.max(0.05, Math.min(0.95, dr.origAnchor.x + dx));
+        let ay = Math.max(0.05, Math.min(0.95, dr.origAnchor.y + dy));
+        if (Math.abs(ax - 0.5) <= 0.02) { ax = 0.5; snapX = true; }
+        if (Math.abs(ay - 0.5) <= 0.02) { ay = 0.5; snapY = true; }
+        anchor = { x: Number(ax.toFixed(3)), y: Number(ay.toFixed(3)) };
       } else if (dr.target === 'box_move') {
         b.x = Number(Math.max(0, Math.min(1 - b.w, dr.origBox.x + dx)).toFixed(3));
         b.y = Number(Math.max(0, Math.min(1 - b.h, dr.origBox.y + dy)).toFixed(3));
@@ -431,21 +487,68 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         b.w = Number((dr.origBox.x + dr.origBox.w - nx).toFixed(3));
         b.x = Number(nx.toFixed(3));
         b.h = Number(Math.max(0.08, Math.min(1 - b.y, dr.origBox.h + dy)).toFixed(3));
+      } else if (dr.target === 'crop_move') {
+        let nx = Math.max(0, Math.min(1 - c.w, dr.origCrop.x + dx));
+        let ny = Math.max(0, Math.min(1 - c.h, dr.origCrop.y + dy));
+        const cxCenter = nx + c.w * 0.5;
+        const cyCenter = ny + c.h * 0.5;
+        if (Math.abs(cxCenter - 0.5) <= 0.02) {
+          nx = Math.max(0, Math.min(1 - c.w, 0.5 - c.w * 0.5));
+          snapX = true;
+        }
+        if (Math.abs(cyCenter - 0.5) <= 0.02) {
+          ny = Math.max(0, Math.min(1 - c.h, 0.5 - c.h * 0.5));
+          snapY = true;
+        }
+        c.x = Number(nx.toFixed(3));
+        c.y = Number(ny.toFixed(3));
+      } else if (dr.target === 'crop_se') {
+        c.w = Number(Math.max(0.10, Math.min(1 - c.x, dr.origCrop.w + dx)).toFixed(3));
+        c.h = Number(Math.max(0.10, Math.min(1 - c.y, dr.origCrop.h + dy)).toFixed(3));
+      } else if (dr.target === 'crop_nw') {
+        const nx = Math.max(0, Math.min(dr.origCrop.x + dr.origCrop.w - 0.10, dr.origCrop.x + dx));
+        const ny = Math.max(0, Math.min(dr.origCrop.y + dr.origCrop.h - 0.10, dr.origCrop.y + dy));
+        c.w = Number((dr.origCrop.x + dr.origCrop.w - nx).toFixed(3));
+        c.h = Number((dr.origCrop.y + dr.origCrop.h - ny).toFixed(3));
+        c.x = Number(nx.toFixed(3));
+        c.y = Number(ny.toFixed(3));
+      } else if (dr.target === 'crop_ne') {
+        const ny = Math.max(0, Math.min(dr.origCrop.y + dr.origCrop.h - 0.10, dr.origCrop.y + dy));
+        c.w = Number(Math.max(0.10, Math.min(1 - c.x, dr.origCrop.w + dx)).toFixed(3));
+        c.h = Number((dr.origCrop.y + dr.origCrop.h - ny).toFixed(3));
+        c.y = Number(ny.toFixed(3));
+      } else if (dr.target === 'crop_sw') {
+        const nx = Math.max(0, Math.min(dr.origCrop.x + dr.origCrop.w - 0.10, dr.origCrop.x + dx));
+        c.w = Number((dr.origCrop.x + dr.origCrop.w - nx).toFixed(3));
+        c.x = Number(nx.toFixed(3));
+        c.h = Number(Math.max(0.10, Math.min(1 - c.y, dr.origCrop.h + dy)).toFixed(3));
       }
-      const next = { ...dr.latest, webcam_box: b, focus_anchor: anchor };
+
+      setCropSnapGuides({ x: snapX, y: snapY });
+      const next = {
+        ...dr.latest,
+        webcam_box: b,
+        focus_anchor: anchor,
+        ...(dr.target.startsWith('crop_') ? { [dr.cropField]: c } : {}),
+      };
       dr.latest = next;
       setFrameBoxDraft(next);
     };
     const onUp = () => {
       const dr = frameDragRef.current;
       setDraggingFrameMode(null);
+      setCropSnapGuides({ x: false, y: false });
       frameDragRef.current = null;
       if (dr) {
-        void persistFramingOverride({
+        const payload: Parameters<typeof persistFramingOverride>[0] = {
           webcam_box: dr.latest.webcam_box,
           focus_anchor: dr.latest.focus_anchor,
           lock_camera: dr.latest.lock_camera,
-        });
+        };
+        if (dr.target.startsWith('crop_')) {
+          payload[dr.cropField] = dr.latest[dr.cropField];
+        }
+        void persistFramingOverride(payload);
       }
     };
     window.addEventListener('pointermove', onMove);
@@ -498,7 +601,25 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const [publishDesc, setPublishDesc] = useState('Created with Lost Heaven Studio! #Shorts');
   const [publishPrivacy, setPublishPrivacy] = useState<'private' | 'unlisted' | 'public'>('private');
   const [isPublishing, setIsPublishing] = useState(false);
-  const [publishResult, setPublishResult] = useState<string | null>(null);
+  const [publishSuccess, setPublishSuccess] = useState<{
+    video_id: string;
+    url: string;
+    privacy_status: string;
+    channel_title?: string | null;
+  } | null>(null);
+  const [publishError, setPublishError] = useState<string | null>(null);
+  const [ytStatus, setYtStatus] = useState<{
+    client_configured: boolean;
+    connected: boolean;
+    channel_title: string | null;
+    channel_id: string | null;
+  } | null>(null);
+  const [isLoadingYtStatus, setIsLoadingYtStatus] = useState(false);
+  const [isConnectingYt, setIsConnectingYt] = useState(false);
+  const [isUploadingSecrets, setIsUploadingSecrets] = useState(false);
+  const [showOAuthSetup, setShowOAuthSetup] = useState(false);
+  const [ytAuthError, setYtAuthError] = useState<string | null>(null);
+  const clientSecretsInputRef = useRef<HTMLInputElement>(null);
   const [isExportingPack, setIsExportingPack] = useState(false);
   const [packError, setPackError] = useState<string | null>(null);
   const [socialCopy, setSocialCopy] = useState<Partial<PlatformCopyMap> | null>(null);
@@ -667,6 +788,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       (resolvedUrl && !resolvedUrl.includes('/media/masters/')))
   );
   const activeVideoSrc = clipIsRendered ? resolvedUrl : undefined;
+  const isStage5Rendering = Boolean(
+    clip &&
+    !clipIsRendered &&
+    (clip.status === 'rendering' || clip.render_status === 'rendering') &&
+    !isAutoRendering &&
+    !isPreparingClip
+  );
 
   useEffect(() => {
     if (seekTime !== undefined && clip) {
@@ -855,6 +983,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const cmdStateRef = useRef({
     clip,
     relCurrent,
+    clipStartOffset,
     duration,
     keepSegments,
     onTrimClip,
@@ -865,6 +994,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   cmdStateRef.current = {
     clip,
     relCurrent,
+    clipStartOffset,
     duration,
     keepSegments,
     onTrimClip,
@@ -873,10 +1003,41 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     handleBladeSplit,
   };
 
-  // Keyboard shortcut event bridge from App.tsx (Space, Arrows, I/O, B, M)
+  const previewFps = clip?.export_fps === '60' ? 60 : clip?.export_fps === '24' ? 24 : 30;
+
+  const formatSMPTE = (secs: number, fpsVal = previewFps) => {
+    const safe = Math.max(0, secs || 0);
+    const totalFrames = Math.round(safe * fpsVal);
+    const f = totalFrames % fpsVal;
+    const totalSec = Math.floor(totalFrames / fpsVal);
+    const s = totalSec % 60;
+    const m = Math.floor(totalSec / 60) % 60;
+    const h = Math.floor(totalSec / 3600);
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}:${String(f).padStart(2, '0')}`;
+  };
+
+  const stepSingleFrame = (framesDelta: number) => {
+    const vid = videoRef.current;
+    if (vid && !vid.paused) {
+      vid.pause();
+      setIsPlaying(false);
+    }
+    const maxDur =
+      vid && Number.isFinite(vid.duration) && vid.duration > 0
+        ? Math.max(0.2, vid.duration - clipStartOffset)
+        : Math.max(1, duration || 30);
+    const stepSec = framesDelta / Math.max(1, previewFps);
+    const nextRel = Math.max(0, Math.min(maxDur, Number((relCurrent + stepSec).toFixed(4))));
+    const absTarget = clipStartOffset + nextRel;
+    if (vid) vid.currentTime = absTarget;
+    setCurrentTime(absTarget);
+    onPlaybackTimeChange?.(nextRel);
+  };
+
+  // Keyboard shortcut event bridge from App.tsx (Space, Arrows +/-1f, Shift+Arrows +/-1s, I/O, B, M)
   useEffect(() => {
     const onPlayerCmd = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ type: string; delta?: number }>).detail;
+      const detail = (ev as CustomEvent<{ type: string; delta?: number; frames?: number }>).detail;
       if (!detail) return;
       const vid = videoRef.current;
       const st = cmdStateRef.current;
@@ -893,16 +1054,32 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         const nextMuted = !vid.muted;
         vid.muted = nextMuted;
         setIsMuted(nextMuted);
-      } else if (detail.type === 'seekDelta') {
-        const cur = vid ? vid.currentTime : st.relCurrent;
+      } else if (detail.type === 'stepFrame') {
+        if (vid && !vid.paused) {
+          vid.pause();
+          setIsPlaying(false);
+        }
+        const fpsVal = st.clip?.export_fps === '60' ? 60 : st.clip?.export_fps === '24' ? 24 : 30;
         const maxDur =
           vid && Number.isFinite(vid.duration) && vid.duration > 0
-            ? vid.duration
+            ? Math.max(0.2, vid.duration - (st.clipStartOffset || 0))
             : Math.max(1, st.duration);
-        const nextT = Math.max(0, Math.min(maxDur, cur + (detail.delta || 0)));
-        if (vid) vid.currentTime = nextT;
-        setCurrentTime(nextT);
-        st.onPlaybackTimeChange?.(nextT);
+        const stepSec = (detail.frames || 0) / fpsVal;
+        const nextRel = Math.max(0, Math.min(maxDur, Number((st.relCurrent + stepSec).toFixed(4))));
+        const absT = (st.clipStartOffset || 0) + nextRel;
+        if (vid) vid.currentTime = absT;
+        setCurrentTime(absT);
+        st.onPlaybackTimeChange?.(nextRel);
+      } else if (detail.type === 'seekDelta') {
+        const maxDur =
+          vid && Number.isFinite(vid.duration) && vid.duration > 0
+            ? Math.max(0.2, vid.duration - (st.clipStartOffset || 0))
+            : Math.max(1, st.duration);
+        const nextRel = Math.max(0, Math.min(maxDur, st.relCurrent + (detail.delta || 0)));
+        const absT = (st.clipStartOffset || 0) + nextRel;
+        if (vid) vid.currentTime = absT;
+        setCurrentTime(absT);
+        st.onPlaybackTimeChange?.(nextRel);
       } else if (detail.type === 'bladeSplit') {
         st.handleBladeSplit(vid ? vid.currentTime : st.relCurrent);
       } else if (detail.type === 'trimIn' && st.clip && st.onTrimClip) {
@@ -971,7 +1148,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         custom_height: clip.custom_height,
         frame_layout: clip.frame_layout,
         framing_template: clip.frame_layout,
+        framing_user_locked: clip.framing_user_locked,
         webcam_corner: clip.webcam_corner,
+        source_corner: clip.source_webcam_region?.locked_zone || 'auto',
         webcam_split_ratio: clip.webcam_split_ratio,
         pip_border_color: clip.pip_border_color,
         source_webcam_region: clip.source_webcam_region,
@@ -1016,6 +1195,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         chroma_split: clip.chroma_split,
         letterbox: clip.letterbox,
         speed_ramp: clip.speed_ramp,
+        horizon_tilt: clip.horizon_tilt ?? 0,
         bypass_color: compareOriginal,
         burn_captions: clip.burn_captions,
         timing_offset: clip.timing_offset,
@@ -1042,7 +1222,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         position_y: clip.position_y,
         pos_y: clip.position_y,
         caption_x: clip.caption_x ?? (clip.position_x ?? 50) / 100,
-        caption_y: clip.caption_y ?? (clip.position_y ?? 76) / 100,
+        caption_y: clip.caption_y ?? (clip.position_y ?? 78) / 100,
+        caption_custom_position: Boolean(clip.caption_custom_position),
         caption_rotation: clip.caption_rotation ?? 0,
         caption_max_width: clip.caption_max_width ?? 0.82,
         outline_width: clip.outline_width,
@@ -1079,7 +1260,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         merge_crossfade_sec: clip.merge_crossfade_sec,
         speakers: clip.speakers,
         speaker_lower_thirds: clip.speaker_lower_thirds,
-        face_safe_captions: clip.face_safe_captions,
+        face_safe_captions: clip.caption_custom_position ? false : (clip.face_safe_captions ?? true),
         callout_cards: clip.callout_cards,
         auto_callouts: clip.auto_callouts,
         bilingual_enabled: clip.bilingual_enabled,
@@ -1088,16 +1269,26 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         backdrop_blur_intensity: clip.backdrop_blur_intensity,
         backdrop_color: clip.backdrop_color,
         privacy_blur_boxes: clip.privacy_blur_boxes,
-        use_cold_open: clip.use_cold_open,
+        use_cold_open: clip.cold_open ?? clip.use_cold_open,
+        cold_open: clip.cold_open ?? clip.use_cold_open,
         cold_open_quote: clip.cold_open_quote,
-        auto_trim_dead_air: clip.auto_trim_dead_air,
+        auto_trim_dead_air: clip.trim_dead_air ?? clip.auto_trim_dead_air,
+        trim_dead_air: clip.trim_dead_air ?? clip.auto_trim_dead_air,
         silence_threshold: clip.silence_threshold,
-        dynamic_punch_zoom: clip.dynamic_punch_zoom,
+        dynamic_punch_zoom: clip.punch_zoom ?? clip.dynamic_punch_zoom,
+        punch_zoom: clip.punch_zoom ?? clip.dynamic_punch_zoom,
         punch_zoom_intensity: clip.punch_zoom_intensity
       });
       setExactFrameUrl(res.frame_url);
       setFrameLatencyMs(res.render_time_ms);
       setShowExactFrame(true);
+      if (res.timeline_fx_summary) {
+        window.dispatchEvent(
+          new CustomEvent('lh-timeline-fx-summary', {
+            detail: { clip_id: clip.id, summary: res.timeline_fx_summary },
+          })
+        );
+      }
     } catch (err) {
       console.error('Failed to render exact frame:', err);
     } finally {
@@ -1111,6 +1302,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       custom_width: clip.custom_width,
       custom_height: clip.custom_height,
       frame_layout: clip.frame_layout,
+      framing_user_locked: Boolean(clip.framing_user_locked),
       webcam_corner: clip.webcam_corner,
       webcam_split_ratio: clip.webcam_split_ratio,
       pip_border_color: clip.pip_border_color,
@@ -1150,8 +1342,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       chroma_split: clip.chroma_split,
       letterbox: clip.letterbox,
       speed_ramp: clip.speed_ramp,
+      horizon_tilt: clip.horizon_tilt ?? 0,
       voice_eq_preset: clip.voice_eq_preset,
       de_esser: clip.de_esser,
+      voice_enhancer: clip.voice_enhancer,
       loudness_target: clip.loudness_target,
       burn_captions: clip.burn_captions,
       timing_offset: clip.timing_offset,
@@ -1172,6 +1366,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       position_y: clip.position_y,
       caption_x: clip.caption_x,
       caption_y: clip.caption_y,
+      caption_custom_position: Boolean(clip.caption_custom_position),
+      face_safe_captions: Boolean(clip.face_safe_captions),
       caption_rotation: clip.caption_rotation,
       caption_max_width: clip.caption_max_width,
       outline_width: clip.outline_width,
@@ -1205,10 +1401,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       vocal_clarity: clip.vocal_clarity,
       voice_isolation: clip.voice_isolation,
       auto_sfx: clip.auto_sfx,
-      use_cold_open: clip.use_cold_open,
+      use_cold_open: clip.cold_open ?? clip.use_cold_open,
+      cold_open: clip.cold_open ?? clip.use_cold_open,
       cold_open_quote: clip.cold_open_quote,
-      auto_trim_dead_air: clip.auto_trim_dead_air,
-      dynamic_punch_zoom: clip.dynamic_punch_zoom,
+      auto_trim_dead_air: clip.trim_dead_air ?? clip.auto_trim_dead_air,
+      trim_dead_air: clip.trim_dead_air ?? clip.auto_trim_dead_air,
+      dynamic_punch_zoom: clip.punch_zoom ?? clip.dynamic_punch_zoom,
+      punch_zoom: clip.punch_zoom ?? clip.dynamic_punch_zoom,
       punch_zoom_intensity: clip.punch_zoom_intensity,
       retention_bar_enabled: clip.retention_bar_enabled,
       retention_bar_color: clip.retention_bar_color,
@@ -1222,7 +1421,6 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       merge_crossfade_sec: clip.merge_crossfade_sec,
       speakers: clip.speakers,
       speaker_lower_thirds: clip.speaker_lower_thirds,
-      face_safe_captions: clip.face_safe_captions,
       callout_cards: clip.callout_cards,
       auto_callouts: clip.auto_callouts,
       bilingual_enabled: clip.bilingual_enabled,
@@ -1262,7 +1460,27 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       }
       setIsAutoRendering(true);
 
-      onAutoRenderClip(targetProjectId, targetClipId, controller.signal)
+      onAutoRenderClip(targetProjectId, targetClipId, controller.signal, {
+        caption_x: clip.caption_x ?? (clip.position_x ?? 50) / 100,
+        caption_y: clip.caption_y ?? (clip.position_y ?? 78) / 100,
+        caption_custom_position: Boolean(clip.caption_custom_position),
+        face_safe_captions: clip.caption_custom_position ? false : (clip.face_safe_captions ?? true),
+        use_cold_open: Boolean(clip.cold_open ?? clip.use_cold_open),
+        cold_open: Boolean(clip.cold_open ?? clip.use_cold_open),
+        auto_trim_dead_air: Boolean(clip.trim_dead_air ?? clip.auto_trim_dead_air),
+        trim_dead_air: Boolean(clip.trim_dead_air ?? clip.auto_trim_dead_air),
+        dynamic_punch_zoom: Boolean(clip.punch_zoom ?? clip.dynamic_punch_zoom),
+        punch_zoom: Boolean(clip.punch_zoom ?? clip.dynamic_punch_zoom),
+        punch_zoom_intensity: clip.punch_zoom_intensity ?? 1.16,
+        silence_threshold: clip.silence_threshold ?? 0.55,
+        frame_layout: clip.frame_layout,
+        framing_template: clip.frame_layout,
+        framing_user_locked: clip.framing_user_locked,
+        webcam_corner: clip.webcam_corner,
+        webcam_split_ratio: clip.webcam_split_ratio,
+        pip_border_color: clip.pip_border_color,
+        source_corner: clip.source_webcam_region?.locked_zone || 'auto',
+      })
         .then((res) => {
           if (controller.signal.aborted || res.status === 'superseded') return;
           if (res.status === 'completed') {
@@ -1327,6 +1545,14 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         return;
       }
 
+      // Stage 5 initial pre-render is already running on the backend: wait for polling instead of duplicating
+      if (isStage5Rendering) {
+        lastRenderedHashByClipRef.current[clip.id] = previewConfigSig;
+        setIsPreparingClip(false);
+        shouldAutoPlayRef.current = switchedFromAnother;
+        return;
+      }
+
       // Clip is not rendered yet: immediately fire fast_preview so clicking any clip plays cleanly
       if (onAutoRenderClip) {
         shouldAutoPlayRef.current = true;
@@ -1334,6 +1560,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       } else {
         setIsPreparingClip(false);
       }
+      return;
+    }
+
+    // Wait cleanly while backend Stage 5 initial preview render finishes for unedited options
+    if (isStage5Rendering && lastRenderedHashByClipRef.current[clip.id] === previewConfigSig) {
       return;
     }
 
@@ -1372,7 +1603,38 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         window.clearTimeout(debounceTimerRef.current);
       }
     };
-  }, [clip?.id, previewConfigSig, autoRender, isPlaying, clipIsRendered]);
+  }, [clip?.id, previewConfigSig, autoRender, isPlaying, clipIsRendered, isStage5Rendering]);
+
+  useEffect(() => {
+    if (!clip || isPlaying) return;
+    const fxOrLayoutActive = Boolean(
+      clip.cold_open ??
+        clip.use_cold_open ??
+        clip.trim_dead_air ??
+        clip.auto_trim_dead_air ??
+        clip.punch_zoom ??
+        clip.dynamic_punch_zoom ??
+        (clip.frame_layout && clip.frame_layout !== 'auto_track')
+    );
+    if (!fxOrLayoutActive) return;
+    const timer = window.setTimeout(() => {
+      void fetchExactFrame();
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [
+    clip?.id,
+    clip?.use_cold_open,
+    clip?.cold_open,
+    clip?.auto_trim_dead_air,
+    clip?.trim_dead_air,
+    clip?.dynamic_punch_zoom,
+    clip?.punch_zoom,
+    clip?.punch_zoom_intensity,
+    clip?.frame_layout,
+    clip?.webcam_corner,
+    clip?.source_webcam_region?.locked_zone,
+    isPlaying,
+  ]);
 
   // Safe-Zone options mapped cleanly to existing backend values
   const safeZones = [
@@ -1406,6 +1668,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     frameHeight = stageSize.h;
     frameWidth = frameHeight * ratio;
   }
+  const zoomScale = canvasZoom === '75' ? 0.75 : canvasZoom === '100' ? 1.25 : 1.0;
+  const displayFrameWidth = Math.max(120, Math.floor(frameWidth * zoomScale));
+  const displayFrameHeight = Math.max(120, Math.floor(frameHeight * zoomScale));
 
   const isCompleted = Boolean(
     clip && (clip.status === 'ready' || clip.render_status === 'completed')
@@ -1444,7 +1709,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         custom_height: clip.custom_height,
         frame_layout: clip.frame_layout,
         framing_template: clip.frame_layout,
+        framing_user_locked: clip.framing_user_locked,
         webcam_corner: clip.webcam_corner,
+        source_corner: clip.source_webcam_region?.locked_zone || 'auto',
         webcam_split_ratio: clip.webcam_split_ratio,
         pip_border_color: clip.pip_border_color,
         source_webcam_region: clip.source_webcam_region,
@@ -1454,6 +1721,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         zoom: clip.zoom,
         pan_x_offset: clip.pan_x_offset,
         pan_x: Math.round((clip.pan_x_offset || 0) * 100),
+        horizon_tilt: clip.horizon_tilt ?? 0,
         bypass_color: true,
         burn_captions: clip.burn_captions,
       })
@@ -1500,6 +1768,27 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         })()
         : 'none';
 
+  const refreshYouTubeStatus = async () => {
+    setIsLoadingYtStatus(true);
+    try {
+      const st = await api.getYouTubeStatus();
+      setYtStatus(st);
+      if (st.connected) {
+        setShowOAuthSetup(false);
+      }
+    } catch (err: any) {
+      setYtAuthError(err?.message || 'Could not inspect YouTube connection status.');
+    } finally {
+      setIsLoadingYtStatus(false);
+    }
+  };
+
+  useEffect(() => {
+    if (isPublishModalOpen) {
+      void refreshYouTubeStatus();
+    }
+  }, [isPublishModalOpen]);
+
   const handleOpenPublish = () => {
     if (clip) {
       setPublishTitle(clip.selected_title || clip.youtube_titles?.[0] || 'Viral Video #Shorts');
@@ -1507,10 +1796,58 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       const extraTags = (clip.hashtags || '').trim();
       setPublishDesc(extraTags && !baseDesc.includes(extraTags) ? `${baseDesc}\n\n${extraTags}` : baseDesc);
       setPublishPrivacy(clip.privacy_status || 'private');
-      setPublishResult(null);
+      setPublishSuccess(null);
+      setPublishError(null);
+      setYtAuthError(null);
       setSocialCopy(null);
     }
     setIsPublishModalOpen(true);
+  };
+
+  const handleUploadClientSecrets = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setIsUploadingSecrets(true);
+    setYtAuthError(null);
+    try {
+      const nextStatus = await api.uploadYouTubeClientSecrets(file);
+      setYtStatus(nextStatus);
+    } catch (err: any) {
+      setYtAuthError(err?.message || 'Failed to save Google OAuth Client JSON.');
+    } finally {
+      setIsUploadingSecrets(false);
+    }
+  };
+
+  const handleConnectYouTube = async () => {
+    if (!ytStatus?.client_configured) {
+      setShowOAuthSetup(true);
+      setYtAuthError('Upload your Google OAuth Client JSON first to connect your YouTube channel.');
+      return;
+    }
+    setIsConnectingYt(true);
+    setYtAuthError(null);
+    try {
+      const nextStatus = await api.connectYouTube();
+      setYtStatus(nextStatus);
+      setShowOAuthSetup(false);
+    } catch (err: any) {
+      setYtAuthError(err?.message || 'YouTube OAuth connection failed.');
+    } finally {
+      setIsConnectingYt(false);
+    }
+  };
+
+  const handleDisconnectYouTube = async () => {
+    setYtAuthError(null);
+    try {
+      const nextStatus = await api.disconnectYouTube();
+      setYtStatus(nextStatus);
+      setPublishSuccess(null);
+    } catch (err: any) {
+      setYtAuthError(err?.message || 'Failed to disconnect YouTube channel.');
+    }
   };
 
   const handleExportPublishPack = async () => {
@@ -1542,7 +1879,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         }
       }
     } catch (err: any) {
-      setPublishResult(`Error: ${err?.message || 'Failed to generate copy'}`);
+      setPublishError(err?.message || 'Failed to generate copy');
     } finally {
       setIsGeneratingCopy(false);
     }
@@ -1562,24 +1899,54 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const handlePublishSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!clip) return;
+    if (!ytStatus?.connected) {
+      setPublishError('YouTube account not linked. Connect your channel before uploading.');
+      return;
+    }
     setIsPublishing(true);
-    setPublishResult(null);
+    setPublishSuccess(null);
+    setPublishError(null);
     try {
-      const res = await api.publishToYouTube(clip.id, {
-        title: publishTitle,
-        description: publishDesc,
-        privacy_status: publishPrivacy
+      const hashtagMatches = publishDesc.match(/#[A-Za-z0-9_]+/g) || [];
+      const cleanTags = Array.from(new Set(hashtagMatches.map((h) => h.replace(/^#/, ''))));
+      const res = await api.publishToYouTube(
+        clip.id,
+        {
+          title: publishTitle,
+          description: publishDesc,
+          tags: cleanTags.length > 0 ? cleanTags : undefined,
+          privacy_status: publishPrivacy,
+        },
+        clip.project_id
+      );
+      setPublishSuccess({
+        video_id: res.video_id,
+        url: res.url,
+        privacy_status: res.privacy_status || publishPrivacy,
+        channel_title: res.channel_title,
       });
-      setPublishResult(res.url || 'Published successfully!');
+      onUpdateClip?.({
+        youtube_url: res.url,
+        selected_title: publishTitle,
+        youtube_description: publishDesc,
+        privacy_status: publishPrivacy,
+      });
     } catch (err: any) {
-      setPublishResult(`Error: ${err.message || err}`);
+      setPublishError(err?.message || 'YouTube upload failed.');
     } finally {
       setIsPublishing(false);
     }
   };
 
+  const tiltDeg =
+    !videoFilterAlreadyBaked && Math.abs(clip?.horizon_tilt || 0) > 0.05
+      ? (clip?.horizon_tilt || 0)
+      : 0;
+  const tiltRad = (Math.abs(tiltDeg) * Math.PI) / 180;
+  const tiltScale = tiltDeg !== 0 ? Math.max(1.0, Math.cos(tiltRad) + Math.sin(tiltRad) * 1.15) : 1.0;
+
   return (
-    <aside className="w-[340px] xl:w-[390px] shrink-0 h-full min-h-0 box-border overflow-hidden border-l border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none">
+    <aside className="w-[420px] xl:w-[460px] shrink-0 h-full min-h-0 box-border overflow-hidden border-l border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none">
       {/* Top Control Strip: 2-Row Responsive Toolbar (Studio Tools + Safe-Zone Guide Switcher) */}
       <div className="px-3 py-2 border-b border-[var(--border-subtle)] space-y-1.5 shrink-0">
         {/* Row 1: Status & Studio Tools */}
@@ -1735,6 +2102,29 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           </div>
 
           <div className="flex items-center gap-1 shrink-0">
+            <div
+              className="flex items-center gap-0.5 bg-[var(--bg-input)] p-0.5 rounded-lg border border-[var(--border-subtle)] shrink-0"
+              title="Preview canvas zoom"
+            >
+              {([
+                { id: 'fit' as const, label: 'Fit' },
+                { id: '75' as const, label: '75%' },
+                { id: '100' as const, label: '100%' },
+              ]).map((zm) => (
+                <button
+                  key={zm.id}
+                  type="button"
+                  onClick={() => setCanvasZoom(zm.id)}
+                  className={`px-1.5 py-0.5 rounded text-[9px] font-bold transition ${canvasZoom === zm.id
+                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                    }`}
+                >
+                  {zm.label}
+                </button>
+              ))}
+            </div>
+
             <button
               type="button"
               disabled={!clip}
@@ -2051,14 +2441,14 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         </div>
       )}
 
-      {/* Auto-Scaled Preview Stage */}
+      {/* Auto-Scaled & Zoomable Preview Stage */}
       <div
         ref={stageRef}
-        className="flex-1 min-h-0 flex items-center justify-center p-3 overflow-hidden bg-[var(--bg-canvas)]"
+        className={`flex-1 min-h-0 flex items-center justify-center p-3 bg-[var(--bg-canvas)] ${canvasZoom === '100' ? 'overflow-auto' : 'overflow-hidden'}`}
       >
         <div
-          style={{ width: `${Math.floor(frameWidth)}px`, height: `${Math.floor(frameHeight)}px` }}
-          className="relative bg-black rounded-[24px] p-1.5 border-2 border-[var(--border-subtle)] shadow-xl flex flex-col overflow-hidden transition-all duration-200"
+          style={{ width: `${displayFrameWidth}px`, height: `${displayFrameHeight}px` }}
+          className="relative shrink-0 bg-black rounded-[24px] p-1.5 border-2 border-[var(--border-subtle)] shadow-xl flex flex-col overflow-hidden transition-all duration-200"
         >
           <div
             ref={previewStageBoxRef}
@@ -2110,14 +2500,30 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   }
                 }}
                 onClick={togglePlay}
-                style={{ filter: videoCssFilter }}
-                className="w-full h-full object-cover cursor-pointer transition-[filter] duration-75"
+                style={{
+                  filter: videoCssFilter,
+                  transform: tiltDeg !== 0 ? `rotate(${tiltDeg}deg) scale(${tiltScale.toFixed(3)})` : undefined,
+                }}
+                className="w-full h-full object-cover cursor-pointer transition-[filter,transform] duration-75"
                 playsInline
                 loop
               />
             ) : (
               <div className="flex flex-col items-center justify-center text-zinc-500 p-4 text-center">
-                {isPreparingClip ? (
+                {isStage5Rendering ? (
+                  <>
+                    <Loader2 className="w-8 h-8 mb-2 animate-spin text-[var(--accent-primary)]" />
+                    <span className="text-xs font-semibold text-white">
+                      Rendering initial preview...
+                    </span>
+                    <span className="text-[10px] text-zinc-400 mt-1">
+                      Stage 5 queue
+                      {typeof clip?.render_progress === 'number' && clip.render_progress > 0
+                        ? ` • ${Math.round(clip.render_progress)}%`
+                        : ''}
+                    </span>
+                  </>
+                ) : isPreparingClip || (isRendering && !isAutoRendering) ? (
                   <>
                     <Loader2 className="w-8 h-8 mb-2 animate-spin text-[var(--accent-primary)]" />
                     <span className="text-xs font-semibold text-white">Preparing preview...</span>
@@ -2142,6 +2548,16 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             )}
 
+            {/* Rule-of-Thirds Overlay Grid on Studio Canvas */}
+            {showCanvasThirds && !isEditFrameOpen && (
+              <div className="absolute inset-0 z-20 pointer-events-none">
+                <div className="absolute inset-y-0 left-1/3 border-l border-white/30" />
+                <div className="absolute inset-y-0 left-2/3 border-l border-white/30" />
+                <div className="absolute inset-x-0 top-1/3 border-t border-white/30" />
+                <div className="absolute inset-x-0 top-2/3 border-t border-white/30" />
+              </div>
+            )}
+
             {/* Top Hook Banner Fallback ONLY when showing raw unrendered video (never duplicate backend PNG/MP4 banners) */}
             {!showExactFrame && !isRenderedSource && clip?.show_hook_banner && clip?.hook_headline && (
               <div className="absolute top-6 left-3 right-3 z-20 pointer-events-none flex justify-center">
@@ -2154,7 +2570,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             {/* Free-Form Interactive Caption Drag & Snap Alignment Overlay */}
             {freeformCaptionMode && !isEditFrameOpen && clip && clip.burn_captions && (() => {
               const effCapX = captionDragDraft?.x ?? clip.caption_x ?? ((clip.position_x ?? 50) / 100);
-              const effCapY = captionDragDraft?.y ?? clip.caption_y ?? ((clip.position_y ?? 76) / 100);
+              const effCapY = captionDragDraft?.y ?? clip.caption_y ?? ((clip.position_y ?? 78) / 100);
               const capRot = clip.caption_rotation ?? 0;
               const capW = Math.max(0.45, Math.min(0.90, clip.caption_max_width ?? 0.82));
               const snapCenterX = Math.abs(effCapX - 0.5) <= 0.015;
@@ -2216,7 +2632,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                     className="absolute bottom-1.5 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-black/80 border border-white/15 backdrop-blur-sm"
                   >
                     {[
-                      { label: 'Center Bottom', x: 0.5, y: 0.76, rot: 0, grid: 'bottom_center' },
+                      { label: 'Center Bottom', x: 0.5, y: 0.78, rot: 0, grid: 'bottom_center' },
                       { label: 'Dead Center', x: 0.5, y: 0.5, rot: 0, grid: 'center' },
                       { label: 'Top Safe', x: 0.5, y: 0.18, rot: 0, grid: 'top_center' },
                     ].map((qp) => (
@@ -2227,6 +2643,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                           commitQuickCap({
                             caption_x: qp.x,
                             caption_y: qp.y,
+                            caption_custom_position: true,
+                            face_safe_captions: false,
                             caption_rotation: qp.rot,
                             position_x: Math.round(qp.x * 100),
                             position_y: Math.round(qp.y * 100),
@@ -2243,11 +2661,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                       onClick={() =>
                         commitQuickCap({
                           caption_x: 0.5,
-                          caption_y: 0.76,
+                          caption_y: 0.78,
+                          caption_custom_position: false,
+                          face_safe_captions: true,
                           caption_rotation: 0,
                           caption_max_width: 0.82,
                           position_x: 50,
-                          position_y: 76,
+                          position_y: 78,
                           position_grid: 'bottom_center',
                         })
                       }
@@ -2311,41 +2731,137 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             ))}
 
-            {/* Interactive On-Canvas Source Frame Box & Focus Anchor Editor */}
-            {isEditFrameOpen && clip && (
+            {/* Interactive On-Canvas Source Frame Crop Box, Keyframe Animator & Webcam Editor */}
+            {isEditFrameOpen && clip && (() => {
+              const activeCropField: 'frame_crop' | 'keyframe_start_crop' | 'keyframe_end_crop' =
+                frameEditTarget === 'start_kf'
+                  ? 'keyframe_start_crop'
+                  : frameEditTarget === 'end_kf'
+                    ? 'keyframe_end_crop'
+                    : 'frame_crop';
+              const activeCropBox: FramingBox =
+                activeCropField === 'keyframe_start_crop'
+                  ? (frameBoxDraft.keyframe_start_crop || frameBoxDraft.frame_crop)
+                  : activeCropField === 'keyframe_end_crop'
+                    ? (frameBoxDraft.keyframe_end_crop || frameBoxDraft.keyframe_start_crop || frameBoxDraft.frame_crop)
+                    : frameBoxDraft.frame_crop;
+              const isWebcamLayout = ['webcam_gameplay_split', 'gameplay_webcam_pip', 'portrait_pip_badge', 'triple_gaming_hud'].includes(
+                String(clip.frame_layout || '')
+              );
+              const applyAspectFitCrop = () => {
+                const ar = getAspectNumeric(clip.aspect_ratio);
+                const srcRatio = 16 / 9;
+                let w = Math.min(0.92, (ar / srcRatio) * 0.90);
+                let h = 0.90;
+                if (w > 0.92) {
+                  w = 0.92;
+                  h = Math.min(0.92, (w * srcRatio) / ar);
+                }
+                const fitted: FramingBox = {
+                  x: Number((0.5 - w * 0.5).toFixed(3)),
+                  y: Number((0.5 - h * 0.5).toFixed(3)),
+                  w: Number(w.toFixed(3)),
+                  h: Number(h.toFixed(3)),
+                };
+                const next = { ...frameBoxDraft, [activeCropField]: fitted };
+                setFrameBoxDraft(next);
+                void persistFramingOverride({ [activeCropField]: fitted });
+              };
+              return (
               <div className="absolute inset-0 z-40 bg-black/92 flex flex-col justify-between p-2 select-none">
-                <div className="flex items-center justify-between gap-1 bg-black/75 border border-white/15 rounded-lg px-2 py-1 text-[9px] text-white">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const nextLock = !frameBoxDraft.lock_camera;
-                      const next = { ...frameBoxDraft, lock_camera: nextLock };
-                      setFrameBoxDraft(next);
-                      void persistFramingOverride(next);
-                    }}
-                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-semibold ${frameBoxDraft.lock_camera
-                      ? 'bg-amber-500/25 border-amber-400 text-amber-300'
-                      : 'border-white/20 text-white/80 hover:text-white'
-                      }`}
-                    title="Lock camera smoothly onto Subject Focus crosshair"
-                  >
-                    {frameBoxDraft.lock_camera ? <Lock className="w-2.5 h-2.5" /> : <Unlock className="w-2.5 h-2.5" />}
-                    <span>{frameBoxDraft.lock_camera ? 'Locked' : 'Lock'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => void persistFramingOverride({ reset: true })}
-                    className="px-1.5 py-0.5 rounded border border-white/20 text-white/80 hover:text-white font-semibold"
-                  >
-                    Reset
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setIsEditFrameOpen(false)}
-                    className="px-1.5 py-0.5 rounded bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold"
-                  >
-                    Done
-                  </button>
+                <div className="flex flex-wrap items-center justify-between gap-1 bg-black/80 border border-white/15 rounded-lg px-2 py-1 text-[9px] text-white">
+                  <div className="flex items-center gap-1 flex-wrap">
+                    {([
+                      { id: 'frame_crop' as const, label: 'Static' },
+                      { id: 'start_kf' as const, label: 'Start KF' },
+                      { id: 'end_kf' as const, label: 'End KF' },
+                    ]).map((pill) => (
+                      <button
+                        key={pill.id}
+                        type="button"
+                        onClick={() => {
+                          setFrameEditTarget(pill.id);
+                          if (pill.id === 'start_kf') {
+                            seekToRelTime(0);
+                            if (!frameBoxDraft.keyframe_start_crop) {
+                              const next = { ...frameBoxDraft, keyframe_start_crop: { ...frameBoxDraft.frame_crop } };
+                              setFrameBoxDraft(next);
+                              void persistFramingOverride({ keyframe_start_crop: next.keyframe_start_crop });
+                            }
+                          } else if (pill.id === 'end_kf') {
+                            seekToRelTime(Math.max(0.1, duration - 0.1));
+                            if (!frameBoxDraft.keyframe_end_crop) {
+                              const seed = frameBoxDraft.keyframe_start_crop || frameBoxDraft.frame_crop;
+                              const next = { ...frameBoxDraft, keyframe_end_crop: { ...seed } };
+                              setFrameBoxDraft(next);
+                              void persistFramingOverride({ keyframe_end_crop: next.keyframe_end_crop });
+                            }
+                          }
+                        }}
+                        className={`px-1.5 py-0.5 rounded border font-bold transition ${frameEditTarget === pill.id
+                          ? 'bg-cyan-500/25 border-cyan-400 text-cyan-200'
+                          : 'border-white/20 text-white/75 hover:text-white'
+                          }`}
+                        title={pill.id === 'start_kf' ? 'Edit crop at start of clip' : pill.id === 'end_kf' ? 'Edit crop at end of clip' : 'Edit main crop box'}
+                      >
+                        {pill.label}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => setShowRuleOfThirds((v) => !v)}
+                      className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded border font-semibold ${showRuleOfThirds
+                        ? 'bg-white/15 border-white/40 text-white'
+                        : 'border-white/20 text-white/70 hover:text-white'
+                        }`}
+                      title="Toggle 3x3 Rule-of-Thirds overlay"
+                    >
+                      <Grid className="w-2.5 h-2.5" />
+                      <span>3×3</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={applyAspectFitCrop}
+                      className="px-1.5 py-0.5 rounded border border-white/20 text-white/80 hover:text-white font-semibold"
+                      title={`Snap crop box to ${clip.aspect_ratio || '9:16'} aspect`}
+                    >
+                      Fit {clip.aspect_ratio || '9:16'}
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextLock = !frameBoxDraft.lock_camera;
+                        const next = { ...frameBoxDraft, lock_camera: nextLock };
+                        setFrameBoxDraft(next);
+                        void persistFramingOverride(next);
+                      }}
+                      className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-semibold ${frameBoxDraft.lock_camera
+                        ? 'bg-amber-500/25 border-amber-400 text-amber-300'
+                        : 'border-white/20 text-white/80 hover:text-white'
+                        }`}
+                      title="Lock camera smoothly onto Subject Focus crosshair"
+                    >
+                      {frameBoxDraft.lock_camera ? <Lock className="w-2.5 h-2.5" /> : <Unlock className="w-2.5 h-2.5" />}
+                      <span>{frameBoxDraft.lock_camera ? 'Locked' : 'Lock'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void persistFramingOverride({ reset: true })}
+                      className="px-1.5 py-0.5 rounded border border-white/20 text-white/80 hover:text-white font-semibold"
+                    >
+                      Reset
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setIsEditFrameOpen(false)}
+                      className="px-1.5 py-0.5 rounded bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold"
+                    >
+                      Done
+                    </button>
+                  </div>
                 </div>
 
                 <div className="flex-1 flex items-center justify-center min-h-0 my-1">
@@ -2361,16 +2877,104 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         className="w-full h-full object-contain pointer-events-none select-none"
                       />
                     )}
+
+                    {/* 3x3 Rule-of-Thirds Overlay Grid */}
+                    {showRuleOfThirds && (
+                      <div className="absolute inset-0 pointer-events-none">
+                        <div className="absolute inset-y-0 left-1/3 border-l border-white/20" />
+                        <div className="absolute inset-y-0 left-2/3 border-l border-white/20" />
+                        <div className="absolute inset-x-0 top-1/3 border-t border-white/20" />
+                        <div className="absolute inset-x-0 top-2/3 border-t border-white/20" />
+                      </div>
+                    )}
+
+                    {/* Magnetic Center Snap Guides */}
+                    {cropSnapGuides.x && (
+                      <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 border-l-2 border-dashed border-cyan-300/90 pointer-events-none z-20" />
+                    )}
+                    {cropSnapGuides.y && (
+                      <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 border-t-2 border-dashed border-cyan-300/90 pointer-events-none z-20" />
+                    )}
+
+                    {/* Draggable & 4-Corner Resizable Normalized Output Crop Box */}
+                    <div
+                      onPointerDown={(ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        frameDragRef.current = {
+                          target: 'crop_move',
+                          cropField: activeCropField,
+                          startX: ev.clientX,
+                          startY: ev.clientY,
+                          origBox: { ...frameBoxDraft.webcam_box },
+                          origCrop: { ...activeCropBox },
+                          origAnchor: { ...frameBoxDraft.focus_anchor },
+                          latest: { ...frameBoxDraft },
+                        };
+                        setDraggingFrameMode('crop_move');
+                      }}
+                      style={{
+                        left: `${activeCropBox.x * 100}%`,
+                        top: `${activeCropBox.y * 100}%`,
+                        width: `${activeCropBox.w * 100}%`,
+                        height: `${activeCropBox.h * 100}%`,
+                      }}
+                      className="absolute border-2 border-cyan-400 bg-cyan-500/12 cursor-move z-10"
+                      title="Drag crop frame (snaps to center); drag corners to resize"
+                    >
+                      <span className="absolute -top-3.5 left-0 px-1 rounded bg-cyan-400 text-black font-mono font-bold text-[8px] whitespace-nowrap pointer-events-none">
+                        {activeCropField === 'keyframe_start_crop'
+                          ? 'START KF'
+                          : activeCropField === 'keyframe_end_crop'
+                            ? 'END KF'
+                            : 'FRAME CROP'}
+                      </span>
+                      {(['crop_nw', 'crop_ne', 'crop_sw', 'crop_se'] as const).map((hCorner) => {
+                        const posCls =
+                          hCorner === 'crop_nw'
+                            ? '-top-1.5 -left-1.5 cursor-nwse-resize'
+                            : hCorner === 'crop_ne'
+                              ? '-top-1.5 -right-1.5 cursor-nesw-resize'
+                              : hCorner === 'crop_sw'
+                                ? '-bottom-1.5 -left-1.5 cursor-nesw-resize'
+                                : '-bottom-1.5 -right-1.5 cursor-nwse-resize';
+                        return (
+                          <div
+                            key={hCorner}
+                            onPointerDown={(ev) => {
+                              ev.preventDefault();
+                              ev.stopPropagation();
+                              frameDragRef.current = {
+                                target: hCorner,
+                                cropField: activeCropField,
+                                startX: ev.clientX,
+                                startY: ev.clientY,
+                                origBox: { ...frameBoxDraft.webcam_box },
+                                origCrop: { ...activeCropBox },
+                                origAnchor: { ...frameBoxDraft.focus_anchor },
+                                latest: { ...frameBoxDraft },
+                              };
+                              setDraggingFrameMode(hCorner);
+                            }}
+                            className={`absolute w-3 h-3 rounded-sm bg-cyan-400 border border-black ${posCls}`}
+                          />
+                        );
+                      })}
+                    </div>
+
                     {/* Draggable & 4-Corner Resizable Webcam Crop Box */}
+                    {(isWebcamLayout || frameEditTarget === 'webcam') && (
                     <div
                       onPointerDown={(ev) => {
                         ev.preventDefault();
                         ev.stopPropagation();
                         frameDragRef.current = {
                           target: 'box_move',
+                          cropField: activeCropField,
                           startX: ev.clientX,
                           startY: ev.clientY,
                           origBox: { ...frameBoxDraft.webcam_box },
+                          origCrop: { ...activeCropBox },
                           origAnchor: { ...frameBoxDraft.focus_anchor },
                           latest: { ...frameBoxDraft },
                         };
@@ -2382,7 +2986,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         width: `${frameBoxDraft.webcam_box.w * 100}%`,
                         height: `${frameBoxDraft.webcam_box.h * 100}%`,
                       }}
-                      className="absolute border-2 border-dashed border-emerald-400 bg-emerald-500/15 cursor-move"
+                      className="absolute border-2 border-dashed border-emerald-400 bg-emerald-500/15 cursor-move z-15"
                       title="Drag to position Webcam Box; drag corners to resize"
                     >
                       <span className="absolute -top-3.5 left-0 px-1 rounded bg-emerald-500 text-black font-mono font-bold text-[8px] whitespace-nowrap pointer-events-none">
@@ -2405,9 +3009,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                               ev.stopPropagation();
                               frameDragRef.current = {
                                 target: hCorner,
+                                cropField: activeCropField,
                                 startX: ev.clientX,
                                 startY: ev.clientY,
                                 origBox: { ...frameBoxDraft.webcam_box },
+                                origCrop: { ...activeCropBox },
                                 origAnchor: { ...frameBoxDraft.focus_anchor },
                                 latest: { ...frameBoxDraft },
                               };
@@ -2418,6 +3024,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         );
                       })}
                     </div>
+                    )}
 
                     {/* Draggable Subject Focus Crosshair */}
                     <div
@@ -2426,9 +3033,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         ev.stopPropagation();
                         frameDragRef.current = {
                           target: 'anchor',
+                          cropField: activeCropField,
                           startX: ev.clientX,
                           startY: ev.clientY,
                           origBox: { ...frameBoxDraft.webcam_box },
+                          origCrop: { ...activeCropBox },
                           origAnchor: { ...frameBoxDraft.focus_anchor },
                           latest: { ...frameBoxDraft },
                         };
@@ -2439,7 +3048,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                         top: `${frameBoxDraft.focus_anchor.y * 100}%`,
                         transform: 'translate(-50%, -50%)',
                       }}
-                      className="absolute w-6 h-6 rounded-full border-2 border-amber-400 bg-amber-500/25 flex items-center justify-center cursor-grab active:cursor-grabbing shadow"
+                      className="absolute w-6 h-6 rounded-full border-2 border-amber-400 bg-amber-500/25 flex items-center justify-center cursor-grab active:cursor-grabbing shadow z-20"
                       title="Drag Subject Focus Anchor crosshair"
                     >
                       <Crosshair className="w-3.5 h-3.5 text-amber-300" />
@@ -2447,11 +3056,12 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   </div>
                 </div>
 
-                <div className="text-center text-[9px] text-white/70 font-mono truncate">
-                  Box: {Math.round(frameBoxDraft.webcam_box.w * 100)}%×{Math.round(frameBoxDraft.webcam_box.h * 100)}% • Anchor: {Math.round(frameBoxDraft.focus_anchor.x * 100)}%,{Math.round(frameBoxDraft.focus_anchor.y * 100)}%
+                <div className="text-center text-[9px] text-white/80 font-mono truncate">
+                  Crop: ({Math.round(activeCropBox.x * 100)}%,{Math.round(activeCropBox.y * 100)}%) {Math.round(activeCropBox.w * 100)}%×{Math.round(activeCropBox.h * 100)}% • Anchor: {Math.round(frameBoxDraft.focus_anchor.x * 100)}%,{Math.round(frameBoxDraft.focus_anchor.y * 100)}%
                 </div>
               </div>
-            )}
+              );
+            })()}
 
             {/* Platform Safe-Zone Overlay */}
             {safeZoneGuide !== 'No guide' && (
@@ -2503,31 +3113,56 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         </div>
       </div>
 
-      {/* Integrated Transport Bar */}
-      <div className="px-3.5 py-2 border-t border-[var(--border-subtle)] bg-[var(--bg-surface)] flex items-center gap-2.5 shrink-0">
+      {/* Integrated Frame-Accurate Transport Bar */}
+      <div className="px-3 py-2 border-t border-[var(--border-subtle)] bg-[var(--bg-surface)] flex items-center gap-1.5 shrink-0">
         <button
           type="button"
           onClick={togglePlay}
           disabled={!activeVideoSrc}
           className="w-7 h-7 rounded-lg bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/50 text-[var(--accent-primary)] border border-[var(--border-subtle)] flex items-center justify-center transition shrink-0 disabled:opacity-40"
-          title={isPlaying ? 'Pause' : 'Play'}
+          title={isPlaying ? 'Pause (Space)' : 'Play (Space)'}
         >
           {isPlaying ? <Pause className="w-3.5 h-3.5 fill-current" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => stepSingleFrame(-1)}
+          disabled={!activeVideoSrc}
+          className="px-1.5 h-7 rounded-lg bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/50 text-[10px] font-mono font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border-subtle)] flex items-center gap-0.5 transition shrink-0 disabled:opacity-40"
+          title="Step backward 1 frame (Left Arrow)"
+        >
+          <StepBack className="w-2.5 h-2.5" />
+          <span>-1f</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => stepSingleFrame(1)}
+          disabled={!activeVideoSrc}
+          className="px-1.5 h-7 rounded-lg bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/50 text-[10px] font-mono font-bold text-[var(--text-secondary)] hover:text-[var(--text-primary)] border border-[var(--border-subtle)] flex items-center gap-0.5 transition shrink-0 disabled:opacity-40"
+          title="Step forward 1 frame (Right Arrow)"
+        >
+          <span>+1f</span>
+          <StepForward className="w-2.5 h-2.5" />
         </button>
 
         <input
           type="range"
           min={0}
           max={Math.max(1, duration)}
-          step={0.1}
+          step={1 / previewFps}
           value={relCurrent}
           onChange={handleScrubberChange}
           disabled={!activeVideoSrc}
           className="flex-1 min-w-0 h-1 bg-[var(--bg-input)] rounded appearance-none cursor-pointer"
         />
 
-        <span className="text-[11px] font-mono text-[var(--text-secondary)] shrink-0 tabular-nums">
-          {formatMMSS(relCurrent)} / {formatMMSS(duration)}
+        <span
+          className="text-[10px] font-mono text-[var(--text-secondary)] shrink-0 tabular-nums"
+          title={`Elapsed ${formatMMSS(relCurrent)} / ${formatMMSS(duration)} @ ${previewFps}fps`}
+        >
+          {formatSMPTE(relCurrent, previewFps)} <span className="opacity-60">/ {formatSMPTE(duration, previewFps)}</span>
         </span>
 
         <button
@@ -2535,7 +3170,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           onClick={toggleMute}
           disabled={!activeVideoSrc}
           className="w-7 h-7 rounded-lg bg-[var(--bg-card)] hover:text-[var(--text-primary)] text-[var(--text-secondary)] border border-[var(--border-subtle)] flex items-center justify-center transition shrink-0 disabled:opacity-40"
-          title={isMuted ? 'Unmute' : 'Mute'}
+          title={isMuted ? 'Unmute (M)' : 'Mute (M)'}
         >
           {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
         </button>
@@ -2838,10 +3473,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             onClick={handleOpenPublish}
             disabled={!isCompleted}
             className="h-8 px-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-red-500/40 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
-            title={isCompleted ? 'Publish rendered clip directly to YouTube Shorts' : 'Render clip first to publish'}
+            title={isCompleted ? 'Publish rendered clip directly to YouTube & Social Studio' : 'Render clip first to publish'}
           >
             <YouTubeIcon className="w-3.5 h-3.5 text-red-500 shrink-0" />
-            <span className="truncate">Post YouTube</span>
+            <span className="truncate">Export &amp; Publish</span>
           </button>
 
           {clip ? (
@@ -2849,7 +3484,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               aria-label="Export Pro NLE Format"
               defaultValue=""
               onChange={(e) => {
-                const fmt = e.target.value as 'fcpxml' | 'premiere' | 'srt' | 'zip';
+                const fmt = e.target.value as 'fcpxml' | 'premiere' | 'edl' | 'srt' | 'vtt' | 'ass' | 'zip';
                 if (!fmt) return;
                 const url = api.getNleExportUrl(clip.project_id, clip.id, fmt);
                 window.open(url, '_blank');
@@ -2858,11 +3493,14 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               className="h-8 px-2 rounded-xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-[11px] outline-none cursor-pointer"
             >
               <option value="" disabled>
-                Pro NLE Export ▾
+                Pro NLE &amp; Captions ▾
               </option>
               <option value="fcpxml">DaVinci / FCPXML</option>
               <option value="premiere">Adobe Premiere .XML</option>
+              <option value="edl">CMX 3600 .EDL</option>
               <option value="srt">Captions .SRT</option>
+              <option value="vtt">WebVTT .VTT</option>
+              <option value="ass">Styled Subtitles .ASS</option>
               <option value="zip">Full Studio .ZIP</option>
             </select>
           ) : (
@@ -2870,39 +3508,20 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           )}
         </div>
 
-        <div className="grid grid-cols-3 gap-1.5">
-          <button
-            type="button"
-            onClick={() => {
-              if (!clip) return;
-              setThumbHeadline(clip.hook_headline || clip.selected_title || 'WATCH THIS');
-              setThumbFormat(clip.aspect_ratio === '16:9' ? '16:9' : '9:16');
-              setThumbAccentColor(clip.active_color || '#C6F32F');
-              setThumbError(null);
-              setIsThumbModalOpen(true);
-            }}
-            disabled={!clip}
-            className="h-8 px-2 rounded-xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-[11px] flex items-center justify-center gap-1 transition disabled:opacity-45"
-            title="Depth-Layer AI Thumbnail & Cover Designer"
-          >
-            <ImageIcon className="w-3.5 h-3.5 text-[var(--accent-primary)] shrink-0" />
-            <span className="truncate">Cover</span>
-          </button>
-          <button
-            type="button"
-            onClick={handleExportPublishPack}
-            disabled={!clip || isExportingPack}
-            className="col-span-2 h-8 px-2.5 rounded-xl bg-[var(--accent-subtle)] hover:bg-[var(--accent-primary)] hover:text-[var(--accent-foreground)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40 font-bold text-[11px] flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
-            title="Export 9:16 + 4:5 + 16:9 MP4s, AI Cover Thumbnail, Captions .SRT, and Social Copy .TXT in one .zip"
-          >
-            {isExportingPack ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-            ) : (
-              <Package className="w-3.5 h-3.5 shrink-0" />
-            )}
-            <span className="truncate">{isExportingPack ? 'Building Pack...' : 'Publish Pack (.zip)'}</span>
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={handleExportPublishPack}
+          disabled={!clip || isExportingPack}
+          className="w-full h-8 px-2.5 rounded-xl bg-[var(--accent-subtle)] hover:bg-[var(--accent-primary)] hover:text-[var(--accent-foreground)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40 font-bold text-[11px] flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
+          title="Export 9:16 + 4:5 + 16:9 MP4s, AI Cover Thumbnail, Captions .SRT, and Social Copy .TXT in one .zip"
+        >
+          {isExportingPack ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+          ) : (
+            <Package className="w-3.5 h-3.5 shrink-0" />
+          )}
+          <span className="truncate">{isExportingPack ? 'Building Publish Pack...' : 'Download Multi-Platform Publish Pack (.zip)'}</span>
+        </button>
 
         {packError && (
           <div className="text-[10px] text-red-400 bg-red-500/10 border border-red-500/25 rounded-lg px-2 py-1 truncate">
@@ -2942,6 +3561,106 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   <X className="w-5 h-5" />
                 </button>
               </div>
+            </div>
+
+            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 space-y-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                {isLoadingYtStatus ? (
+                  <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Checking YouTube channel status...
+                  </span>
+                ) : ytStatus?.connected ? (
+                  <span
+                    data-testid="yt-connected-badge"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/40 text-[11px] font-bold"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                    <span>Connected: {ytStatus.channel_title || 'YouTube Channel'}</span>
+                  </span>
+                ) : (
+                  <span
+                    data-testid="yt-not-linked-badge"
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/40 text-[11px] font-bold"
+                  >
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                    <span>YouTube Not Linked</span>
+                  </span>
+                )}
+
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {ytStatus?.connected ? (
+                    <button
+                      type="button"
+                      onClick={handleDisconnectYouTube}
+                      className="px-2.5 py-1 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-red-400 hover:border-red-500/40 text-[11px] font-semibold flex items-center gap-1 transition"
+                    >
+                      <Unlink className="w-3 h-3" />
+                      <span>Disconnect</span>
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setShowOAuthSetup((prev) => !prev)}
+                        className="px-2.5 py-1 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-primary)] hover:border-[var(--accent-primary)]/50 text-[11px] font-semibold flex items-center gap-1 transition"
+                      >
+                        <Upload className="w-3 h-3 text-[var(--accent-primary)]" />
+                        <span>Setup Google OAuth Client JSON</span>
+                        {showOAuthSetup ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleConnectYouTube}
+                        disabled={isConnectingYt}
+                        className="px-3 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-bold flex items-center gap-1.5 transition disabled:opacity-50"
+                      >
+                        {isConnectingYt ? <Loader2 className="w-3 h-3 animate-spin" /> : <Link2 className="w-3 h-3" />}
+                        <span>{isConnectingYt ? 'Waiting for Google Sign-In...' : 'Connect YouTube Channel'}</span>
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {!ytStatus?.connected && showOAuthSetup && (
+                <div className="rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-3 space-y-2 text-[11px] text-[var(--text-muted)]">
+                  <ol className="list-decimal list-inside space-y-1 text-[var(--text-primary)]">
+                    <li>Open Google Cloud Console and enable the <strong>YouTube Data API v3</strong>.</li>
+                    <li>Go to <strong>Credentials -&gt; Create Credentials -&gt; OAuth client ID (Desktop app)</strong> and download the JSON.</li>
+                    <li>Upload your <code>client_secret_*.json</code> file below, then click <strong>Connect YouTube Channel</strong>.</li>
+                  </ol>
+                  <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
+                    <input
+                      ref={clientSecretsInputRef}
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={handleUploadClientSecrets}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => clientSecretsInputRef.current?.click()}
+                      disabled={isUploadingSecrets}
+                      className="px-3 py-1.5 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent-primary)]/40 text-[var(--accent-primary)] font-bold flex items-center gap-1.5 hover:opacity-90 transition disabled:opacity-50"
+                    >
+                      {isUploadingSecrets ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
+                      <span>{isUploadingSecrets ? 'Saving JSON...' : 'Upload Google OAuth Client JSON'}</span>
+                    </button>
+                    {ytStatus?.client_configured && (
+                      <span className="text-[10px] font-semibold text-emerald-400">
+                        Client JSON configured
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {ytAuthError && (
+                <div className="rounded-lg bg-red-500/10 border border-red-500/40 px-2.5 py-2 text-[11px] text-red-400">
+                  {ytAuthError}
+                </div>
+              )}
             </div>
 
             {socialCopy && (
@@ -3049,7 +3768,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                 />
               </div>
 
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
                 <div>
                   <label className="text-[var(--text-secondary)] font-semibold block mb-1">Visibility</label>
                   <select
@@ -3063,29 +3782,86 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   </select>
                 </div>
 
-                <button
-                  type="submit"
-                  disabled={isPublishing}
-                  className="px-5 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl transition shadow-md flex items-center gap-1.5 disabled:opacity-50"
-                >
-                  {isPublishing ? <Loader2 className="w-4 h-4 animate-spin" /> : <YouTubeIcon className="w-4 h-4" />}
-                  <span>{isPublishing ? 'Publishing...' : 'Upload Video'}</span>
-                </button>
+                <div className="flex items-center gap-2 flex-wrap ml-auto">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleCopyText('modal_copy', `${publishTitle}\n\n${publishDesc}`.trim())
+                    }
+                    className="px-3 py-2 rounded-xl bg-[var(--bg-elevated)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center gap-1.5 transition"
+                  >
+                    {copiedField === 'modal_copy' ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                    <span>{copiedField === 'modal_copy' ? 'Copied' : 'Copy Title & Hashtags'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleExportPublishPack}
+                    disabled={!clip || isExportingPack}
+                    className="px-3 py-2 rounded-xl bg-[var(--accent-subtle)] hover:bg-[var(--accent-primary)] hover:text-[var(--accent-foreground)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40 font-bold text-xs flex items-center gap-1.5 transition disabled:opacity-45"
+                  >
+                    {isExportingPack ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Package className="w-3.5 h-3.5" />}
+                    <span>{isExportingPack ? 'Building Zip...' : 'Download Social Pack (.zip)'}</span>
+                  </button>
+
+                  <button
+                    type="submit"
+                    disabled={isPublishing || !ytStatus?.connected || !isCompleted}
+                    title={
+                      !ytStatus?.connected
+                        ? 'Connect your YouTube channel above before uploading'
+                        : !isCompleted
+                        ? 'Render clip MP4 first'
+                        : 'Upload rendered MP4 to your connected YouTube channel'
+                    }
+                    className={`px-4 py-2 font-bold text-xs rounded-xl transition shadow-md flex items-center gap-1.5 ${
+                      ytStatus?.connected
+                        ? 'bg-red-600 hover:bg-red-700 text-white disabled:opacity-50'
+                        : 'bg-[var(--bg-elevated)] text-[var(--text-muted)] border border-[var(--border-subtle)] opacity-70 cursor-not-allowed'
+                    }`}
+                  >
+                    {isPublishing ? <Loader2 className="w-4 h-4 animate-spin" /> : <YouTubeIcon className="w-4 h-4" />}
+                    <span>
+                      {!ytStatus?.connected
+                        ? 'Connect YouTube to Upload'
+                        : isPublishing
+                        ? 'Uploading rendered MP4 to YouTube...'
+                        : 'Upload Video'}
+                    </span>
+                  </button>
+                </div>
               </div>
 
-              {publishResult && (
-                <div
-                  className={`p-3 rounded-xl text-xs flex items-center justify-between ${publishResult.startsWith('Error')
-                    ? 'bg-red-500/10 border border-red-500/30 text-red-400'
-                    : 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-400'
-                    }`}
-                >
-                  <span className="break-all">{publishResult}</span>
-                  {publishResult.startsWith('http') && (
-                    <a href={publishResult} target="_blank" rel="noreferrer" className="underline font-bold ml-2 shrink-0">
-                      View
+              {publishSuccess && (
+                <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/35 text-emerald-400 space-y-1.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold">
+                      Uploaded to {publishSuccess.channel_title || 'YouTube'} ({publishSuccess.privacy_status})
+                    </span>
+                    <a
+                      href={publishSuccess.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline font-bold inline-flex items-center gap-1 shrink-0"
+                    >
+                      <span>Open on YouTube</span>
+                      <ExternalLink className="w-3 h-3" />
                     </a>
-                  )}
+                  </div>
+                  <div className="break-all font-mono text-[11px]">{publishSuccess.url}</div>
+                  <p className="text-[10px] text-[var(--text-muted)] leading-snug">
+                    Note: Unverified Google Cloud OAuth apps upload videos as <strong>Private</strong> in YouTube Studio by default until Google app verification is approved.
+                  </p>
+                </div>
+              )}
+
+              {publishError && (
+                <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/40 text-red-400 text-xs break-words">
+                  {publishError}
                 </div>
               )}
             </form>

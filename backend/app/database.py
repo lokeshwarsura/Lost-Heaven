@@ -94,6 +94,13 @@ def init_db():
                 if p_cols and "ai_mode" not in p_cols:
                     session.exec(text("ALTER TABLE projects ADD COLUMN ai_mode TEXT"))
                     added = True
+                if p_cols and "tags_json" not in p_cols:
+                    session.exec(text("ALTER TABLE projects ADD COLUMN tags_json TEXT DEFAULT '[]'"))
+                    added = True
+                if p_cols and "podcast_mode" not in p_cols:
+                    session.exec(text("ALTER TABLE projects ADD COLUMN podcast_mode BOOLEAN DEFAULT 0"))
+                    added = True
+                    added = True
                 # Migrate caption_style_presets table columns if missing on older DBs
                 cs_res = session.exec(text("PRAGMA table_info(caption_style_presets)")).fetchall()
                 cs_cols = [r[1] for r in cs_res] if cs_res else []

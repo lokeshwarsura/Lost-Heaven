@@ -24,7 +24,7 @@ import {
   BestFrameItem
 } from './types';
 import { api } from './api/client';
-import { applyTheme, getActiveTheme } from './themes/themes';
+import { applyTheme, getActiveTheme, setCustomThemes } from './themes/themes';
 import { useEditorHistory, extractEditableSnapshot } from './hooks/useEditorHistory';
 import {
   Home,
@@ -141,7 +141,14 @@ export const App: React.FC = () => {
         api.getSystemSettings().catch(() => null)
       ]).then(([sys, sysSet]) => {
         if (sys) setSystemInfo(sys);
-        if (sysSet) setStudioSettings(sysSet);
+        if (sysSet) {
+        setStudioSettings(sysSet);
+        const mergedCustom =
+          Array.isArray(sysSet.custom_themes) && sysSet.custom_themes.length > 0
+            ? setCustomThemes(sysSet.custom_themes)
+            : undefined;
+        applyTheme(sysSet.active_theme || getActiveTheme().id, mergedCustom);
+      }
       });
     }
   }, [activeView]);
@@ -159,7 +166,14 @@ export const App: React.FC = () => {
       ]);
 
       if (sys) setSystemInfo(sys);
-      if (sysSet) setStudioSettings(sysSet);
+      if (sysSet) {
+        setStudioSettings(sysSet);
+        const mergedCustom =
+          Array.isArray(sysSet.custom_themes) && sysSet.custom_themes.length > 0
+            ? setCustomThemes(sysSet.custom_themes)
+            : undefined;
+        applyTheme(sysSet.active_theme || getActiveTheme().id, mergedCustom);
+      }
       if (styles?.length) setCaptionStyles(styles);
       if (fonts?.length) setAvailableFonts(fonts);
       if (profsData?.length) setProfiles(profsData);
@@ -341,12 +355,22 @@ export const App: React.FC = () => {
       } else if (e.key === 'ArrowLeft') {
         e.preventDefault();
         window.dispatchEvent(
-          new CustomEvent('lh-player-cmd', { detail: { type: 'seekDelta', delta: e.shiftKey ? -5 : -1 } })
+          new CustomEvent(
+            'lh-player-cmd',
+            e.shiftKey
+              ? { detail: { type: 'seekDelta', delta: -1 } }
+              : { detail: { type: 'stepFrame', frames: -1 } }
+          )
         );
       } else if (e.key === 'ArrowRight') {
         e.preventDefault();
         window.dispatchEvent(
-          new CustomEvent('lh-player-cmd', { detail: { type: 'seekDelta', delta: e.shiftKey ? 5 : 1 } })
+          new CustomEvent(
+            'lh-player-cmd',
+            e.shiftKey
+              ? { detail: { type: 'seekDelta', delta: 1 } }
+              : { detail: { type: 'stepFrame', frames: 1 } }
+          )
         );
       } else if (keyLower === 'i') {
         e.preventDefault();
@@ -380,12 +404,24 @@ export const App: React.FC = () => {
   const handleAutoRenderClip = async (
     projectId: number,
     clipId: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    overrides?: Record<string, any>
   ) => {
     if (pendingClipPatchRef.current) {
       await pendingClipPatchRef.current.catch(() => {});
     }
-    return api.triggerRender(clipId, 'fast_preview', signal, projectId);
+    const cur = clips.find((c) => c.id === clipId) || selectedClip;
+    const coordPayload =
+      overrides ??
+      (cur
+        ? {
+            caption_x: cur.caption_x ?? (cur.position_x ?? 50) / 100,
+            caption_y: cur.caption_y ?? (cur.position_y ?? 78) / 100,
+            caption_custom_position: Boolean(cur.caption_custom_position),
+            face_safe_captions: cur.caption_custom_position ? false : (cur.face_safe_captions ?? true),
+          }
+        : undefined);
+    return api.triggerRender(clipId, 'fast_preview', signal, projectId, coordPayload);
   };
 
   const handleAutoRenderComplete = (clipId: number, nextVideoUrl: string, renderedPath?: string) => {
@@ -816,7 +852,15 @@ export const App: React.FC = () => {
     handleUpdateClip({ status: 'rendering', render_status: 'rendering', render_progress: 5 });
 
     try {
-      await api.triggerRender(selectedClip.id, 'final_hq', undefined, selectedClip.project_id);
+      if (pendingClipPatchRef.current) {
+        await pendingClipPatchRef.current.catch(() => {});
+      }
+      await api.triggerRender(selectedClip.id, 'final_hq', undefined, selectedClip.project_id, {
+        caption_x: selectedClip.caption_x ?? (selectedClip.position_x ?? 50) / 100,
+        caption_y: selectedClip.caption_y ?? (selectedClip.position_y ?? 78) / 100,
+        caption_custom_position: Boolean(selectedClip.caption_custom_position),
+        face_safe_captions: selectedClip.caption_custom_position ? false : (selectedClip.face_safe_captions ?? true),
+      });
     } catch (err) {
       console.error('Failed to trigger render:', err);
       handleUpdateClip({ status: 'failed', render_status: 'failed', render_message: 'Trigger failed' });
@@ -1180,6 +1224,10 @@ export const App: React.FC = () => {
         onSetThumbnailCover={handleSetThumbnailCoverFrame}
         onSnapClipStart={handleSnapClipStartFrame}
         onCalibrateCamera={handleCalibrateCameraFrame}
+        onClipUpdated={(updated) => {
+          setSelectedClip(updated);
+          setClips((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+        }}
       />
 
       {/* Full Transcript Search & Manual Clip Creator Modal */}

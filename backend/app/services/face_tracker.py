@@ -343,43 +343,53 @@ def detect_punch_zoom_peaks(
     start_sec: float,
     end_sec: float,
     base_zoom: float = 1.0,
-    punch_intensity: float = 1.14,
+    punch_intensity: float = 1.16,
+    max_peaks: int = 6,
+    min_spacing: float = 3.2,
 ) -> Dict[str, Any]:
     """
     Detect vocal excitement / acoustic energy peaks inside [start_sec, end_sec]
-    and construct crisp 0.45s Punch-In Zoom FX intervals (`1.0x -> intensity -> 1.0x`).
+    (up to `max_peaks=6`, at least `min_spacing=3.2s` apart) and construct crisp
+    0.45s Punch-In Zoom FX intervals (`1.0x -> intensity -> 1.0x`).
     Falls back to periodic 3.2s rhythm triggers when audio is uniform or silent.
     """
     dur = max(0.5, float(end_sec) - float(start_sec))
     base_z = max(1.0, min(2.5, float(base_zoom or 1.0)))
-    peak_z = max(1.04, min(2.5, max(base_z + 0.04, float(punch_intensity or 1.14))))
+    peak_z = max(1.04, min(2.5, max(base_z + 0.04, float(punch_intensity or 1.16))))
+    max_cnt = max(1, min(12, int(max_peaks or 6)))
+    spacing = max(1.0, float(min_spacing or 3.2))
     sample_fps = 6.0
     rms_list = extract_audio_rms_profile(video_path, start_sec, end_sec, sample_fps=sample_fps)
 
     punch_times: List[float] = []
     if len(rms_list) >= 4:
-        arr = np.array(rms_list)
+        arr = np.array(rms_list, dtype=np.float32)
         mean_val = float(np.mean(arr))
         std_val = float(np.std(arr))
-        thresh = max(0.42, mean_val + 0.55 * std_val)
-        last_t = -3.2
+        thresh = max(0.38, mean_val + 0.45 * std_val)
+        # Collect all local maxima sorted by acoustic peak strength, then pick non-overlapping peaks >= spacing apart
+        candidates: List[Tuple[float, float]] = []
         for i in range(1, len(arr) - 1):
             t = i / sample_fps
-            if t < 0.6 or t > dur - 0.45:
+            if t < 0.55 or t > dur - 0.45:
                 continue
             if arr[i] >= thresh and arr[i] >= arr[i - 1] and arr[i] >= arr[i + 1]:
-                if t - last_t >= 3.2:
-                    punch_times.append(round(t, 2))
-                    last_t = t
-            if len(punch_times) >= 8:
+                candidates.append((float(arr[i]), round(t, 2)))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        chosen: List[float] = []
+        for _, cand_t in candidates:
+            if all(abs(cand_t - ex) >= spacing for ex in chosen):
+                chosen.append(cand_t)
+            if len(chosen) >= max_cnt:
                 break
+        punch_times = sorted(chosen)
 
     # Deterministic 3.2s fallback cadence when audio has no sharp isolated peaks
     if not punch_times and dur >= 1.8:
         cur_t = 0.8 if dur < 4.0 else 1.2
-        while cur_t <= dur - 0.45 and len(punch_times) < 8:
+        while cur_t <= dur - 0.45 and len(punch_times) < max_cnt:
             punch_times.append(round(cur_t, 2))
-            cur_t += 3.2
+            cur_t += spacing
 
     # Crisp 0.45s punch envelope centered on each peak [pt - 0.15, pt + 0.30]
     intervals: List[Tuple[float, float, float]] = []
