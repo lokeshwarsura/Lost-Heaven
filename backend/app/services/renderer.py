@@ -185,11 +185,14 @@ def _render_clip_ultra_impl(
     custom_width: int = 1080,
     custom_height: int = 1920,
     frame_layout: str = "auto_track",
+    framing_template: Optional[str] = None,
     webcam_corner: str = "auto",
     webcam_split_ratio: float = 0.40,
     source_webcam_region: Optional[Dict[str, Any]] = None,
     visual_map: Optional[Dict[str, Any]] = None,
     framing_override: Optional[Dict[str, Any]] = None,
+    frame_crop_override: Any = "__UNSET__",
+    clear_framing_override: bool = False,
     best_frames: Optional[List[Dict[str, Any]]] = None,
     camera_motion: str = "steady",
     whip_pan_cuts: bool = False,
@@ -271,7 +274,10 @@ def _render_clip_ultra_impl(
     hardware_mode: str = "gpu",
     # Hooks & Retention FX
     hook_headline: str = "",
+    hook_text: Optional[str] = None,
     show_hook_banner: bool = True,
+    show_hook: Optional[bool] = None,
+    safe_zone: Optional[str] = None,
     cold_open_quote: str = "",
     use_cold_open: bool = False,
     cold_open: Optional[bool] = None,
@@ -357,7 +363,22 @@ def _render_clip_ultra_impl(
     eff_resolution = export_resolution or clip_size
     target_w, target_h = scale_dimensions_for_clip_size(base_w, base_h, eff_resolution)
 
-    layout = canonicalize_framing_template(frame_layout)
+    _layout_opts = options if isinstance(options, dict) else {}
+    _chosen_layout = (
+        framing_template
+        if framing_template is not None
+        else (
+            _layout_opts.get("framing_template")
+            if (frame_layout == "auto_track" and _layout_opts.get("framing_template"))
+            else frame_layout
+        )
+    )
+    layout = canonicalize_framing_template(_chosen_layout)
+    eff_framing_override = (
+        None
+        if (clear_framing_override or frame_crop_override is None)
+        else framing_override
+    )
 
     # Explicit keep_segments normalization (supports multi-segment blade cuts & merged clips)
     explicit_abs_segs: Optional[List[tuple[float, float]]] = None
@@ -379,6 +400,25 @@ def _render_clip_ultra_impl(
     )
 
     render_words = [dict(w) for w in (words or []) if not w.get("muted", False)]
+    from app.services.caption_renderer import resolve_hook_banner_state
+    _hook_opts = options if isinstance(options, dict) else {}
+    eff_hook_flag = show_hook if show_hook is not None else (
+        None if show_hook_banner is False else (
+            _hook_opts.get("show_hook") if "show_hook" in _hook_opts and _hook_opts.get("show_hook") is not None else show_hook_banner
+        )
+    )
+    if show_hook is None and show_hook_banner is False:
+        eff_hook_flag = False
+    eff_show_hook, eff_hook_text = resolve_hook_banner_state(
+        show_hook=eff_hook_flag,
+        hook_text=hook_text,
+        hook_headline=hook_headline,
+        options=_hook_opts,
+    )
+    from app.services.reframer import canonicalize_safe_zone as _canon_sz
+    eff_safe_zone = _canon_sz(
+        safe_zone if safe_zone is not None else _hook_opts.get("safe_zone", _hook_opts.get("safe_zone_guide"))
+    )
     eff_cold_open = bool(cold_open) if cold_open is not None else bool(use_cold_open)
     eff_trim_dead_air = bool(trim_dead_air) if trim_dead_air is not None else bool(auto_trim_dead_air)
     eff_punch_zoom = bool(punch_zoom) if punch_zoom is not None else bool(dynamic_punch_zoom)
@@ -420,18 +460,62 @@ def _render_clip_ultra_impl(
     cold_open_net_offset = tl_plan.teaser_duration
     effective_duration = tl_plan.effective_duration
 
-    # Single Source of Truth framing analysis (identical keyframes & crop math as preview_frame.py)
-    face_track_data, effective_corner, _ = prepare_clip_framing_data(
+    # Single Source of Truth framing analysis + chronological Cold-Open -> Main timeline keyframes
+    main_face_data, effective_corner, _ = prepare_clip_framing_data(
         video_path=master_video_path,
         kept_segments_abs=kept_segments_abs,
         frame_layout=layout,
         webcam_corner=webcam_corner,
         source_webcam_region=source_webcam_region,
         visual_map=visual_map,
-        framing_override=framing_override,
+        framing_override=eff_framing_override,
         best_frames=best_frames,
         merge_crossfade_sec=float(tl_plan.crossfade_sec or merge_crossfade_sec or 0.03),
     )
+    if cold_open_active and cold_open_window is not None:
+        co_face_data, _, _ = prepare_clip_framing_data(
+            video_path=master_video_path,
+            kept_segments_abs=[cold_open_window],
+            frame_layout=layout,
+            webcam_corner=webcam_corner,
+            source_webcam_region=source_webcam_region,
+            visual_map=visual_map,
+            framing_override=eff_framing_override,
+            best_frames=best_frames,
+            merge_crossfade_sec=0.0,
+        )
+        co_kfs = [
+            {**kf, "t": min(max(0.0, cold_open_teaser_len - 0.05), round(float(kf.get("t", 0.0)), 3))}
+            for kf in (co_face_data.get("keyframes") or [])
+            if float(kf.get("t", 0.0)) <= cold_open_teaser_len + 0.05
+        ]
+        shifted_main_kfs = [
+            {**kf, "t": round(float(kf.get("t", 0.0)) + cold_open_teaser_len, 3)}
+            for kf in (main_face_data.get("keyframes") or [])
+        ]
+        co_shots = [
+            {
+                **sh,
+                "start_t": round(max(0.0, float(sh.get("start_t", 0.0))), 3),
+                "end_t": round(min(cold_open_teaser_len, float(sh.get("end_t", cold_open_teaser_len))), 3),
+            }
+            for sh in (co_face_data.get("shots") or [])
+        ]
+        shifted_shots = [
+            {
+                **sh,
+                "start_t": round(float(sh.get("start_t", 0.0)) + cold_open_teaser_len, 3),
+                "end_t": round(float(sh.get("end_t", main_duration)) + cold_open_teaser_len, 3),
+            }
+            for sh in (main_face_data.get("shots") or [])
+        ]
+        face_track_data = {
+            **main_face_data,
+            "keyframes": co_kfs + shifted_main_kfs,
+            "shots": co_shots + shifted_shots,
+        }
+    else:
+        face_track_data = main_face_data
 
     opts = dict(options or {})
     speed_ramp = max(0.5, min(2.0, float(opts.get("speed_ramp", 1.0) or 1.0)))
@@ -494,6 +578,7 @@ def _render_clip_ultra_impl(
 
     render_overlay = bool(
         burn_captions
+        or (eff_show_hook and bool(eff_hook_text))
         or cold_open_active
         or retention_bar_enabled
         or outro_cta_enabled
@@ -514,8 +599,10 @@ def _render_clip_ultra_impl(
                 width=target_w,
                 height=target_h,
                 burn_captions=burn_captions,
-                hook_banner_enabled=bool(show_hook_banner and hook_headline),
-                hook_headline=hook_headline or "",
+                hook_banner_enabled=eff_show_hook,
+                show_hook=eff_show_hook,
+                hook_headline=eff_hook_text,
+                hook_text=eff_hook_text,
                 retention_bar_enabled=retention_bar_enabled,
                 retention_bar_color=retention_bar_color,
                 outro_cta_enabled=outro_cta_enabled,
@@ -576,6 +663,7 @@ def _render_clip_ultra_impl(
                 handle_display_mode=handle_display_mode,
                 cold_open_active=cold_open_active,
                 cold_open_teaser_dur=round((cold_open_net_offset if cold_open_active else 2.8) / speed_ramp, 3),
+                safe_zone=eff_safe_zone,
                 caption_animation=caption_animation,
                 pill_color=opts.get("pill_color"),
                 pacing_density=opts.get("pacing_density", "3-4 Words Viral"),
@@ -611,13 +699,53 @@ def _render_clip_ultra_impl(
             fg_segments.append("[0:v]setpts=PTS-STARTPTS[v_pts]")
             v_in_lbl = "v_pts"
 
+        # Chain timeline_editor (trim_dead_air + cold_open concat) directly BEFORE reframer.build_multi_aspect_filter
+        v_reframe_in = v_in_lbl
+        reframe_dur = main_duration
+        co_in_idx: Optional[int] = None
+        if cold_open_active and cold_open_window is not None:
+            src_fps_norm = max(15.0, min(60.0, float(meta.get("fps") or 30.0)))
+            co_in_idx = len(kept_segments_abs) if use_multi_input else 1
+            flash_st = max(0.05, round(cold_open_teaser_len - cold_open_xfade, 3))
+            fg_segments.append(
+                f"[{co_in_idx}:v]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,"
+                f"trim=duration={cold_open_teaser_len:.3f},setpts=PTS-STARTPTS,"
+                f"fade=t=out:st={flash_st:.3f}:d={cold_open_xfade:.3f}:color=white[co_v_norm]"
+            )
+            fg_segments.append(
+                f"[{v_in_lbl}]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS,"
+                f"fade=t=in:st=0.000:d={cold_open_xfade:.3f}:color=white[main_v_norm]"
+            )
+            fg_segments.append("[co_v_norm][main_v_norm]concat=n=2:v=1:a=0[v_timeline]")
+            if has_audio and a_in_lbl:
+                fg_segments.append(
+                    f"[{co_in_idx}:a]atrim=duration={cold_open_teaser_len:.3f},asetpts=PTS-STARTPTS,"
+                    f"aresample=async=1:first_pts=0,aresample=48000,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo[co_a_norm]"
+                )
+                fg_segments.append(
+                    f"[{a_in_lbl}]asetpts=PTS-STARTPTS,"
+                    f"aresample=async=1:first_pts=0,aresample=48000,"
+                    f"aformat=sample_rates=48000:channel_layouts=stereo[main_a_norm]"
+                )
+                fg_segments.append("[co_a_norm][main_a_norm]concat=n=2:v=0:a=1[a_co]")
+                a_in_lbl = "a_co"
+            v_reframe_in = "v_timeline"
+            reframe_dur = effective_duration
+
         eff_source_corner = str(
             ((source_webcam_region or {}).get("locked_zone") if isinstance(source_webcam_region, dict) else None)
             or "auto"
         )
+        eff_cap_y = (
+            float(opts["caption_y"])
+            if opts.get("caption_y") is not None
+            else (float(position_y) / 100.0 if position_y is not None else None)
+        )
         layout_vf = build_multi_aspect_filter(
             aspect_ratio=aspect_ratio,
             frame_layout=layout,
+            framing_template=layout,
             source_w=src_w,
             source_h=src_h,
             custom_w=target_w,
@@ -631,91 +759,17 @@ def _render_clip_ultra_impl(
             face_track_data=face_track_data,
             is_video_render=True,
             target_size=(target_w, target_h),
-            input_label=v_in_lbl,
+            input_label=v_reframe_in,
             camera_motion=camera_motion,
             whip_pan_cuts=whip_pan_cuts,
-            clip_duration=main_duration,
+            clip_duration=reframe_dur,
             fps=max(15.0, min(60.0, float(meta.get("fps") or 30.0))),
             beat_timestamps=beat_data.get("beats"),
             source_corner=eff_source_corner,
+            caption_y=(eff_cap_y if burn_captions else None),
+            safe_zone=eff_safe_zone,
         )
         fg_segments.append(layout_vf)
-
-        # If Cold-Open Climax teaser is active, frame teaser independently and stitch via fadewhite xfade
-        co_in_idx: Optional[int] = None
-        if cold_open_active and cold_open_window is not None:
-            # Avoid duplicate `[v]` pad label in filter_complex by renaming main layout output
-            fg_segments[-1] = re.sub(r"\[v\](?=[^[]*$)", "[v_main_src]", fg_segments[-1])
-            src_fps_norm = max(15.0, min(60.0, float(meta.get("fps") or 30.0)))
-            co_in_idx = len(kept_segments_abs) if use_multi_input else 1
-            co_face_data, co_eff_corner, _ = prepare_clip_framing_data(
-                video_path=master_video_path,
-                kept_segments_abs=[cold_open_window],
-                frame_layout=layout,
-                webcam_corner=webcam_corner,
-                source_webcam_region=source_webcam_region,
-                visual_map=None,
-                framing_override=framing_override,
-                best_frames=None,
-                merge_crossfade_sec=0.0,
-            )
-            co_layout_vf = build_multi_aspect_filter(
-                aspect_ratio=aspect_ratio,
-                frame_layout=layout,
-                source_w=src_w,
-                source_h=src_h,
-                custom_w=target_w,
-                custom_h=target_h,
-                webcam_corner=co_eff_corner,
-                webcam_split_ratio=webcam_split_ratio,
-                pip_border_color=pip_border_color,
-                zoom=zoom,
-                pan_x_offset=pan_x_offset,
-                pan_x=pan_x,
-                face_track_data=co_face_data,
-                is_video_render=True,
-                target_size=(target_w, target_h),
-                input_label="__CO_IN__",
-                camera_motion="steady",
-                whip_pan_cuts=False,
-                clip_duration=cold_open_teaser_len,
-                fps=src_fps_norm,
-                source_corner=eff_source_corner,
-            )
-            # Scope internal filtergraph labels to `[co_*]` so main stream `[v_main_src]` never collides
-            co_layout_scoped = re.sub(
-                r"\[([a-zA-Z_][a-zA-Z0-9_]*)\]",
-                lambda m: f"[co_{m.group(1)}]",
-                co_layout_vf,
-            ).replace("[co___CO_IN__]", f"[{co_in_idx}:v]")
-            fg_segments.append(co_layout_scoped)
-            flash_st = max(0.05, round(cold_open_teaser_len - cold_open_xfade, 3))
-            fg_segments.append(
-                f"[co_v]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,"
-                f"trim=duration={cold_open_teaser_len:.3f},setpts=PTS-STARTPTS,"
-                f"fade=t=out:st={flash_st:.3f}:d={cold_open_xfade:.3f}:color=white[co_v_norm]"
-            )
-            fg_segments.append(
-                f"[v_main_src]fps={src_fps_norm:.3f},format=yuv420p,setsar=1,setpts=PTS-STARTPTS,"
-                f"fade=t=in:st=0.000:d={cold_open_xfade:.3f}:color=white[main_v_norm]"
-            )
-            if has_audio and a_in_lbl:
-                fg_segments.append(
-                    f"[{co_in_idx}:a]atrim=duration={cold_open_teaser_len:.3f},asetpts=PTS-STARTPTS,"
-                    f"aresample=async=1:first_pts=0,aresample=48000,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo[co_a_norm]"
-                )
-                fg_segments.append(
-                    f"[{a_in_lbl}]asetpts=PTS-STARTPTS,"
-                    f"aresample=async=1:first_pts=0,aresample=48000,"
-                    f"aformat=sample_rates=48000:channel_layouts=stereo[main_a_norm]"
-                )
-                fg_segments.append(
-                    "[co_v_norm][co_a_norm][main_v_norm][main_a_norm]concat=n=2:v=1:a=1[v][a_co]"
-                )
-                a_in_lbl = "a_co"
-            else:
-                fg_segments.append("[co_v_norm][main_v_norm]concat=n=2:v=1:a=0[v]")
 
         staged_lut_rel: Optional[str] = None
         if opts.get("lut_path"):
@@ -804,8 +858,8 @@ def _render_clip_ultra_impl(
         punch_zoom_vf = ""
         if eff_punch_zoom and punch_data.get("punch_intervals"):
             fx, fy = (0.5, 0.5)
-            if isinstance(framing_override, dict) and isinstance(framing_override.get("focus_anchor"), dict):
-                fx, fy = compute_punch_focus_anchor(face_track_data, framing_override=framing_override)
+            if isinstance(eff_framing_override, dict) and isinstance(eff_framing_override.get("focus_anchor"), dict):
+                fx, fy = compute_punch_focus_anchor(face_track_data, framing_override=eff_framing_override)
             z_expr = "1.0"
             for t0, t1, pz in reversed(punch_data["punch_intervals"]):
                 span = max(0.08, float(t1) - float(t0))
@@ -909,8 +963,8 @@ def _render_clip_ultra_impl(
         if auto_sfx or callout_sfx_times or cold_open_sfx_times:
             sfx_events = plan_sfx_events(
                 effective_duration,
-                show_hook_banner=bool(auto_sfx and show_hook_banner and hook_headline),
-                hook_headline=hook_headline or "",
+                show_hook_banner=bool(auto_sfx and eff_show_hook and eff_hook_text),
+                hook_headline=eff_hook_text,
                 punch_timestamps=punch_data.get("punch_timestamps") if auto_sfx else [],
                 callout_timestamps=callout_sfx_times,
                 transition_times=cold_open_sfx_times,
@@ -1289,11 +1343,14 @@ def render_clip_ultra(
     custom_width: int = 1080,
     custom_height: int = 1920,
     frame_layout: str = "auto_track",
+    framing_template: Optional[str] = None,
     webcam_corner: str = "auto",
     webcam_split_ratio: float = 0.40,
     source_webcam_region: Optional[Dict[str, Any]] = None,
     visual_map: Optional[Dict[str, Any]] = None,
     framing_override: Optional[Dict[str, Any]] = None,
+    frame_crop_override: Any = "__UNSET__",
+    clear_framing_override: bool = False,
     best_frames: Optional[List[Dict[str, Any]]] = None,
     camera_motion: str = "steady",
     whip_pan_cuts: bool = False,
@@ -1375,7 +1432,10 @@ def render_clip_ultra(
     hardware_mode: str = "gpu",
     # Hooks & Retention FX
     hook_headline: str = "",
+    hook_text: Optional[str] = None,
     show_hook_banner: bool = True,
+    show_hook: Optional[bool] = None,
+    safe_zone: Optional[str] = None,
     cold_open_quote: str = "",
     use_cold_open: bool = False,
     cold_open: Optional[bool] = None,
@@ -1425,6 +1485,40 @@ def render_clip_ultra(
     - Option or timestamp changes supersede the older FFmpeg job cleanly
     """
     raw_params = dict(locals())
+    from app.services.caption_renderer import resolve_hook_banner_state
+    _sig_opts = options if isinstance(options, dict) else {}
+    _sig_flag = show_hook if show_hook is not None else (
+        None if show_hook_banner is False else (
+            _sig_opts.get("show_hook") if "show_hook" in _sig_opts and _sig_opts.get("show_hook") is not None else show_hook_banner
+        )
+    )
+    if show_hook is None and show_hook_banner is False:
+        _sig_flag = False
+    _eff_sig_show, _eff_sig_text = resolve_hook_banner_state(
+        show_hook=_sig_flag,
+        hook_text=hook_text,
+        hook_headline=hook_headline,
+        options=_sig_opts,
+    )
+    from app.services.reframer import canonicalize_safe_zone as _canon_sz, canonicalize_framing_template as _canon_tpl
+    _eff_sig_sz = _canon_sz(
+        safe_zone if safe_zone is not None else _sig_opts.get("safe_zone", _sig_opts.get("safe_zone_guide"))
+    )
+    _eff_sig_tpl = _canon_tpl(
+        framing_template
+        if framing_template is not None
+        else (_sig_opts.get("framing_template") if (frame_layout == "auto_track" and _sig_opts.get("framing_template")) else frame_layout)
+    )
+    _eff_sig_override = None if (clear_framing_override or frame_crop_override is None) else framing_override
+    sig_params = dict(raw_params)
+    sig_params["show_hook"] = _eff_sig_show
+    sig_params["show_hook_banner"] = _eff_sig_show
+    sig_params["hook_text"] = _eff_sig_text
+    sig_params["hook_headline"] = _eff_sig_text
+    sig_params["safe_zone"] = _eff_sig_sz
+    sig_params["framing_template"] = _eff_sig_tpl
+    sig_params["frame_layout"] = _eff_sig_tpl
+    sig_params["framing_override"] = _eff_sig_override
     my_token = uuid.uuid4().hex
     clip_key = (
         f"pack_{project_id if project_id is not None else 0}_{clip_id}_{my_token}"
@@ -1436,7 +1530,7 @@ def render_clip_ultra(
         project_id=project_id,
         start_time=start_time,
         duration=duration,
-        params=raw_params,
+        params=sig_params,
     )
     action, queue_entry = acquire_or_attach_render(clip_key, my_token, render_sig)
     if action == "attach":

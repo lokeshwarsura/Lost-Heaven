@@ -88,6 +88,15 @@ export const App: React.FC = () => {
   const [safeZoneGuide, setSafeZoneGuide] = useState<string>('TikTok');
   const [compareOriginal, setCompareOriginal] = useState<boolean>(false);
 
+  const mapSafeZoneToBackend = (guide?: string): string => {
+    const g = (guide || '').trim().toLowerCase();
+    if (g === 'tiktok') return 'tiktok';
+    if (g === 'instagram' || g === 'reels' || g === 'ig') return 'reels';
+    if (g === 'yt shorts' || g === 'yt_shorts' || g === 'shorts' || g === 'youtube_shorts') return 'shorts';
+    if (g === 'all') return 'all';
+    return 'none';
+  };
+
   useEffect(() => {
     if (!compareOriginal) return;
     const release = () => setCompareOriginal(false);
@@ -287,7 +296,7 @@ export const App: React.FC = () => {
     setSelectedClip(updated);
     setClips((prev) => prev.map((c) => (c.id === clipId ? { ...c, ...updates } : c)));
 
-    const patchPromise = api.updateClip(clipId, updates);
+    const patchPromise = api.updateClip(clipId, updates, selectedClip.project_id);
     pendingClipPatchRef.current = patchPromise;
     try {
       await patchPromise;
@@ -411,6 +420,7 @@ export const App: React.FC = () => {
       await pendingClipPatchRef.current.catch(() => {});
     }
     const cur = clips.find((c) => c.id === clipId) || selectedClip;
+    const curTpl = cur?.framing_template || cur?.frame_layout;
     const coordPayload =
       overrides ??
       (cur
@@ -419,6 +429,18 @@ export const App: React.FC = () => {
             caption_y: cur.caption_y ?? (cur.position_y ?? 78) / 100,
             caption_custom_position: Boolean(cur.caption_custom_position),
             face_safe_captions: cur.caption_custom_position ? false : (cur.face_safe_captions ?? true),
+            frame_layout: curTpl,
+            framing_template: curTpl,
+            framing_override: cur.framing_override ?? null,
+            frame_crop_override: cur.framing_override ?? null,
+            clear_framing_override: !cur.framing_override,
+            show_hook: Boolean(cur.show_hook ?? cur.show_hook_banner),
+            show_hook_banner: Boolean(cur.show_hook ?? cur.show_hook_banner),
+            hook_banner_enabled: Boolean(cur.show_hook ?? cur.show_hook_banner),
+            hook_headline: (cur.show_hook ?? cur.show_hook_banner) ? (cur.hook_headline || '') : '',
+            hook_text: (cur.show_hook ?? cur.show_hook_banner) ? (cur.hook_headline || '') : '',
+            safe_zone: mapSafeZoneToBackend(safeZoneGuide),
+            safe_zone_guide: safeZoneGuide,
           }
         : undefined);
     return api.triggerRender(clipId, 'fast_preview', signal, projectId, coordPayload);
@@ -855,11 +877,24 @@ export const App: React.FC = () => {
       if (pendingClipPatchRef.current) {
         await pendingClipPatchRef.current.catch(() => {});
       }
+      const exportTpl = selectedClip.framing_template || selectedClip.frame_layout;
       await api.triggerRender(selectedClip.id, 'final_hq', undefined, selectedClip.project_id, {
         caption_x: selectedClip.caption_x ?? (selectedClip.position_x ?? 50) / 100,
         caption_y: selectedClip.caption_y ?? (selectedClip.position_y ?? 78) / 100,
         caption_custom_position: Boolean(selectedClip.caption_custom_position),
         face_safe_captions: selectedClip.caption_custom_position ? false : (selectedClip.face_safe_captions ?? true),
+        frame_layout: exportTpl,
+        framing_template: exportTpl,
+        framing_override: selectedClip.framing_override ?? null,
+        frame_crop_override: selectedClip.framing_override ?? null,
+        clear_framing_override: !selectedClip.framing_override,
+        show_hook: Boolean(selectedClip.show_hook ?? selectedClip.show_hook_banner),
+        show_hook_banner: Boolean(selectedClip.show_hook ?? selectedClip.show_hook_banner),
+        hook_banner_enabled: Boolean(selectedClip.show_hook ?? selectedClip.show_hook_banner),
+        hook_headline: (selectedClip.show_hook ?? selectedClip.show_hook_banner) ? (selectedClip.hook_headline || '') : '',
+        hook_text: (selectedClip.show_hook ?? selectedClip.show_hook_banner) ? (selectedClip.hook_headline || '') : '',
+        safe_zone: mapSafeZoneToBackend(safeZoneGuide),
+        safe_zone_guide: safeZoneGuide,
       });
     } catch (err) {
       console.error('Failed to trigger render:', err);
@@ -1028,6 +1063,9 @@ export const App: React.FC = () => {
             {/* Top 52px Header with 3-Step Segmented Switcher */}
             <TopBar
               projectTitle={currentProject?.title}
+              onRenameProject={(nextTitle) => {
+                if (currentProject) void handleUpdateProject({ title: nextTitle });
+              }}
               activeStep={activeStep}
               onSelectStep={setActiveStep}
               onUploadVideo={handleUploadVideo}
@@ -1085,11 +1123,27 @@ export const App: React.FC = () => {
               <ClipFeed
                 clips={clips}
                 selectedClipId={selectedClip?.id || null}
+                project={currentProject}
                 onSelectClip={(clip) => {
                   setSelectedClip(clip);
                   setPreviewSeekTime(undefined);
                   setCurrentPlaybackTime(undefined);
                 }}
+                onUpdateProject={(updates) => void handleUpdateProject(updates)}
+                onRegenerateClips={
+                  currentProject
+                    ? async () => {
+                        try {
+                          await api.retryProject(currentProject.id, isOfflineMultimodal, 'discovery');
+                          setProgressTargetId(currentProject.id);
+                          setActiveView('progress');
+                          showToast('Re-generating project clips with updated target settings...', 'success');
+                        } catch (err: any) {
+                          showToast(err?.message || 'Failed to re-generate clips', 'error');
+                        }
+                      }
+                    : undefined
+                }
                 onMergeClips={handleMergeClips}
                 isMerging={isMerging}
                 onCompileTrailer={handleCompileTrailer}
@@ -1099,7 +1153,7 @@ export const App: React.FC = () => {
               />
 
               {/* Column 2: Full-Width Center Inspector */}
-              <main className="flex-1 min-w-0 h-full min-h-0 overflow-y-auto p-4 lg:p-5 bg-[var(--bg-canvas)]">
+              <main className="flex-1 min-w-0 h-full min-h-0 overflow-y-auto px-4 lg:px-5 pt-4 pb-6 bg-[var(--bg-canvas)]">
                 {activeStep === 1 && (
                   <Step1Setup
                     clip={selectedClip}
@@ -1132,6 +1186,7 @@ export const App: React.FC = () => {
                   <Step3Video
                     clip={selectedClip}
                     onUpdateClip={handleUpdateClip}
+                    onUpdateProject={handleUpdateProject}
                     onUploadAsset={api.uploadAsset}
                     compareOriginal={compareOriginal}
                     onCompareOriginalChange={setCompareOriginal}

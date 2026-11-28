@@ -477,6 +477,7 @@ def score_window_from_fusion(
             if et and et not in ev_types:
                 ev_types.append(et)
 
+    diar_ctx = multimodal_context.get("speaker_diarization") or {}
     return {
         "audio_score": round(0.65 * avg_aud + 0.35 * peak_aud, 1),
         "visual_score": round(0.65 * avg_vis + 0.35 * peak_vis, 1),
@@ -498,6 +499,8 @@ def score_window_from_fusion(
         "avg_fluency": round(avg_fluency, 1),
         "crosstalk_bins": crosstalk_cnt,
         "speaker_count": int((multimodal_context.get("summary") or {}).get("speaker_count", 1) or 1),
+        "dominance_ratios": diar_ctx.get("dominance_ratios") or (multimodal_context.get("summary") or {}).get("dominance_ratios") or {},
+        "max_turns_15s": int(diar_ctx.get("max_turns_15s", 0) or 0),
         "acoustic_events_in_window": ev_types,
     }
 

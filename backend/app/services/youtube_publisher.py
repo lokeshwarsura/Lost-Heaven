@@ -16,6 +16,15 @@ SCOPES = [
 
 VALID_PRIVACY_STATUSES = {"private", "unlisted", "public"}
 
+YOUTUBE_CATEGORIES = [
+    {"id": "20", "label": "Gaming"},
+    {"id": "24", "label": "Entertainment"},
+    {"id": "22", "label": "People & Blogs"},
+    {"id": "27", "label": "Education"},
+    {"id": "28", "label": "Science & Technology"},
+]
+VALID_CATEGORY_IDS = {c["id"] for c in YOUTUBE_CATEGORIES} | {"1", "2", "10", "15", "17", "19", "23", "25", "26", "29"}
+
 
 class YouTubeAuthError(Exception):
     """Raised when YouTube OAuth credentials are missing, invalid, or cannot refresh (HTTP 401)."""
@@ -187,6 +196,32 @@ def save_youtube_client_secrets(raw_bytes: bytes) -> Dict[str, Any]:
     return get_youtube_status()
 
 
+def save_youtube_oauth_credentials(client_id: str, client_secret: str) -> Dict[str, Any]:
+    """Validate pasted Google Cloud OAuth Client ID & Secret and persist standard Desktop OAuth JSON."""
+    cid = str(client_id or "").strip()
+    csec = str(client_secret or "").strip()
+    if not cid or not csec:
+        raise YouTubeConfigError("Both Client ID and Client Secret are required.")
+    if any(ch.isspace() for ch in cid) or any(ch.isspace() for ch in csec):
+        raise YouTubeConfigError("Client ID and Client Secret must not contain spaces or line breaks.")
+
+    payload = {
+        "installed": {
+            "client_id": cid,
+            "client_secret": csec,
+            "project_id": "lost-heaven-studio",
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
+    secrets_path = get_client_secrets_file()
+    secrets_path.parent.mkdir(parents=True, exist_ok=True)
+    secrets_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return get_youtube_status()
+
+
 def connect_youtube_account() -> Dict[str, Any]:
     """Launch desktop OAuth 2.0 local server flow, persist token & channel metadata."""
     secrets_path = get_client_secrets_file()
@@ -266,6 +301,11 @@ def _sanitize_privacy(privacy_status: Optional[str]) -> str:
     return val if val in VALID_PRIVACY_STATUSES else "private"
 
 
+def _sanitize_category_id(category_id: Optional[str]) -> str:
+    digits = re.sub(r"\D", "", str(category_id or "22"))
+    return digits if digits in VALID_CATEGORY_IDS else "22"
+
+
 def upload_clip_to_youtube(
     video_path: str,
     title: str,
@@ -273,6 +313,7 @@ def upload_clip_to_youtube(
     tags: Optional[List[str]] = None,
     privacy_status: str = "private",
     aspect_ratio: str = "9:16",
+    category_id: str = "22",
 ) -> Dict[str, Any]:
     """
     Upload a rendered clip to YouTube via YouTube Data API v3 resumable upload.
@@ -291,13 +332,14 @@ def upload_clip_to_youtube(
     clean_desc = _sanitize_description(description)
     clean_tags = _sanitize_tags(tags)
     clean_privacy = _sanitize_privacy(privacy_status)
+    clean_category = _sanitize_category_id(category_id)
 
     body = {
         "snippet": {
             "title": clean_title,
             "description": clean_desc,
             "tags": clean_tags,
-            "categoryId": "22",
+            "categoryId": clean_category,
         },
         "status": {
             "privacyStatus": clean_privacy,

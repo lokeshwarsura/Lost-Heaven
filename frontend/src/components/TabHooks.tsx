@@ -8,6 +8,17 @@ interface TabHooksProps {
 }
 
 export const TabHooks: React.FC<TabHooksProps> = ({ clip, onUpdateClip }) => {
+  const [draftHeadline, setDraftHeadline] = React.useState(clip.hook_headline || '');
+  const hookEnabled = Boolean(clip.show_hook ?? clip.show_hook_banner);
+
+  React.useEffect(() => {
+    if ((clip.hook_headline || '').trim()) {
+      setDraftHeadline(clip.hook_headline);
+    }
+  }, [clip.id, clip.hook_headline]);
+
+  const effectiveDraft = (clip.hook_headline && clip.hook_headline.length > 0 ? clip.hook_headline : draftHeadline) || '';
+
   return (
     <div className="space-y-5">
       {/* Visual Hook Banner */}
@@ -18,13 +29,32 @@ export const TabHooks: React.FC<TabHooksProps> = ({ clip, onUpdateClip }) => {
             <span className="text-xs font-bold text-zinc-200">Top Hook Banner (First 3.5s)</span>
           </div>
           <button
-            onClick={() => onUpdateClip({ show_hook_banner: !clip.show_hook_banner })}
+            onClick={() => {
+              const nextOn = !hookEnabled;
+              if (!nextOn) {
+                setDraftHeadline(effectiveDraft);
+                onUpdateClip({
+                  show_hook_banner: false,
+                  show_hook: false,
+                  hook_text: '',
+                  options: { ...(clip.options || {}), show_hook: false },
+                });
+              } else {
+                onUpdateClip({
+                  show_hook_banner: true,
+                  show_hook: true,
+                  hook_headline: effectiveDraft,
+                  hook_text: effectiveDraft,
+                  options: { ...(clip.options || {}), show_hook: true },
+                });
+              }
+            }}
             className={`w-9 h-5 rounded-full transition-colors relative ${
-              clip.show_hook_banner ? 'bg-violet-500' : 'bg-zinc-800'
+              hookEnabled ? 'bg-violet-500' : 'bg-zinc-800'
             }`}
           >
             <div className={`w-4 h-4 rounded-full bg-white transition-transform transform absolute top-0.5 ${
-              clip.show_hook_banner ? 'translate-x-4' : 'translate-x-0.5'
+              hookEnabled ? 'translate-x-4' : 'translate-x-0.5'
             }`} />
           </button>
         </div>
@@ -33,11 +63,14 @@ export const TabHooks: React.FC<TabHooksProps> = ({ clip, onUpdateClip }) => {
           Burns high-contrast headline banner pill in top safe zone for first 3.5s of the clip.
         </p>
 
-        {clip.show_hook_banner && (
+        {hookEnabled && (
           <input
             type="text"
-            value={clip.hook_headline}
-            onChange={(e) => onUpdateClip({ hook_headline: e.target.value })}
+            value={effectiveDraft}
+            onChange={(e) => {
+              setDraftHeadline(e.target.value);
+              onUpdateClip({ hook_headline: e.target.value, hook_text: e.target.value });
+            }}
             placeholder="PUNCHY 4-6 WORD HEADLINE..."
             className="w-full px-3 py-2 rounded-lg bg-zinc-950 border border-zinc-800 text-xs font-bold tracking-wide text-amber-300 outline-none uppercase focus:border-violet-500"
           />

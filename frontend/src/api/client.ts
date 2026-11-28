@@ -16,6 +16,7 @@ import {
   SourceWebcamRegion,
   FramingOverride,
   FramingMapResponse,
+  SocialCopyBundle,
   JobProgress,
   JobsListResponse,
   YouTubeMetadataInfo,
@@ -493,11 +494,22 @@ export const api = {
     return res.json();
   },
 
-  async updateClip(clipId: number, updates: Partial<ViralClip>): Promise<any> {
-    const res = await fetch(`${API_BASE}/clips/${clipId}`, {
+  async updateClip(clipId: number, updates: Partial<ViralClip>, projectId?: number): Promise<any> {
+    const payload: Record<string, any> = { ...updates };
+    if (payload.show_hook !== undefined || payload.show_hook_banner !== undefined) {
+      const nextHook = Boolean(payload.show_hook ?? payload.show_hook_banner);
+      payload.show_hook = nextHook;
+      payload.show_hook_banner = nextHook;
+      payload.options = { ...(payload.options || {}), show_hook: nextHook };
+    }
+    const endpoint =
+      projectId !== undefined
+        ? `${API_BASE}/clips/${projectId}/${clipId}`
+        : `${API_BASE}/clips/${clipId}`;
+    const res = await fetch(endpoint, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
+      body: JSON.stringify(payload),
     });
     return res.json();
   },
@@ -511,6 +523,7 @@ export const api = {
       hashtags?: string;
       pinned_comment?: string;
       privacy_status?: 'private' | 'unlisted' | 'public';
+      social_copy?: Record<string, any>;
     }
   ): Promise<any> {
     const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/metadata`, {
@@ -591,6 +604,27 @@ export const api = {
     return res.json();
   },
 
+  async saveYouTubeCredentials(
+    clientId: string,
+    clientSecret: string
+  ): Promise<{
+    client_configured: boolean;
+    connected: boolean;
+    channel_title: string | null;
+    channel_id: string | null;
+  }> {
+    const res = await fetch(`${API_BASE}/youtube/auth/credentials`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: clientId, client_secret: clientSecret }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to save YouTube OAuth credentials' }));
+      throw new Error(err.detail || 'Failed to save YouTube OAuth credentials');
+    }
+    return res.json();
+  },
+
   async connectYouTube(): Promise<{
     client_configured: boolean;
     connected: boolean;
@@ -625,7 +659,7 @@ export const api = {
 
   async publishToYouTube(
     clipId: number,
-    data: { title?: string; description?: string; tags?: string[]; privacy_status?: string },
+    data: { title?: string; description?: string; tags?: string[]; privacy_status?: string; category_id?: string },
     projectId?: number
   ): Promise<{
     success: boolean;
@@ -752,6 +786,8 @@ export const api = {
     pip_border_color?: string;
     source_webcam_region?: any;
     framing_override?: any;
+    frame_crop_override?: any;
+    clear_framing_override?: boolean;
     clip_size?: string;
     export_resolution?: string;
     watermark_path?: string;
@@ -845,9 +881,13 @@ export const api = {
     word_by_word?: boolean;
     clean_filler_words?: boolean;
     censor_profanity?: boolean;
+    show_hook?: boolean;
     show_hook_banner?: boolean;
     hook_banner_enabled?: boolean;
+    enable_hook_banner?: boolean;
+    top_hook_banner?: boolean;
     hook_headline?: string;
+    hook_text?: string;
     retention_bar_enabled?: boolean;
     retention_bar_color?: string;
     outro_cta_enabled?: boolean;
@@ -884,6 +924,8 @@ export const api = {
     use_cold_open?: boolean;
     cold_open?: boolean;
     cold_open_quote?: string;
+    safe_zone?: string;
+    safe_zone_guide?: string;
     auto_trim_dead_air?: boolean;
     trim_dead_air?: boolean;
     silence_threshold?: number;
@@ -891,11 +933,12 @@ export const api = {
     punch_zoom?: boolean;
     punch_zoom_intensity?: number;
     options?: Record<string, any>;
-  }): Promise<PreviewFrameResponse> {
+  }, signal?: AbortSignal): Promise<PreviewFrameResponse> {
     const res = await fetch(`${API_BASE}/preview-frame`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
+      signal,
     });
     if (!res.ok) {
       const err = await res.json();
@@ -1129,7 +1172,7 @@ export const api = {
   async generateSocialCopy(
     projectId: number,
     clipId: number
-  ): Promise<{ clip_id: number; project_id: number; platforms: Record<string, any> }> {
+  ): Promise<{ clip_id: number; project_id: number } & SocialCopyBundle> {
     const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/generate-social-copy`, {
       method: 'POST',
     });
@@ -1138,6 +1181,27 @@ export const api = {
       throw new Error(err.detail || 'Failed to generate platform social copy');
     }
     return res.json();
+  },
+
+  async downloadSocialPack(projectId: number, clipId: number): Promise<string> {
+    const res = await fetch(`${API_BASE}/clips/${projectId}/${clipId}/social-pack`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to download Social Pack (.zip)' }));
+      throw new Error(err.detail || 'Failed to download Social Pack (.zip)');
+    }
+    const blob = await res.blob();
+    const disp = res.headers.get('Content-Disposition') || '';
+    const match = disp.match(/filename="?([^";\n]+)"?/i);
+    const filename = match ? match[1] : `clip_${clipId}_social_pack.zip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 15000);
+    return filename;
   },
 
   async exportPublishPack(

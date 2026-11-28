@@ -1,3 +1,4 @@
+import math
 import re
 import subprocess
 import cv2
@@ -22,6 +23,7 @@ ASPECT_RATIO_PRESETS = {
     "4:5": (1080, 1350),
     "4:3": (1440, 1080),
     "21:9": (2560, 1080),
+    "2.39:1": (1920, 804),
 }
 
 
@@ -258,28 +260,94 @@ def _pip_overlay_coords(corner: str, margin_x: int = 28, margin_y: int = 36, bot
     return f"W-w-{margin_x}:{margin_y}"
 
 
+def canonicalize_safe_zone(safe_zone: Any = None) -> str:
+    """Normalize platform safe-zone identifiers across UI and backend callers."""
+    norm = str(safe_zone or "").strip().lower().replace("-", " ").replace("_", " ")
+    norm = " ".join(norm.split())
+    if norm in ("tiktok", "tik tok", "tt"):
+        return "tiktok"
+    if norm in ("reels", "reel", "instagram", "instagram reels", "ig", "ig reels"):
+        return "reels"
+    if norm in ("shorts", "short", "yt shorts", "youtube shorts", "youtube"):
+        return "shorts"
+    if norm == "all":
+        return "all"
+    return "none"
+
+
+def compute_top_safe_zone_y(target_h: int, safe_zone: Any = None) -> int:
+    """Return even pixel Y >= 0.13 * target_h when a social safe zone is active."""
+    sz = canonicalize_safe_zone(safe_zone)
+    if sz not in ("tiktok", "reels", "shorts", "all"):
+        return 0
+    raw = max(0, int(math.ceil(max(2, int(target_h or 0)) * 0.13)))
+    return raw if raw % 2 == 0 else raw + 1
+
+
+def _nudge_pip_y_clear_of_captions(
+    y: int,
+    target_h: int,
+    card_h: int,
+    corner: str,
+    caption_y: Optional[float],
+    min_margin: int,
+    min_top_margin: Optional[int] = None,
+) -> int:
+    """Shift PiP card vertically if user-placed captions inhabit the same vertical band."""
+    eff_top = min_top_margin if min_top_margin is not None else min_margin
+    if caption_y is None:
+        return max(eff_top, min(max(eff_top, target_h - card_h - min_margin), y))
+    try:
+        cy_norm = max(0.05, min(0.95, float(caption_y)))
+    except (TypeError, ValueError):
+        return max(eff_top, min(max(eff_top, target_h - card_h - min_margin), y))
+    cap_top = int(round(max(0.02, cy_norm - 0.11) * target_h))
+    cap_bot = int(round(min(0.98, cy_norm + 0.11) * target_h))
+    buf = max(8, _even_int(round(target_h * 0.01), 2))
+    if y < (cap_bot + buf) and (y + card_h) > (cap_top - buf):
+        cand_above = cap_top - card_h - buf
+        cand_below = cap_bot + buf
+        can_above = cand_above >= eff_top
+        can_below = (cand_below + card_h) <= (target_h - min_margin)
+        if "bottom" in corner or cy_norm >= 0.48:
+            if can_above:
+                y = cand_above
+            elif can_below:
+                y = cand_below
+        else:
+            if can_below:
+                y = cand_below
+            elif can_above:
+                y = cand_above
+    return max(eff_top, min(max(eff_top, target_h - card_h - min_margin), y))
+
+
 def _pip_safe_xy(
     corner: str,
     target_w: int,
     target_h: int,
     card_w: int,
     card_h: int,
+    caption_y: Optional[float] = None,
+    safe_zone: Any = "none",
 ) -> Tuple[int, int]:
     """
     Compute realistic platform-safe PiP top-left coordinates clear of top Hook Banner,
     bottom captions (y + h <= 72% height on vertical outputs), and social UI rail:
-    - top_left:     x=4%,  y=14%
-    - top_right:    x=60%, y=14%
+    - top_left:     x=4%,  y=14% (>= 13% when social safe zone is active)
+    - top_right:    x=60%, y=14% (>= 13% when social safe zone is active)
     - bottom_left:  x=4%,  y=54% (clamped so y + card_h <= 0.72 * target_h)
     - bottom_right: x=49%, y=54% (clamped so y + card_h <= 0.72 * target_h)
     """
     c_key = (corner or "top_right").strip().lower()
     is_vertical = target_h > target_w
     max_bot_y = int(round(target_h * 0.72)) - card_h if is_vertical else target_h - card_h - 12
+    safe_top_y = compute_top_safe_zone_y(target_h, safe_zone)
 
     if c_key == "top_left":
         x = int(round(target_w * 0.04))
-        y = min(max_bot_y, int(round(target_h * 0.14))) if is_vertical else int(round(target_h * 0.06))
+        base_top = min(max_bot_y, int(round(target_h * 0.14))) if is_vertical else int(round(target_h * 0.06))
+        y = max(safe_top_y, base_top) if safe_top_y > 0 else base_top
     elif c_key == "bottom_left":
         x = int(round(target_w * 0.04))
         y = min(max_bot_y, int(round(target_h * 0.54))) if is_vertical else int(round(target_h * 0.54))
@@ -288,13 +356,55 @@ def _pip_safe_xy(
         y = min(max_bot_y, int(round(target_h * 0.54))) if is_vertical else int(round(target_h * 0.54))
     else:  # top_right
         x = int(round(target_w * 0.60))
-        y = min(max_bot_y, int(round(target_h * 0.14))) if is_vertical else int(round(target_h * 0.06))
+        base_top = min(max_bot_y, int(round(target_h * 0.14))) if is_vertical else int(round(target_h * 0.06))
+        y = max(safe_top_y, base_top) if safe_top_y > 0 else base_top
 
     x = max(8, min(max(8, target_w - card_w - 8), x))
-    y = max(8, min(max(8, target_h - card_h - 8), y))
+    min_top_eff = max(8, safe_top_y) if ("top" in c_key and safe_top_y > 0) else 8
+    y = _nudge_pip_y_clear_of_captions(y, target_h, card_h, c_key, caption_y, 8, min_top_margin=min_top_eff)
     x = _even_int(x, 8)
     y = _even_int(y, 8)
+    if "top" in c_key and safe_top_y > 0 and y < safe_top_y:
+        y = min(max(safe_top_y, target_h - card_h - 8), safe_top_y)
     return x, y
+
+
+def _portrait_pip_safe_xy(
+    corner: str,
+    target_w: int,
+    target_h: int,
+    card_w: int,
+    card_h: int,
+    caption_y: Optional[float] = None,
+    safe_zone: Any = "none",
+) -> Tuple[int, int]:
+    """
+    Anchor compact 3:4 portrait facecam card cleanly inside requested output corner
+    with 28px safe margin (and >= 13% top clearance when a social safe zone is active),
+    automatically nudging vertically if captions share the same vertical zone.
+    """
+    c_key = (corner or "top_right").strip().lower()
+    mx = _even_int(max(12, min(28, round(target_w * 28.0 / 1080.0))), 2)
+    my = _even_int(max(12, min(28, round(target_h * 28.0 / 1920.0))), 2)
+    safe_top_y = compute_top_safe_zone_y(target_h, safe_zone)
+    top_my = max(my, safe_top_y) if safe_top_y > 0 else my
+
+    if c_key == "top_left":
+        x, y = mx, top_my
+    elif c_key == "bottom_left":
+        x, y = mx, max(my, target_h - card_h - my)
+    elif c_key == "bottom_right":
+        x, y = max(mx, target_w - card_w - mx), max(my, target_h - card_h - my)
+    else:  # top_right
+        x, y = max(mx, target_w - card_w - mx), top_my
+
+    x = max(mx, min(max(mx, target_w - card_w - mx), x))
+    min_top_eff = top_my if ("top" in c_key and safe_top_y > 0) else my
+    y = _nudge_pip_y_clear_of_captions(y, target_h, card_h, c_key, caption_y, my, min_top_margin=min_top_eff)
+    y_even = _even_int(y, 2)
+    if "top" in c_key and safe_top_y > 0 and y_even < safe_top_y:
+        y_even = safe_top_y
+    return _even_int(x, 2), y_even
 
 
 def prepare_clip_framing_data(
@@ -307,6 +417,7 @@ def prepare_clip_framing_data(
     framing_override: Optional[Dict[str, Any]] = None,
     merge_crossfade_sec: float = 0.03,
     best_frames: Optional[List[Dict[str, Any]]] = None,
+    skip_video_scan: bool = False,
 ) -> Tuple[Dict[str, Any], str, Optional[Dict[str, Any]]]:
     """
     Single Source of Truth called by both `preview_frame.py` and `renderer.py` to compute
@@ -333,7 +444,10 @@ def prepare_clip_framing_data(
             locked_zone = lz
 
     resolved_vm: Optional[Dict[str, Any]] = None
-    if (
+    if skip_video_scan:
+        # Fast live-preview mode: reuse cached visual_map/metadata in <1ms without multi-frame video decoding
+        resolved_vm = visual_map if isinstance(visual_map, dict) else None
+    elif (
         isinstance(visual_map, dict)
         and visual_map.get("keyframes")
         and len(segs) == 1
@@ -631,6 +745,7 @@ def _build_crop_filter_or_coords(
     fallback_xy: Tuple[float, float],
     is_video_render: bool,
     preview_rel_t: float,
+    center_vertical: bool = False,
 ) -> str:
     """
     Shared keyframe -> crop compiler ensuring exact pixel coordinate parity between
@@ -639,10 +754,17 @@ def _build_crop_filter_or_coords(
     """
     max_x = max(0, source_w - cw)
     max_y = max(0, source_h - ch)
+    overscan_y = _even_int(max(0, round(max_y * 0.35)), 0) if center_vertical else 0
+
+    def _resolve_xy(fx_v: float, fy_v: float) -> Tuple[int, int]:
+        px, py = compute_clamped_crop_coords(fx_v, fy_v, cw, ch, source_w, source_h, pan_norm=pan_norm)
+        if center_vertical:
+            centered_y = int(round(max(0.0, min(1.0, fy_v)) * source_h - ch * 0.5))
+            py = _even_int(max(overscan_y, min(max(overscan_y, max_y - overscan_y), centered_y)), 0)
+        return px, py
+
     if not kfs:
-        px, py = compute_clamped_crop_coords(
-            fallback_xy[0], fallback_xy[1], cw, ch, source_w, source_h, pan_norm=pan_norm
-        )
+        px, py = _resolve_xy(fallback_xy[0], fallback_xy[1])
         return f"crop={cw}:{ch}:{px}:{py}"
 
     pts_x: List[Tuple[float, int]] = []
@@ -654,7 +776,7 @@ def _build_crop_filter_or_coords(
         t_val = float(kf.get("t", 0.0))
         fx_val = float(kf.get(cx_key, fallback_xy[0]))
         fy_val = float(kf.get(cy_key, fallback_xy[1]))
-        px, py = compute_clamped_crop_coords(fx_val, fy_val, cw, ch, source_w, source_h, pan_norm=pan_norm)
+        px, py = _resolve_xy(fx_val, fy_val)
         if (
             kf.get("is_cut")
             and prev_x is not None
@@ -738,7 +860,6 @@ def build_camera_motion_zoom_expr(
     duration: float,
     fps: float = 30.0,
     beat_timestamps: Optional[List[float]] = None,
-    source_corner: str = "auto",
 ) -> str:
     mode = canonicalize_camera_motion(camera_motion)
     eff_fps = max(15.0, min(60.0, float(fps or 30.0)))
@@ -834,6 +955,9 @@ def build_multi_aspect_filter(
     fps: float = 30.0,
     beat_timestamps: Optional[List[float]] = None,
     source_corner: str = "auto",
+    caption_y: Optional[float] = None,
+    safe_zone: str = "none",
+    framing_template: Optional[str] = None,
 ) -> str:
     """
     Generate complete FFmpeg video filtergraph string for all 5 unified framing templates:
@@ -852,7 +976,7 @@ def build_multi_aspect_filter(
         eff_custom_h = custom_h if custom_h is not None else custom_height
         target_w, target_h = resolve_target_dimensions(aspect_ratio, custom_w, eff_custom_h)
     target_ratio = target_w / float(target_h)
-    layout = canonicalize_framing_template(frame_layout)
+    layout = canonicalize_framing_template(framing_template if framing_template is not None else frame_layout)
     z = max(1.0, min(2.5, float(zoom or 1.0)))
     pan_norm = normalize_pan_ratio(pan_x=pan_x, pan_x_offset=pan_x_offset)
     actual_corner = "top_left" if (not webcam_corner or webcam_corner == "auto") else webcam_corner
@@ -885,9 +1009,12 @@ def build_multi_aspect_filter(
 
     # Support explicit normalized custom crop box and Start->End keyframe framing
     fo = (face_track_data or {}).get("framing_override") or {}
-    kf_start_box = fo.get("keyframe_start_crop") if isinstance(fo.get("keyframe_start_crop"), dict) else None
-    kf_end_box = fo.get("keyframe_end_crop") if isinstance(fo.get("keyframe_end_crop"), dict) else None
-    static_frame_crop = fo.get("frame_crop") if isinstance(fo.get("frame_crop"), dict) else None
+    if isinstance(fo, dict) and not bool(fo.get("disabled", False)):
+        kf_start_box = fo.get("keyframe_start_crop") if isinstance(fo.get("keyframe_start_crop"), dict) else None
+        kf_end_box = fo.get("keyframe_end_crop") if isinstance(fo.get("keyframe_end_crop"), dict) else None
+        static_frame_crop = fo.get("frame_crop") if isinstance(fo.get("frame_crop"), dict) else None
+    else:
+        kf_start_box = kf_end_box = static_frame_crop = None
     if (
         (kf_start_box or kf_end_box or static_frame_crop)
         and layout in ("auto_track", "dynamic_punch_crop")
@@ -985,12 +1112,12 @@ def build_multi_aspect_filter(
             f"[{input_label}]split=2[in_cam][in_game];"
             f"[in_cam]crop={wcw}:{wch}:{wcx}:{wcy},scale={target_w}:{top_h}:force_original_aspect_ratio=increase,"
             f"crop={target_w}:{top_h}:(iw-{target_w})/2:{max(0, min(top_h // 4, adj_wcy - wcy))},"
-            f"drawbox=x=0:y=ih-2:w=iw:h=2:color=0xFFFFFF@0.28:t=fill[top];"
+            f"drawbox=x=0:y=ih-3:w=iw:h=3:color=0xFFFFFF@0.28:t=fill[top];"
             f"[in_game]{game_crop},scale={target_w}:{bot_h}[bot];"
             f"[top][bot]vstack=inputs=2[v]"
         )
 
-    # 2. GAMEPLAY + WEBCAM PiP OVERLAY (Primary base + 32% wide rounded PiP card of secondary_box, 2px border)
+    # 2. GAMEPLAY + WEBCAM PiP OVERLAY (Primary base + 30% wide rounded PiP card of secondary_box, 2px border)
     if layout == "gameplay_webcam_pip":
         wcx, wcy, wcw, wch = regions["secondary_box"]
         cam_ar = float(regions["secondary_aspect"] or 1.3333)
@@ -1008,7 +1135,7 @@ def build_multi_aspect_filter(
             else f"scale={target_w}:{target_h}"
         )
 
-        pip_w = _even_int(round(target_w * 0.32), 2)
+        pip_w = _even_int(round(target_w * 0.30), 2)
         safe_ar = max(0.95, min(1.85, float(cam_ar)))
         pip_h = _even_int(round(pip_w / safe_ar), 48)
 
@@ -1016,7 +1143,10 @@ def build_multi_aspect_filter(
         card_w = _even_int(pip_w + border_px * 2, 2)
         card_h = _even_int(pip_h + border_px * 2, 2)
         out_corner = regions["output_corner"]
-        px, py = _pip_safe_xy(out_corner, target_w, target_h, card_w, card_h)
+        px, py = _pip_safe_xy(
+            out_corner, target_w, target_h, card_w, card_h,
+            caption_y=caption_y, safe_zone=safe_zone,
+        )
         sh_x = _even_int(max(0, px - 6), 0)
         sh_y = _even_int(max(0, py - 4), 0)
         round_mask_f = _rounded_pip_alpha_filter(radius=18)
@@ -1098,17 +1228,17 @@ def build_multi_aspect_filter(
 
         crop1 = _build_crop_filter_or_coords(
             kfs, cw, ch, source_w, source_h, pan_norm,
-            "s1_cx", "s1_cy", (speaker1_cx, speaker1_cy),
+            "s1_cx", "s1_cy", (0.25 if abs(speaker1_cx - 0.3) < 1e-6 else speaker1_cx, speaker1_cy),
             is_video_render, preview_rel_t,
         )
         crop2 = _build_crop_filter_or_coords(
             kfs, cw, ch, source_w, source_h, pan_norm,
-            "s2_cx", "s2_cy", (speaker2_cx, speaker2_cy),
+            "s2_cx", "s2_cy", (0.75 if abs(speaker2_cx - 0.7) < 1e-6 else speaker2_cx, speaker2_cy),
             is_video_render, preview_rel_t,
         )
 
-        # Subtle active-speaker border glow on talking speaker pane + 2px pane divider
-        div1 = f",drawbox=x=0:y=ih-2:w=iw:h=2:color=0xFFFFFF@0.25:t=fill" if is_vertical_layout else ""
+        # Subtle active-speaker border glow on talking speaker pane + 3px pane divider
+        div1 = f",drawbox=x=0:y=ih-3:w=iw:h=3:color=0xFFFFFF@0.28:t=fill" if is_vertical_layout else ""
         glow1_fx = ""
         glow2_fx = ""
         if is_video_render and dual_shots:
@@ -1223,9 +1353,9 @@ def build_multi_aspect_filter(
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
         )
 
-    # 6. TRIPLE GAMING HUD (28% top secondary_box + 50% middle primary_box + 22% bottom-left HUD/map strip)
+    # 6. TRIPLE GAMING HUD (26% top secondary_box + 52% middle primary_box + 22% bottom-left HUD/map strip)
     if layout == "triple_gaming_hud":
-        top_h = _even_int(target_h * 0.28, 16)
+        top_h = _even_int(target_h * 0.26, 16)
         bot_h = _even_int(target_h * 0.22, 16)
         mid_h = _even_int(target_h - top_h - bot_h, 16)
         if top_h + mid_h + bot_h != target_h:
@@ -1263,35 +1393,44 @@ def build_multi_aspect_filter(
             f"[top][mid][bot]vstack=inputs=3[v]"
         )
 
-    # 7. PORTRAIT FACECAM CARD + FULL SCREEN (Vertical 3:4 rounded card 26% width over primary_box video)
+    # 7. PORTRAIT FACECAM CARD + FULL SCREEN (Full-bleed 9:16 fill + 26% 3:4 rounded corner card)
     if layout == "portrait_pip_badge":
         wcx, wcy, wcw, wch = regions["secondary_box"]
-        z_bg = z * motion_zoom_mult if not is_video_render else z
+        # Slight vertical fill zoom (>= 1.08x) + centered overscan crop eliminates top/bottom letterbox bars cleanly
+        z_bg = max(1.08, float(z))
+        if not is_video_render:
+            z_bg = max(1.08, z_bg * motion_zoom_mult)
         bg_w, bg_h = _compute_aspect_crop_dims(source_w, source_h, target_ratio, z_bg)
         bg_crop = _build_crop_filter_or_coords(
             kfs, bg_w, bg_h, source_w, source_h, pan_norm,
             "action_cx", "action_cy", (prim_cx, prim_cy),
             is_video_render, preview_rel_t,
+            center_vertical=True,
         )
         bg_scale = (
             f"fps={eff_fps:.3f},zoompan=z='{motion_z_expr}':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
             f"s={target_w}x{target_h}:fps={eff_fps:.3f}"
             if (is_video_render and motion_z_expr)
-            else f"scale={target_w}:{target_h}"
+            else f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
         )
 
-        pip_w = _even_int(round(target_w * 0.26), 2)
-        pip_h = _even_int(min(round(target_h * 0.34), round(pip_w * 4.0 / 3.0)), 48)
-        pip_w = _even_int(min(pip_w, round(pip_h * 3.0 / 4.0)), 2)
+        pip_w = _even_int(round(target_w * 0.27), 2)
+        pip_h = _even_int(round(pip_w * 4.0 / 3.0), 48)
+        if pip_h > int(target_h * 0.44):
+            pip_h = _even_int(round(target_h * 0.44), 48)
+            pip_w = _even_int(round(pip_h * 3.0 / 4.0), 2)
 
         border_px = 2
         card_w = _even_int(pip_w + border_px * 2, 2)
         card_h = _even_int(pip_h + border_px * 2, 2)
         out_corner = regions["output_corner"]
-        px, py = _pip_safe_xy(out_corner, target_w, target_h, card_w, card_h)
+        px, py = _portrait_pip_safe_xy(
+            out_corner, target_w, target_h, card_w, card_h,
+            caption_y=caption_y, safe_zone=safe_zone,
+        )
         sh_x = _even_int(max(0, px - 6), 0)
         sh_y = _even_int(max(0, py - 4), 0)
-        round_mask_f = _rounded_pip_alpha_filter(radius=22)
+        round_mask_f = _rounded_pip_alpha_filter(radius=20)
         clean_hex = (pip_border_color or "").strip().upper()
         border_col_ff = "0xFFFFFF44" if clean_hex in ("", "#FFFFFF", "FFFFFF") else f"{hex_to_ffmpeg_color(pip_border_color)}C4"
 
@@ -1358,7 +1497,7 @@ def build_multi_aspect_filter(
             right_chain = f"{crop_r},scale={right_w}:{target_h}"
         return _finish(
             f"[{input_label}]split=2[s_left][s_right];"
-            f"[s_left]{crop_l},scale={left_w}:{target_h},drawbox=x=iw-2:y=0:w=2:h=ih:color=0xFFFFFF@0.30:t=fill[left];"
+            f"[s_left]{crop_l},scale={left_w}:{target_h},drawbox=x=iw-3:y=0:w=3:h=ih:color=0xFFFFFF@0.30:t=fill[left];"
             f"[s_right]{right_chain}[right];"
             f"[left][right]hstack=inputs=2[v]"
         )

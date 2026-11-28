@@ -277,6 +277,13 @@ def classify_narrative_arc(
 
     crosstalk_bins = int(mm_win.get("crosstalk_bins", 0) or 0)
     sp_count = int(mm_win.get("speaker_count", 1) or 1)
+    dom_ratios = mm_win.get("dominance_ratios")
+    if isinstance(dom_ratios, dict) and dom_ratios:
+        meaningful_sp_cnt = sum(1 for r in dom_ratios.values() if float(r or 0.0) >= 0.22)
+    else:
+        meaningful_sp_cnt = sp_count
+    max_turns_15s = int(mm_win.get("max_turns_15s", 0) or 0)
+    has_rapid_turns = (max_turns_15s >= 3) or (speaker_switch_rate >= 1.5) or (shot_scale == "dual_speaker")
 
     # 1. Shock reaction: sudden surprise/fear delta or dramatic pause + surge
     if facial in ("surprise", "fear"):
@@ -297,7 +304,7 @@ def classify_narrative_arc(
         scores["setup_to_laughter"] += 24.0
 
     # 3. Heated debate: rapid speaker turns, negative/urgent tension, fast WPM
-    if speaker_switch_rate >= 1.8:
+    if meaningful_sp_cnt >= 2 and speaker_switch_rate >= 1.8:
         scores["heated_debate"] += 42.0
     if shot_scale == "dual_speaker":
         scores["heated_debate"] += 28.0
@@ -308,23 +315,25 @@ def classify_narrative_arc(
     if wpm >= 155.0:
         scores["heated_debate"] += 12.0
 
-    # 3b. Cross-talk debate clash (6th arc): overlapping simultaneous voices during debate/disagreement
-    if crosstalk_bins >= 1:
+    # 3b. Cross-talk debate clash (6th arc): requires >= 2 real speakers (>=22% each) + rapid turn exchanges
+    if crosstalk_bins >= 2 and meaningful_sp_cnt >= 2 and has_rapid_turns:
         scores["crosstalk_debate_clash"] += 58.0 + min(30.0, crosstalk_bins * 8.0)
-        if sp_count >= 2 or shot_scale == "dual_speaker" or speaker_switch_rate >= 1.2:
+        if shot_scale == "dual_speaker" or speaker_switch_rate >= 1.5:
             scores["crosstalk_debate_clash"] += 30.0
         if vocal in ("urgent_tense", "excited_hype") or aud_s >= 55.0:
             scores["crosstalk_debate_clash"] += 16.0
 
-    # 4. Gameplay / Action climax: wide shot, HUD/graphic popups, bass drop, crowd roar
+    # 4. Gameplay / Action climax: wide shot, HUD/graphic popups, bass drop, crowd roar, solo hype
     if shot_scale == "wide_gameplay":
-        scores["gameplay_climax"] += 34.0
+        scores["gameplay_climax"] += 36.0
     if graphic_pk >= 35.0:
         scores["gameplay_climax"] += 26.0
     if "bass_music_drop" in ac_events or "crowd_cheering" in ac_events:
         scores["gameplay_climax"] += 40.0
-    if aud_s >= 58.0 and vis_s >= 55.0 and facial == "neutral":
-        scores["gameplay_climax"] += 20.0
+    if aud_s >= 58.0 and (vis_s >= 55.0 or meaningful_sp_cnt < 2):
+        scores["gameplay_climax"] += 22.0
+    if meaningful_sp_cnt < 2 and (shot_scale == "wide_gameplay" or vocal == "excited_hype"):
+        scores["gameplay_climax"] += 18.0
 
     # 5. Hook explanation: question/secret opener + steady storytelling cadence
     txt_l = (first_sentence_text or "").lower()

@@ -5,8 +5,10 @@ import shutil
 import tempfile
 import logging
 import subprocess
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 from PIL import Image
 
@@ -16,6 +18,7 @@ from app.services.reframer import (
     resolve_target_dimensions,
     build_multi_aspect_filter,
     canonicalize_framing_template,
+    canonicalize_safe_zone,
     build_filter_complex_args,
     prepare_clip_framing_data,
 )
@@ -27,10 +30,107 @@ from app.services.face_tracker import (
     compute_punch_focus_anchor,
 )
 from app.services.filters import build_advanced_color_filter
-from app.services.caption_renderer import render_caption_frame
+from app.services.caption_renderer import render_caption_frame, resolve_hook_banner_state
 from app.services.profanity_filter import mask_words_profanity
 
 logger = logging.getLogger(__name__)
+
+# Fast LRU caches for instant (<150ms) live preview responsiveness across slider/template edits
+_RAW_FRAME_CACHE: "OrderedDict[Tuple[Any, ...], bytes]" = OrderedDict()
+_RAW_FRAME_CACHE_MAX = 16
+_FACE_BOX_CACHE: "OrderedDict[Tuple[Any, ...], List[Dict[str, Any]]]" = OrderedDict()
+_FACE_BOX_CACHE_MAX = 48
+_BEAT_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+_BEAT_CACHE_MAX = 32
+_SINGLE_META_CACHE: "OrderedDict[Tuple[Any, ...], Dict[str, Any]]" = OrderedDict()
+_SINGLE_META_CACHE_MAX = 48
+_PREVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _video_stat_sig(abs_video: str) -> Tuple[str, int, int]:
+    try:
+        st = os.stat(abs_video)
+        return (abs_video, int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        return (abs_video, 0, 0)
+
+
+def _extract_single_frame_raw(
+    ffmpeg_bin: str,
+    abs_video: str,
+    seek_ts: float,
+    total_dur: float,
+    src_w: int,
+    src_h: int,
+) -> Tuple[bytes, int, int]:
+    """
+    Decode exactly ONE frame from `abs_video` using fast keyframe seek (`-ss` before `-i`),
+    scaling >1280px sources (like 4K 3840x2160) down to 1280px wide even dimensions so live
+    preview renders stay under ~150ms, and LRU-cache the raw BGR24 buffer across edits at the
+    same timestamp.
+    """
+    if src_w > 1280:
+        dec_w = 1280
+        dec_h = max(2, int(round(src_h * 1280.0 / max(1, src_w))))
+        if dec_h % 2 != 0:
+            dec_h += 1
+    else:
+        dec_w = src_w if src_w % 2 == 0 else max(2, src_w - 1)
+        dec_h = src_h if src_h % 2 == 0 else max(2, src_h - 1)
+
+    eff_seek = max(0.0, float(seek_ts or 0.0))
+    if total_dur > 0.2 and eff_seek >= total_dur - 0.05:
+        eff_seek = max(0.0, total_dur - 0.08)
+
+    v_sig = _video_stat_sig(abs_video)
+    c_key = (*v_sig, round(eff_seek, 2), dec_w, dec_h)
+    with _PREVIEW_CACHE_LOCK:
+        cached = _RAW_FRAME_CACHE.get(c_key)
+        if cached is not None:
+            _RAW_FRAME_CACHE.move_to_end(c_key)
+            return cached, dec_w, dec_h
+
+    expected_len = dec_w * dec_h * 3
+    attempts: List[Tuple[bool, float]] = [(True, eff_seek), (False, eff_seek)]
+    if eff_seek > 0.35:
+        attempts.append((False, max(0.0, eff_seek - 0.4)))
+
+    raw_bytes = b""
+    vf_arg = f"scale={dec_w}:{dec_h},setsar=1"
+    for use_hwaccel, ss_val in attempts:
+        cmd_dec = [ffmpeg_bin, "-y"]
+        if use_hwaccel:
+            cmd_dec.extend(["-hwaccel", "auto"])
+        cmd_dec.extend([
+            "-ss", f"{ss_val:.3f}",
+            "-i", abs_video,
+            "-frames:v", "1",
+            "-vf", vf_arg,
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-",
+        ])
+        try:
+            proc = subprocess.run(
+                cmd_dec,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            if proc.returncode == 0 and len(proc.stdout) >= expected_len:
+                raw_bytes = proc.stdout[:expected_len]
+                break
+        except Exception:
+            continue
+
+    if len(raw_bytes) == expected_len:
+        with _PREVIEW_CACHE_LOCK:
+            _RAW_FRAME_CACHE[c_key] = raw_bytes
+            _RAW_FRAME_CACHE.move_to_end(c_key)
+            while len(_RAW_FRAME_CACHE) > _RAW_FRAME_CACHE_MAX:
+                _RAW_FRAME_CACHE.popitem(last=False)
+
+    return raw_bytes, dec_w, dec_h
 
 
 def render_exact_preview_frame(
@@ -95,13 +195,22 @@ def render_exact_preview_frame(
     dynamic_punch_zoom: bool = False,
     punch_zoom: Optional[bool] = None,
     punch_zoom_intensity: float = 1.16,
+    show_hook: Optional[bool] = None,
+    show_hook_banner: Optional[bool] = None,
+    hook_banner_enabled: Optional[bool] = None,
+    hook_text: Optional[str] = None,
+    hook_headline: Optional[str] = None,
+    safe_zone: Optional[str] = None,
+    framing_template: Optional[str] = None,
+    frame_crop_override: Any = "__UNSET__",
+    clear_framing_override: bool = False,
 ) -> Dict[str, Any]:
     """
     Extract a single frame at `timestamp` using the exact FFmpeg reframing,
     face tracking, color grading, and ASS subtitle pipeline.
     Executes FFmpeg with cwd=work_dir and strictly relative ASCII paths inside filtergraph.txt.
     """
-    t0 = time.time()
+    t0 = time.perf_counter()
     ffmpeg_bin = get_ffmpeg_cmd()
     previews_dir = Path(settings.STORAGE_DIR) / "previews"
     previews_dir.mkdir(parents=True, exist_ok=True)
@@ -129,7 +238,7 @@ def render_exact_preview_frame(
         except Exception as e:
             logger.warning(f"Could not probe video {video_path} for preview frame, assuming 1920x1080: {e}")
 
-        layout = canonicalize_framing_template(frame_layout)
+        layout = canonicalize_framing_template(framing_template if framing_template is not None else frame_layout)
 
         # Compute seek timestamp & clip-relative subtitle timestamp unambiguously
         seek_ts = max(0.0, float(timestamp or 0.0))
@@ -255,48 +364,221 @@ def render_exact_preview_frame(
             )
             framing_rel_t = clip_rel_ts
 
-        face_track_data, eff_webcam_corner, _ = prepare_clip_framing_data(
-            video_path=video_path,
-            kept_segments_abs=framing_segs,
-            frame_layout=layout,
-            webcam_corner=webcam_corner,
-            source_webcam_region=source_webcam_region,
-            visual_map=visual_map,
-            framing_override=framing_override,
-            best_frames=best_frames,
-            merge_crossfade_sec=float(merge_crossfade_sec or 0.03),
+        abs_video = os.path.abspath(video_path)
+        v_sig = _video_stat_sig(abs_video)
+        raw_bgr_bytes, dec_w, dec_h = _extract_single_frame_raw(
+            ffmpeg_bin=ffmpeg_bin,
+            abs_video=abs_video,
+            seek_ts=seek_ts,
+            total_dur=total_vid_dur,
+            src_w=int(src_w),
+            src_h=int(src_h),
         )
+        eff_src_w = dec_w if raw_bgr_bytes else int(src_w)
+        eff_src_h = dec_h if raw_bgr_bytes else int(src_h)
 
         co = caption_options or {}
         eff_cam_motion = str(camera_motion or co.get("camera_motion") or "steady")
         eff_whip_pan = bool(whip_pan_cuts or co.get("whip_pan_cuts", False))
         eff_dur_val = float(main_dur_eval if framing_rel_t != clip_rel_ts or not cold_open_active else (framing_segs[-1][1] - framing_segs[0][0]))
-        beat_ts_prev: Optional[List[float]] = None
-        if eff_cam_motion == "beat_punch":
-            try:
-                from app.services.beat_sync import detect_audio_beats
-                bd = detect_audio_beats(
-                    video_path,
-                    start_sec=framing_segs[0][0],
-                    duration_sec=max(1.0, eff_dur_val),
-                    spectrum_fps=8,
-                )
-                beat_ts_prev = bd.get("beats") or None
-            except Exception:
-                beat_ts_prev = None
-
         eff_source_corner = str(
             source_corner
             if str(source_corner or "").strip().lower() not in ("", "auto")
             else ((source_webcam_region or {}).get("locked_zone") if isinstance(source_webcam_region, dict) else None)
             or "auto"
         )
+
+        # Single-frame fast vision resolver (<6ms, LRU-cached): detects corner webcam & speaker cuts
+        # from the ONE decoded BGR frame in memory whenever SQLite lacks cached visual_map/webcam data,
+        # without ever opening/scanning the video file via OpenCV/analyze_clip_visuals.
+        eff_visual_map = visual_map
+        eff_webcam_reg = source_webcam_region
+        needs_single_webcam = (
+            eff_webcam_reg is None
+            and eff_source_corner == "auto"
+            and layout in (
+                "webcam_gameplay_split",
+                "gameplay_webcam_pip",
+                "portrait_pip_badge",
+                "triple_gaming_hud",
+                "side_by_side_50_50",
+            )
+        )
+        needs_single_faces = (
+            not isinstance(eff_visual_map, dict)
+            and layout in ("split_podcast", "auto_track", "dynamic_punch_crop", "side_by_side_50_50")
+        )
+        if raw_bgr_bytes and (needs_single_webcam or needs_single_faces):
+            m_key = (
+                *v_sig,
+                round(seek_ts, 2),
+                eff_src_w,
+                eff_src_h,
+                bool(needs_single_webcam),
+                bool(needs_single_faces),
+                eff_source_corner,
+            )
+            with _PREVIEW_CACHE_LOCK:
+                cached_meta = _SINGLE_META_CACHE.get(m_key)
+                if cached_meta is not None:
+                    _SINGLE_META_CACHE.move_to_end(m_key)
+            if cached_meta is None:
+                cached_meta = {}
+                try:
+                    import numpy as np
+                    import cv2
+                    from app.services.webcam_detector import detect_webcam_in_frames, _compute_action_focal_point
+
+                    frame_bgr = np.frombuffer(raw_bgr_bytes, dtype=np.uint8).reshape((eff_src_h, eff_src_w, 3))
+                    if needs_single_webcam:
+                        cached_meta["webcam_reg"] = detect_webcam_in_frames(
+                            [frame_bgr],
+                            src_w=eff_src_w,
+                            src_h=eff_src_h,
+                        )
+                    if needs_single_faces:
+                        if eff_src_w > 480:
+                            sc_f = 480.0 / float(eff_src_w)
+                            small_f = cv2.resize(frame_bgr, (480, max(2, int(round(eff_src_h * sc_f)))))
+                        else:
+                            small_f = frame_bgr
+                        faces_single = detect_faces_offline(small_f)
+                        if len(faces_single) >= 2:
+                            f_lr = sorted(faces_single, key=lambda f: float(f.get("cx", 0.5)))
+                            s1_cx, s1_cy = float(f_lr[0].get("cx", 0.3)), float(f_lr[0].get("cy", 0.4))
+                            s2_cx, s2_cy = float(f_lr[-1].get("cx", 0.7)), float(f_lr[-1].get("cy", 0.4))
+                            top_f = max(faces_single, key=lambda f: float(f.get("area", 0.0)))
+                            kf = {
+                                "t": float(framing_rel_t),
+                                "cx": float(top_f.get("cx", s1_cx)),
+                                "cy": float(top_f.get("cy", s1_cy)),
+                                "face_h": float(top_f.get("h", 0.26)),
+                                "s1_cx": s1_cx,
+                                "s1_cy": s1_cy,
+                                "s2_cx": s2_cx,
+                                "s2_cy": s2_cy,
+                                "shot_id": 0,
+                            }
+                            shot = {
+                                "shot_id": 0,
+                                "start_t": 0.0,
+                                "end_t": max(1.0, eff_dur_val),
+                                "speaker_mode": "two_speaker",
+                                "active_speaker_idx": 0,
+                            }
+                        elif len(faces_single) == 1:
+                            f0 = faces_single[0]
+                            fcx, fcy = float(f0.get("cx", 0.5)), float(f0.get("cy", 0.4))
+                            kf = {
+                                "t": float(framing_rel_t),
+                                "cx": fcx,
+                                "cy": fcy,
+                                "face_h": float(f0.get("h", 0.26)),
+                                "s1_cx": fcx,
+                                "s1_cy": fcy,
+                                "s2_cx": min(0.85, fcx + 0.35),
+                                "s2_cy": fcy,
+                                "shot_id": 0,
+                            }
+                            shot = {
+                                "shot_id": 0,
+                                "start_t": 0.0,
+                                "end_t": max(1.0, eff_dur_val),
+                                "speaker_mode": "single_speaker",
+                                "active_speaker_idx": 0,
+                            }
+                        else:
+                            acx, acy = _compute_action_focal_point(small_f)
+                            kf = {
+                                "t": float(framing_rel_t),
+                                "cx": float(acx),
+                                "cy": float(acy),
+                                "action_cx": float(acx),
+                                "action_cy": float(acy),
+                                "shot_id": 0,
+                            }
+                            shot = {
+                                "shot_id": 0,
+                                "start_t": 0.0,
+                                "end_t": max(1.0, eff_dur_val),
+                                "speaker_mode": "zero_face",
+                                "active_speaker_idx": 0,
+                            }
+                        cached_meta["visual_map"] = {
+                            "start_time": round(framing_segs[0][0], 3),
+                            "end_time": round(framing_segs[-1][1], 3),
+                            "keyframes": [kf],
+                            "shots": [shot],
+                            "cut_timestamps": [],
+                        }
+                except Exception:
+                    pass
+                with _PREVIEW_CACHE_LOCK:
+                    _SINGLE_META_CACHE[m_key] = cached_meta
+                    _SINGLE_META_CACHE.move_to_end(m_key)
+                    while len(_SINGLE_META_CACHE) > _SINGLE_META_CACHE_MAX:
+                        _SINGLE_META_CACHE.popitem(last=False)
+            if needs_single_webcam and isinstance(cached_meta.get("webcam_reg"), dict):
+                eff_webcam_reg = cached_meta["webcam_reg"]
+            if needs_single_faces and isinstance(cached_meta.get("visual_map"), dict):
+                eff_visual_map = cached_meta["visual_map"]
+
+        eff_framing_override = (
+            None
+            if (clear_framing_override or frame_crop_override is None)
+            else framing_override
+        )
+        face_track_data, eff_webcam_corner, _ = prepare_clip_framing_data(
+            video_path=video_path,
+            kept_segments_abs=framing_segs,
+            frame_layout=layout,
+            webcam_corner=webcam_corner,
+            source_webcam_region=eff_webcam_reg,
+            visual_map=eff_visual_map,
+            framing_override=eff_framing_override,
+            best_frames=best_frames,
+            merge_crossfade_sec=float(merge_crossfade_sec or 0.03),
+            skip_video_scan=True,
+        )
+
+        beat_ts_prev: Optional[List[float]] = None
+        if eff_cam_motion == "beat_punch":
+            try:
+                from app.services.beat_sync import detect_audio_beats
+                b_key = (*v_sig, round(framing_segs[0][0], 1), round(max(1.0, eff_dur_val), 1), 8, "beats")
+                with _PREVIEW_CACHE_LOCK:
+                    bd = _BEAT_CACHE.get(b_key)
+                if bd is None:
+                    bd = detect_audio_beats(
+                        video_path,
+                        start_sec=framing_segs[0][0],
+                        duration_sec=max(1.0, eff_dur_val),
+                        spectrum_fps=8,
+                    )
+                    with _PREVIEW_CACHE_LOCK:
+                        _BEAT_CACHE[b_key] = bd
+                        _BEAT_CACHE.move_to_end(b_key)
+                        while len(_BEAT_CACHE) > _BEAT_CACHE_MAX:
+                            _BEAT_CACHE.popitem(last=False)
+                beat_ts_prev = bd.get("beats") or None
+            except Exception:
+                beat_ts_prev = None
+
+        eff_cap_y = (
+            float(co["caption_y"])
+            if co.get("caption_y") is not None
+            else (float(co["position_y"]) / 100.0 if co.get("position_y") is not None else None)
+        )
+        eff_safe_zone = canonicalize_safe_zone(
+            safe_zone if safe_zone is not None else co.get("safe_zone", co.get("safe_zone_guide"))
+        )
         # 1. Multi-Aspect Framing Filter
         layout_vf = build_multi_aspect_filter(
             aspect_ratio=aspect_ratio,
             frame_layout=layout,
-            source_w=src_w,
-            source_h=src_h,
+            framing_template=layout,
+            source_w=eff_src_w,
+            source_h=eff_src_h,
             custom_w=target_w,
             custom_h=target_h,
             webcam_corner=eff_webcam_corner,
@@ -315,6 +597,8 @@ def render_exact_preview_frame(
             fps=src_fps,
             beat_timestamps=beat_ts_prev,
             source_corner=eff_source_corner,
+            caption_y=(eff_cap_y if burn_captions else None),
+            safe_zone=eff_safe_zone,
         )
 
         # 2. Punch Zoom FX + Footage Color Grading & FX BEFORE captions
@@ -399,19 +683,19 @@ def render_exact_preview_frame(
         fg_segments: List[str] = [layout_vf, f"[v]{post_chain}[v_graded]"]
         curr_v_lbl = "v_graded"
 
-        abs_video = os.path.abspath(video_path)
-        if seek_ts > 2.0:
-            coarse_ss = max(0.0, seek_ts - 1.5)
-            fine_ss = max(0.0, seek_ts - coarse_ss)
+        feed_stdin = False
+        if raw_bgr_bytes:
             input_args: List[str] = [
-                "-ss", f"{coarse_ss:.3f}",
-                "-i", abs_video,
-                "-ss", f"{fine_ss:.3f}",
+                "-f", "rawvideo",
+                "-pix_fmt", "bgr24",
+                "-s", f"{dec_w}x{dec_h}",
+                "-i", "-",
             ]
+            feed_stdin = True
         else:
             input_args = [
-                "-i", abs_video,
                 "-ss", f"{seek_ts:.3f}",
+                "-i", abs_video,
             ]
         next_in_idx = 1
 
@@ -424,9 +708,10 @@ def render_exact_preview_frame(
                 [
                     ffmpeg_bin, "-y", *input_args,
                     *build_filter_complex_args(ffmpeg_bin, "pre_bg_fg.txt", pre_fg),
-                    "-map", "[vout]", "-vframes", "1", pre_bg_name,
+                    "-map", "[vout]", "-vframes", "1", "-pred", "none", "-compression_level", "1", pre_bg_name,
                 ],
-                capture_output=True, text=True, timeout=20, cwd=str(work_dir),
+                input=(raw_bgr_bytes if feed_stdin else None),
+                capture_output=True, timeout=20, cwd=str(work_dir),
             )
             if p1.returncode == 0 and (work_dir / pre_bg_name).exists():
                 import cv2
@@ -435,6 +720,7 @@ def render_exact_preview_frame(
                     matte_u8 = segment_foreground_mask(raw_bgr)
                     cv2.imwrite(str(work_dir / "fg_matte.png"), matte_u8)
                     input_args = ["-i", pre_bg_name, "-i", "fg_matte.png"]
+                    feed_stdin = False
                     matte_in_idx = 1
                     next_in_idx = 2
                     bg_in_idx: Optional[int] = None
@@ -490,27 +776,17 @@ def render_exact_preview_frame(
         fg_segments.append(f"[{curr_v_lbl}]null[vout]")
         filter_complex = ";".join(fg_segments)
 
-        fg_script = work_dir / "filtergraph.txt"
-        fg_script.write_text(filter_complex, encoding="utf-8")
-
-        cmd = [
-            ffmpeg_bin,
-            "-y",
-            *input_args,
-            *build_filter_complex_args(ffmpeg_bin, "filtergraph.txt", filter_complex),
-            "-map", "[vout]",
-            "-vframes", "1",
-            "-q:v", "2",
-            str(out_path),
-        ]
-
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20, cwd=str(work_dir))
-        if res.returncode != 0:
-            logger.error(f"FFmpeg preview frame failed: {res.stderr}")
-            raise RuntimeError(f"FFmpeg frame render failed: {res.stderr[-400:]}")
-
-        # 3. Pixel-identical Pillow transparent RGBA Caption & Hook Banner overlay
         co = caption_options or {}
+        eff_show_hook, eff_hook_text = resolve_hook_banner_state(
+            show_hook=show_hook if show_hook is not None else co.get("show_hook"),
+            show_hook_banner=show_hook_banner if show_hook_banner is not None else co.get("show_hook_banner"),
+            hook_banner_enabled=hook_banner_enabled if hook_banner_enabled is not None else co.get("hook_banner_enabled"),
+            enable_hook_banner=co.get("enable_hook_banner"),
+            top_hook_banner=co.get("top_hook_banner"),
+            hook_text=hook_text if hook_text is not None else co.get("hook_text"),
+            hook_headline=hook_headline if hook_headline is not None else co.get("hook_headline"),
+            options=co,
+        )
         eff_spectrum_enabled = bool(spectrum_enabled or co.get("spectrum_enabled", False))
         eff_spectrum_pos = str(co.get("spectrum_position", spectrum_position) or spectrum_position or "bottom")
         eff_spectrum_color = str(co.get("spectrum_color", spectrum_color) or spectrum_color or "#C6F32F")
@@ -522,8 +798,10 @@ def render_exact_preview_frame(
         eff_handle_corner = str(co.get("handle_corner", handle_corner) or handle_corner or "bottom_right")
         eff_handle_op = float(co.get("handle_opacity", handle_opacity) if co.get("handle_opacity") is not None else handle_opacity)
         eff_handle_mode = str(co.get("handle_display_mode", handle_display_mode) or handle_display_mode or "always")
+
         render_overlay = bool(
             burn_captions
+            or (eff_show_hook and bool(eff_hook_text))
             or cold_open_active
             or co.get("retention_bar_enabled")
             or co.get("outro_cta_enabled")
@@ -533,18 +811,70 @@ def render_exact_preview_frame(
             or (eff_chapters_enabled and eff_chapters)
             or (eff_handle_on and eff_handle_text)
         )
+
+        fg_script = work_dir / "filtergraph.txt"
+        fg_script.write_text(filter_complex, encoding="utf-8")
+
+        if render_overlay:
+            # Pipe raw RGB24 straight to Pillow (eliminates intermediate PNG encode + disk decode)
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                *input_args,
+                *build_filter_complex_args(ffmpeg_bin, "filtergraph.txt", filter_complex),
+                "-map", "[vout]",
+                "-vframes", "1",
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-",
+            ]
+        else:
+            cmd = [
+                ffmpeg_bin,
+                "-y",
+                *input_args,
+                *build_filter_complex_args(ffmpeg_bin, "filtergraph.txt", filter_complex),
+                "-map", "[vout]",
+                "-vframes", "1",
+                "-pred", "none",
+                "-compression_level", "1",
+                str(out_path),
+            ]
+
+        res = subprocess.run(
+            cmd,
+            input=(raw_bgr_bytes if feed_stdin else None),
+            capture_output=True,
+            timeout=20,
+            cwd=str(work_dir),
+        )
+        if res.returncode != 0:
+            err_txt = (res.stderr or b"").decode("utf-8", errors="ignore")
+            logger.error(f"FFmpeg preview frame failed: {err_txt}")
+            raise RuntimeError(f"FFmpeg frame render failed: {err_txt[-400:]}")
+
+        # 3. Pixel-identical Pillow transparent RGBA Caption & Hook Banner overlay
         if render_overlay:
             spec_data = None
             if eff_spectrum_enabled:
                 try:
                     from app.services.beat_sync import detect_audio_beats
                     win_s = max(0.0, float(timestamp) - 1.0)
-                    raw_spec = detect_audio_beats(
-                        video_path,
-                        start_sec=win_s,
-                        duration_sec=2.0,
-                        spectrum_fps=10,
-                    )
+                    s_key = (*v_sig, round(win_s, 1), 2.0, 10, "spec")
+                    with _PREVIEW_CACHE_LOCK:
+                        raw_spec = _BEAT_CACHE.get(s_key)
+                    if raw_spec is None:
+                        raw_spec = detect_audio_beats(
+                            video_path,
+                            start_sec=win_s,
+                            duration_sec=2.0,
+                            spectrum_fps=10,
+                        )
+                        with _PREVIEW_CACHE_LOCK:
+                            _BEAT_CACHE[s_key] = raw_spec
+                            _BEAT_CACHE.move_to_end(s_key)
+                            while len(_BEAT_CACHE) > _BEAT_CACHE_MAX:
+                                _BEAT_CACHE.popitem(last=False)
                     # Re-index local 1.0s position to clip_rel_ts cleanly via offset wrapper
                     bars_at_ts = raw_spec.get("spectrum_frames", [])
                     mid_bars = bars_at_ts[min(len(bars_at_ts) - 1, 10)] if bars_at_ts else []
@@ -563,31 +893,70 @@ def render_exact_preview_frame(
             active_cap_words = preview_words
             if co.get("censor_profanity"):
                 active_cap_words = mask_words_profanity(active_cap_words)
-            with Image.open(out_path) as base_img:
-                base_rgba = base_img.convert("RGBA")
+            expected_rgb_len = target_w * target_h * 3
+            if len(res.stdout) >= expected_rgb_len:
+                base_rgba = Image.frombytes("RGB", (target_w, target_h), res.stdout[:expected_rgb_len]).convert("RGBA")
+            else:
+                # Defensive fallback if resolution inside filtergraph differed
+                fallback_png = work_dir / "fallback_base.png"
+                subprocess.run(
+                    [
+                        ffmpeg_bin, "-y", *input_args,
+                        *build_filter_complex_args(ffmpeg_bin, "filtergraph.txt", filter_complex),
+                        "-map", "[vout]", "-vframes", "1", "-pred", "none", "-compression_level", "1", str(fallback_png),
+                    ],
+                    input=(raw_bgr_bytes if feed_stdin else None),
+                    capture_output=True, timeout=20, cwd=str(work_dir),
+                )
+                with Image.open(fallback_png) as fb:
+                    base_rgba = fb.convert("RGBA")
+            if True:
                 preview_face_kfs: Optional[List[Dict[str, Any]]] = None
                 custom_cap_pos = bool(co.get("caption_custom_position", False))
                 eff_face_safe_prev = bool(co.get("face_safe_captions", True)) and not custom_cap_pos
                 if eff_face_safe_prev:
                     try:
-                        import numpy as np
-                        import cv2
-                        rgb_np = np.array(base_rgba.convert("RGB"))
-                        bgr_np = rgb_np[:, :, ::-1]
-                        if bgr_np.shape[1] > 480:
-                            sc = 480.0 / bgr_np.shape[1]
-                            small_bgr = cv2.resize(bgr_np, (480, max(1, int(bgr_np.shape[0] * sc))))
-                        else:
-                            small_bgr = bgr_np
-                        faces_now = detect_faces_offline(small_bgr)
-                        if faces_now:
-                            top_f = max(faces_now, key=lambda f: f.get("area", 0.0))
-                            preview_face_kfs = [{
-                                "t": clip_rel_ts,
-                                "cx": float(top_f.get("cx", 0.5)),
-                                "cy": float(top_f.get("cy", 0.4)),
-                                "face_h": float(top_f.get("h", 0.26)),
-                            }]
+                        f_key = (*v_sig, round(seek_ts, 2), layout, eff_source_corner, base_rgba.width, base_rgba.height)
+                        with _PREVIEW_CACHE_LOCK:
+                            cached_faces = _FACE_BOX_CACHE.get(f_key)
+                        if cached_faces is not None:
+                            preview_face_kfs = cached_faces
+                        elif isinstance(visual_map, dict) and visual_map.get("keyframes"):
+                            vm_kfs = [k for k in visual_map["keyframes"] if isinstance(k, dict)]
+                            near_k = min(vm_kfs, key=lambda k: abs(float(k.get("t", 0.0)) - clip_rel_ts), default=None)
+                            if near_k and near_k.get("cx") is not None:
+                                preview_face_kfs = [{
+                                    "t": clip_rel_ts,
+                                    "cx": float(near_k.get("cx", 0.5)),
+                                    "cy": float(near_k.get("cy", 0.4)),
+                                    "face_h": float(near_k.get("face_h", 0.26)),
+                                }]
+                        if preview_face_kfs is None:
+                            import numpy as np
+                            import cv2
+                            rgb_np = np.array(base_rgba.convert("RGB"))
+                            bgr_np = rgb_np[:, :, ::-1]
+                            if bgr_np.shape[1] > 480:
+                                sc = 480.0 / bgr_np.shape[1]
+                                small_bgr = cv2.resize(bgr_np, (480, max(1, int(bgr_np.shape[0] * sc))))
+                            else:
+                                small_bgr = bgr_np
+                            faces_now = detect_faces_offline(small_bgr)
+                            if faces_now:
+                                top_f = max(faces_now, key=lambda f: f.get("area", 0.0))
+                                preview_face_kfs = [{
+                                    "t": clip_rel_ts,
+                                    "cx": float(top_f.get("cx", 0.5)),
+                                    "cy": float(top_f.get("cy", 0.4)),
+                                    "face_h": float(top_f.get("h", 0.26)),
+                                }]
+                            else:
+                                preview_face_kfs = []
+                            with _PREVIEW_CACHE_LOCK:
+                                _FACE_BOX_CACHE[f_key] = preview_face_kfs
+                                _FACE_BOX_CACHE.move_to_end(f_key)
+                                while len(_FACE_BOX_CACHE) > _FACE_BOX_CACHE_MAX:
+                                    _FACE_BOX_CACHE.popitem(last=False)
                     except Exception:
                         preview_face_kfs = None
                 cap_rgba = render_caption_frame(
@@ -623,8 +992,10 @@ def render_exact_preview_frame(
                     word_by_word=is_word_by_word,
                     auto_emoji=co.get("auto_emoji", co.get("emoji_enabled", False)),
                     highlight_power_words=bool(co.get("highlight_power_words", False)),
-                    hook_banner_enabled=co.get("hook_banner_enabled", co.get("show_hook_banner", False)),
-                    hook_headline=co.get("hook_headline", ""),
+                    hook_banner_enabled=eff_show_hook,
+                    show_hook=eff_show_hook,
+                    hook_headline=eff_hook_text,
+                    hook_text=eff_hook_text,
                     retention_bar_enabled=bool(co.get("retention_bar_enabled", False)),
                     retention_bar_color=co.get("retention_bar_color", "#C6F32F"),
                     outro_cta_enabled=bool(co.get("outro_cta_enabled", False)),
@@ -659,15 +1030,16 @@ def render_exact_preview_frame(
                     handle_display_mode=eff_handle_mode,
                     cold_open_active=cold_open_active,
                     cold_open_teaser_dur=cold_open_net_offset if cold_open_active else 2.8,
+                    safe_zone=eff_safe_zone,
                     caption_animation=co.get("caption_animation", co.get("animation", "Pop Bounce")),
                     pill_color=co.get("pill_color"),
                     pacing_density=co.get("pacing_density", "3-4 Words Viral"),
                     text_case=co.get("text_case", "ALL CAPS" if co.get("uppercase", co.get("all_caps", True)) else "As Spoken"),
                 )
                 composited = Image.alpha_composite(base_rgba, cap_rgba).convert("RGB")
-                composited.save(out_path, format="PNG")
+                composited.save(out_path, format="PNG", compress_level=1)
 
-        latency_ms = int((time.time() - t0) * 1000)
+        latency_ms = max(1, int(round((time.perf_counter() - t0) * 1000)))
         return {
             "frame_url": f"/media/previews/{out_filename}",
             "render_time_ms": latency_ms,

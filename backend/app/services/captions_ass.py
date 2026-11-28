@@ -513,8 +513,13 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     events: List[str] = []
 
     # 1. Top Hook Banner in Layer 1 (0.0s to 3.5s)
-    if show_hook_banner and hook_headline and hook_headline.strip():
-        clean_headline = hook_headline.strip().upper()
+    from app.services.caption_renderer import resolve_hook_banner_state
+    eff_ass_show, eff_ass_text = resolve_hook_banner_state(
+        show_hook_banner=show_hook_banner,
+        hook_headline=hook_headline,
+    )
+    if eff_ass_show and eff_ass_text:
+        clean_headline = eff_ass_text.upper()
         banner_margin_v = max(40, int(140 * (video_height / 1920.0)))
         banner_text = f"{{\\an8\\q1\\bord6\\shad2\\c&H0000FFFF&\\3c&H00000000&}}★ {clean_headline} ★"
         events.append(

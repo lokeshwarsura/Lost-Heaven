@@ -161,6 +161,7 @@ class ViralClip(SQLModel, table=True):
     custom_width: int = SQLField(default=1080)
     custom_height: int = SQLField(default=1920)
     frame_layout: str = SQLField(default="auto_track") # auto_track, webcam_gameplay_split, webcam_gameplay_pip, split_podcast, fit_blur
+    framing_template: Optional[str] = SQLField(default=None)
     webcam_corner: str = SQLField(default="auto") # auto, top_left, top_right, bottom_left, bottom_right
     webcam_split_ratio: float = SQLField(default=0.40) # 0.25 to 0.50
     source_webcam_region_json: str = SQLField(default="")
@@ -532,6 +533,8 @@ class PreviewFrameRequest(BaseModel):
     webcam_split_ratio: float = 0.40
     source_webcam_region: Optional[Dict[str, Any]] = None
     framing_override: Optional[Dict[str, Any]] = None
+    frame_crop_override: Optional[Any] = None
+    clear_framing_override: Optional[bool] = None
     camera_motion: str = "steady"
     whip_pan_cuts: bool = False
     pip_border_color: str = "#F59E0B"
@@ -637,9 +640,15 @@ class PreviewFrameRequest(BaseModel):
     word_by_word: Optional[bool] = None
     clean_filler_words: bool = False
     censor_profanity: bool = False
-    show_hook_banner: bool = True
+    show_hook_banner: Optional[bool] = None
+    show_hook: Optional[bool] = None
     hook_banner_enabled: Optional[bool] = None
+    enable_hook_banner: Optional[bool] = None
+    top_hook_banner: Optional[bool] = None
     hook_headline: str = ""
+    hook_text: Optional[str] = None
+    safe_zone: Optional[str] = None
+    safe_zone_guide: Optional[str] = None
     retention_bar_enabled: bool = False
     retention_bar_color: str = "#C6F32F"
     outro_cta_enabled: bool = False
@@ -783,7 +792,14 @@ class UpdateClipRequest(BaseModel):
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     hook_headline: Optional[str] = None
+    hook_text: Optional[str] = None
     show_hook_banner: Optional[bool] = None
+    show_hook: Optional[bool] = None
+    hook_banner_enabled: Optional[bool] = None
+    enable_hook_banner: Optional[bool] = None
+    top_hook_banner: Optional[bool] = None
+    safe_zone: Optional[str] = None
+    safe_zone_guide: Optional[str] = None
     cold_open_quote: Optional[str] = None
     use_cold_open: Optional[bool] = None
     cold_open: Optional[bool] = None
@@ -807,6 +823,8 @@ class UpdateClipRequest(BaseModel):
     webcam_split_ratio: Optional[float] = None
     source_webcam_region: Optional[Dict[str, Any]] = None
     framing_override: Optional[Dict[str, Any]] = None
+    frame_crop_override: Optional[Any] = None
+    clear_framing_override: Optional[bool] = None
     camera_motion: Optional[str] = None
     whip_pan_cuts: Optional[bool] = None
     pip_border_color: Optional[str] = None
@@ -1032,6 +1050,7 @@ class UpdateClipMetadataRequest(BaseModel):
     hashtags: Optional[str] = None
     pinned_comment: Optional[str] = None
     privacy_status: Optional[str] = None
+    social_copy: Optional[Dict[str, Any]] = None
 
 
 class RenderClipRequest(BaseModel):
@@ -1079,6 +1098,18 @@ class RenderClipRequest(BaseModel):
     webcam_split_ratio: Optional[float] = None
     pip_border_color: Optional[str] = None
     source_corner: Optional[str] = None
+    framing_override: Optional[Dict[str, Any]] = None
+    frame_crop_override: Optional[Any] = None
+    clear_framing_override: Optional[bool] = None
+    show_hook: Optional[bool] = None
+    show_hook_banner: Optional[bool] = None
+    hook_banner_enabled: Optional[bool] = None
+    enable_hook_banner: Optional[bool] = None
+    top_hook_banner: Optional[bool] = None
+    hook_headline: Optional[str] = None
+    hook_text: Optional[str] = None
+    safe_zone: Optional[str] = None
+    safe_zone_guide: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
 
 
@@ -1145,6 +1176,12 @@ class PublishYouTubeRequest(BaseModel):
     tags: Optional[List[str]] = None
     privacy_status: Optional[str] = "private"
     privacy: Optional[str] = None
+    category_id: Optional[str] = "22"
+
+
+class YouTubeCredentialsRequest(BaseModel):
+    client_id: str
+    client_secret: str
 
 
 class SettingsUpdateRequest(BaseModel):

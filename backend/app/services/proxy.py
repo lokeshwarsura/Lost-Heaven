@@ -3,10 +3,25 @@ import shutil
 import subprocess
 import json
 import logging
+import threading
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_PROBE_CACHE: "OrderedDict[Tuple[str, int, int], Dict[str, Any]]" = OrderedDict()
+_PROBE_CACHE_LOCK = threading.Lock()
+_PROBE_CACHE_MAX = 128
+
+
+def _probe_stat_key(video_path: str) -> Optional[Tuple[str, int, int]]:
+    try:
+        abs_p = os.path.abspath(video_path)
+        st = os.stat(abs_p)
+        return (abs_p, int(st.st_size), int(st.st_mtime_ns))
+    except OSError:
+        return None
 
 def get_ffmpeg_cmd() -> str:
     """Return available ffmpeg executable, checking backend/bin, workspace/bin, and system PATH."""
@@ -33,7 +48,15 @@ def get_ffprobe_cmd() -> str:
     return "ffprobe"
 
 def probe_video(video_path: str) -> Dict[str, Any]:
-    """Probe video resolution, duration, fps, and audio streams using ffprobe."""
+    """Probe video resolution, duration, fps, and audio streams using ffprobe (LRU cached by file stat)."""
+    stat_key = _probe_stat_key(video_path)
+    if stat_key is not None:
+        with _PROBE_CACHE_LOCK:
+            cached = _PROBE_CACHE.get(stat_key)
+            if cached is not None:
+                _PROBE_CACHE.move_to_end(stat_key)
+                return dict(cached)
+
     ffprobe = get_ffprobe_cmd()
     cmd = [
         ffprobe,
@@ -78,13 +101,20 @@ def probe_video(video_path: str) -> Dict[str, Any]:
         elif stream.get("codec_type") == "audio":
             has_audio = True
 
-    return {
+    res = {
         "duration": duration,
         "width": width,
         "height": height,
         "fps": fps,
         "has_audio": has_audio
     }
+    if stat_key is not None and width > 0 and height > 0:
+        with _PROBE_CACHE_LOCK:
+            _PROBE_CACHE[stat_key] = dict(res)
+            _PROBE_CACHE.move_to_end(stat_key)
+            while len(_PROBE_CACHE) > _PROBE_CACHE_MAX:
+                _PROBE_CACHE.popitem(last=False)
+    return res
 
 def detect_hardware_encoder() -> str:
     """Detect available hardware encoders or fallback to libx264."""

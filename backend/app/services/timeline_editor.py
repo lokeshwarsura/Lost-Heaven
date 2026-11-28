@@ -1,9 +1,13 @@
 import os
 import re
+import json
+import hashlib
+import threading
 import wave
 import logging
 import subprocess
 import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,6 +17,32 @@ import numpy as np
 from app.services.proxy import get_ffmpeg_cmd, probe_video
 
 logger = logging.getLogger(__name__)
+
+_PLAN_CACHE: "OrderedDict[Tuple[Any, ...], TimelineEditPlan]" = OrderedDict()
+_PLAN_CACHE_LOCK = threading.Lock()
+_PLAN_CACHE_MAX = 64
+
+
+def _clone_timeline_plan(plan: "TimelineEditPlan") -> "TimelineEditPlan":
+    return TimelineEditPlan(
+        keep_intervals=list(plan.keep_intervals),
+        kept_segments_abs=list(plan.kept_segments_abs),
+        has_cuts=plan.has_cuts,
+        main_duration=plan.main_duration,
+        effective_duration=plan.effective_duration,
+        crossfade_sec=plan.crossfade_sec,
+        remapped_words=[dict(w) for w in plan.remapped_words],
+        cold_open_active=plan.cold_open_active,
+        climax_window=plan.climax_window,
+        climax_rel_start=plan.climax_rel_start,
+        teaser_duration=plan.teaser_duration,
+        flash_duration=plan.flash_duration,
+        punch_timestamps=list(plan.punch_timestamps),
+        punch_intervals=list(plan.punch_intervals),
+        dead_air_cuts_count=plan.dead_air_cuts_count,
+        dead_air_saved_sec=plan.dead_air_saved_sec,
+        timeline_fx_summary=dict(plan.timeline_fx_summary),
+    )
 
 FILLER_TOKENS = {"um", "uh", "erm", "ah", "er", "hmm"}
 COLD_OPEN_WINDOW_SEC = 2.80
@@ -782,6 +812,49 @@ def build_timeline_edit_plan(
         if (tighten_pacing or trim_dead_air)
         else float(crossfade_sec or 0.03)
     )
+
+    try:
+        abs_v = os.path.abspath(video_path) if video_path else ""
+        st = os.stat(abs_v) if (abs_v and os.path.exists(abs_v)) else None
+        v_stat = (abs_v, int(st.st_size), int(st.st_mtime_ns)) if st else (str(video_path or ""), 0, 0)
+    except OSError:
+        v_stat = (str(video_path or ""), 0, 0)
+
+    words_sig = hashlib.md5(
+        json.dumps(
+            [
+                (w.get("word"), round(float(w.get("start", 0.0)), 3), round(float(w.get("end", 0.0)), 3))
+                for w in src_words
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    exp_sig = tuple((round(float(a), 3), round(float(b), 3)) for a, b in (explicit_keep_segments or []))
+    cache_key = (
+        v_stat,
+        round(anchor_s, 3),
+        round(span_d, 3),
+        words_sig,
+        bool(cold_open),
+        str(cold_open_quote or ""),
+        bool(trim_dead_air),
+        bool(tighten_pacing),
+        round(float(silence_threshold), 3),
+        bool(clean_filler_words),
+        bool(punch_zoom),
+        round(float(punch_zoom_intensity or 1.16), 3),
+        exp_sig,
+        round(eff_cf, 3),
+        id(detect_ffmpeg_silences),
+        id(compute_kept_segments_and_remapped_words),
+        id(select_cold_open_climax_window),
+        id(detect_punch_zoom_peaks),
+    )
+    with _PLAN_CACHE_LOCK:
+        cached_plan = _PLAN_CACHE.get(cache_key)
+        if cached_plan is not None:
+            _PLAN_CACHE.move_to_end(cache_key)
+            return _clone_timeline_plan(cached_plan)
     tl_cuts = compute_kept_segments_and_remapped_words(
         words=src_words,
         clip_start_time=anchor_s,
@@ -925,7 +998,7 @@ def build_timeline_edit_plan(
         "effective_duration": eff_dur,
     }
 
-    return TimelineEditPlan(
+    plan = TimelineEditPlan(
         keep_intervals=kept_rel,
         kept_segments_abs=kept_abs,
         has_cuts=has_cuts,
@@ -944,6 +1017,12 @@ def build_timeline_edit_plan(
         dead_air_saved_sec=saved_sec,
         timeline_fx_summary=summary,
     )
+    with _PLAN_CACHE_LOCK:
+        _PLAN_CACHE[cache_key] = _clone_timeline_plan(plan)
+        _PLAN_CACHE.move_to_end(cache_key)
+        while len(_PLAN_CACHE) > _PLAN_CACHE_MAX:
+            _PLAN_CACHE.popitem(last=False)
+    return plan
 
 
 def build_timeline_trim_concat_filter(

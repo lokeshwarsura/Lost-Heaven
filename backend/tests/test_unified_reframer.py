@@ -226,9 +226,9 @@ def test_all_five_templates_and_split_podcast_cutaway(
     )
     assert "geq=" in vf_pip_gameplay and "pad=" in vf_pip_gameplay and "overlay=" in vf_pip_gameplay
 
-    # 4. webcam_gameplay_split filter produces Top 38% / Bottom 62% stack + 2px divider
+    # 4. webcam_gameplay_split filter produces Top 38% / Bottom 62% stack + 3px divider
     vf_split = build_multi_aspect_filter("9:16", "webcam_gameplay_split", 1920, 1080, face_track_data=ft_game)
-    assert "vstack=inputs=2" in vf_split and "h=2:color=0xFFFFFF@0.28" in vf_split
+    assert "vstack=inputs=2" in vf_split and "h=3:color=0xFFFFFF@0.28" in vf_split
 
 
 def test_preview_and_render_pixel_coordinate_parity(

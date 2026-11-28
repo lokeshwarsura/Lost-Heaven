@@ -19,6 +19,76 @@ logger = logging.getLogger(__name__)
 
 FILLER_WORDS = {"um", "uh", "er", "ah", "like", "you know", "basically", "literally"}
 
+
+def coerce_strict_bool(val: Any) -> bool:
+    """Strictly parse booleans so strings like 'false' or '0' evaluate to False."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        norm = val.strip().lower()
+        if norm in ("1", "true", "yes", "on"):
+            return True
+        if norm in ("", "0", "false", "no", "off", "disabled", "none", "null"):
+            return False
+        return False
+    return False
+
+
+def resolve_hook_banner_state(
+    *,
+    show_hook: Any = None,
+    show_hook_banner: Any = None,
+    hook_banner_enabled: Any = None,
+    enable_hook_banner: Any = None,
+    top_hook_banner: Any = None,
+    hook_text: Any = None,
+    hook_headline: Any = None,
+    options: Optional[Dict[str, Any]] = None,
+    default_show: bool = False,
+) -> Tuple[bool, str]:
+    """
+    Resolve effective `(show_hook, hook_text)` strictly:
+    returns `(True, clean_text)` ONLY when both boolean flag is strictly True
+    AND headline text is non-empty after stripping; otherwise `(False, "")`.
+    """
+    opts = options if isinstance(options, dict) else {}
+    flag_val: Any = None
+    for candidate in (
+        show_hook,
+        top_hook_banner,
+        enable_hook_banner,
+        hook_banner_enabled,
+        show_hook_banner,
+    ):
+        if candidate is not None:
+            flag_val = candidate
+            break
+    if flag_val is None:
+        for opt_key in (
+            "show_hook",
+            "top_hook_banner",
+            "enable_hook_banner",
+            "hook_banner_enabled",
+            "show_hook_banner",
+        ):
+            if opt_key in opts and opts.get(opt_key) is not None:
+                flag_val = opts.get(opt_key)
+                break
+
+    eff_show = coerce_strict_bool(flag_val) if flag_val is not None else bool(default_show)
+    if eff_show is not True:
+        return False, ""
+
+    raw_text = hook_text if hook_text is not None else hook_headline
+    if raw_text is None:
+        raw_text = opts.get("hook_text", opts.get("hook_headline", ""))
+    eff_text = str(raw_text or "").strip()
+    if not eff_text:
+        return False, ""
+    return True, eff_text
+
 # Map UI font names cleanly to bundled font stems and Windows/system font filenames
 FONT_CANDIDATES: Dict[str, Dict[str, List[str]]] = {
     "montserrat": {
@@ -656,11 +726,26 @@ def _draw_hook_banner(
         curr_y += line_h + gap_y
 
 
+def _canonicalize_safe_zone(safe_zone: Any = None) -> str:
+    norm = str(safe_zone or "").strip().lower().replace("-", " ").replace("_", " ")
+    norm = " ".join(norm.split())
+    if norm in ("tiktok", "tik tok", "tt"):
+        return "tiktok"
+    if norm in ("reels", "reel", "instagram", "instagram reels", "ig", "ig reels"):
+        return "reels"
+    if norm in ("shorts", "short", "yt shorts", "youtube shorts", "youtube"):
+        return "shorts"
+    if norm == "all":
+        return "all"
+    return "none"
+
+
 def _draw_cold_open_climax_badge(
     canvas: Image.Image,
     width: int,
     height: int,
     has_hook_banner: bool = False,
+    safe_zone: str = "none",
 ):
     """Draw a high-contrast pill badge (`CLIMAX HOOK`) during the prepended Cold-Open teaser."""
     scale = max(0.45, width / 1080.0)
@@ -676,6 +761,9 @@ def _draw_cold_open_climax_badge(
     pill_h = int(round(th)) + pad_y * 2
     x0 = (width - pill_w) // 2
     y0 = max(14, int(round(height * (0.025 if has_hook_banner else 0.065))))
+    if _canonicalize_safe_zone(safe_zone) in ("tiktok", "reels", "shorts", "all"):
+        safe_top_y = int(math.ceil(height * 0.13)) + max(2, int(round(4 * scale)))
+        y0 = max(safe_top_y, y0)
     x1 = x0 + pill_w
     y1 = y0 + pill_h
 
@@ -1095,6 +1183,9 @@ def render_caption_frame(
     auto_emoji: bool = False,
     hook_banner_enabled: bool = False,
     hook_headline: str = "",
+    show_hook: Optional[bool] = None,
+    show_hook_banner: Optional[bool] = None,
+    hook_text: Optional[str] = None,
     retention_bar_enabled: bool = False,
     retention_bar_color: str = "#C6F32F",
     outro_cta_enabled: bool = False,
@@ -1132,6 +1223,7 @@ def render_caption_frame(
     handle_display_mode: str = "always",
     cold_open_active: bool = False,
     cold_open_teaser_dur: float = 2.3,
+    safe_zone: str = "none",
     caption_animation: Optional[str] = None,
     pill_color: Optional[str] = None,
     pacing_density: str = "3-4 Words Viral",
@@ -1170,10 +1262,17 @@ def render_caption_frame(
             logo_path=outro_logo_path,
         )
 
-    hook_visible_now = bool(burn_captions and hook_banner_enabled and hook_headline and 0.0 <= t <= 3.5)
+    eff_show_hook, eff_hook_text = resolve_hook_banner_state(
+        show_hook=show_hook,
+        show_hook_banner=show_hook_banner,
+        hook_banner_enabled=hook_banner_enabled,
+        hook_text=hook_text,
+        hook_headline=hook_headline,
+    )
+    hook_visible_now = bool(eff_show_hook is True and bool(eff_hook_text) is True and 0.0 <= t <= 3.5)
     cold_open_visible_now = bool(cold_open_active and 0.0 <= t <= max(0.5, float(cold_open_teaser_dur or 2.3)))
     if cold_open_visible_now:
-        _draw_cold_open_climax_badge(canvas, width, height, has_hook_banner=hook_visible_now)
+        _draw_cold_open_climax_badge(canvas, width, height, has_hook_banner=hook_visible_now, safe_zone=safe_zone)
 
     if chapters_enabled and chapters:
         from app.services.chapter_engine import draw_chapter_pill
@@ -1248,11 +1347,11 @@ def render_caption_frame(
 
     if not burn_captions:
         if hook_visible_now:
-            _draw_hook_banner(canvas, hook_headline, width, height)
+            _draw_hook_banner(canvas, eff_hook_text, width, height)
         return canvas
 
     if hook_visible_now:
-        _draw_hook_banner(canvas, hook_headline, width, height)
+        _draw_hook_banner(canvas, eff_hook_text, width, height)
 
     active_chunk: Optional[Dict[str, Any]] = None
     for ch in chunks:
@@ -1858,6 +1957,9 @@ def build_caption_ffconcat(
     burn_captions: bool = True,
     hook_banner_enabled: bool = False,
     hook_headline: str = "",
+    show_hook: Optional[bool] = None,
+    show_hook_banner: Optional[bool] = None,
+    hook_text: Optional[str] = None,
     clip_start_time: float = 0.0,
     project_id: Optional[int] = None,
     timing_offset: float = 0.0,
@@ -1893,6 +1995,7 @@ def build_caption_ffconcat(
     handle_display_mode: str = "always",
     cold_open_active: bool = False,
     cold_open_teaser_dur: float = 2.3,
+    safe_zone: str = "none",
     caption_animation: Optional[str] = None,
     pill_color: Optional[str] = None,
     pacing_density: str = "3-4 Words Viral",
@@ -1934,11 +2037,19 @@ def build_caption_ffconcat(
     )
     active_cards = [c for c in (callout_cards or []) if isinstance(c, dict) and c.get("enabled", True)] if auto_callouts else []
 
+    eff_show_hook, eff_hook_text = resolve_hook_banner_state(
+        show_hook=show_hook,
+        show_hook_banner=show_hook_banner,
+        hook_banner_enabled=hook_banner_enabled,
+        hook_text=hook_text,
+        hook_headline=hook_headline,
+    )
+
     breakpoints = {0.0, round(dur_total, 3)}
     co_teaser_end = max(0.5, float(cold_open_teaser_dur or 2.3))
     if cold_open_active and co_teaser_end < dur_total:
         breakpoints.add(round(co_teaser_end, 3))
-    if burn_captions and hook_banner_enabled and hook_headline.strip():
+    if eff_show_hook is True and bool(eff_hook_text) is True:
         if 3.5 < dur_total:
             breakpoints.add(3.5)
 
@@ -2035,7 +2146,7 @@ def build_caption_ffconcat(
             continue
         mid_t = (t0 + t1) / 2.0
 
-        hook_vis = bool(burn_captions and hook_banner_enabled and hook_headline.strip() and mid_t <= 3.5)
+        hook_vis = bool(eff_show_hook is True and bool(eff_hook_text) is True and mid_t <= 3.5)
         cold_open_vis = bool(cold_open_active and mid_t <= co_teaser_end)
         bar_bucket = int(round((mid_t / dur_total) * 100)) if retention_bar_enabled else -1
         cta_bucket = -1
@@ -2112,8 +2223,9 @@ def build_caption_ffconcat(
             fname = "blank.png"
         else:
             state_key = (
-                ch_idx, word_idx, anim_bucket, hook_vis, cold_open_vis, bar_bucket, cta_bucket,
-                turn_idx, callout_state, face_bucket, chap_idx, chap_ease, spec_bucket, handle_bucket
+                ch_idx, word_idx, anim_bucket, hook_vis, cold_open_vis, _canonicalize_safe_zone(safe_zone),
+                bar_bucket, cta_bucket, turn_idx, callout_state, face_bucket, chap_idx, chap_ease,
+                spec_bucket, handle_bucket,
             )
             fname = state_to_filename.get(state_key, "")
             if not fname:
@@ -2126,8 +2238,10 @@ def build_caption_ffconcat(
                     height=height,
                     words=words,
                     burn_captions=burn_captions,
-                    hook_banner_enabled=hook_banner_enabled,
-                    hook_headline=hook_headline,
+                    hook_banner_enabled=eff_show_hook,
+                    hook_headline=eff_hook_text,
+                    show_hook=eff_show_hook,
+                    hook_text=eff_hook_text,
                     retention_bar_enabled=retention_bar_enabled,
                     retention_bar_color=retention_bar_color,
                     outro_cta_enabled=outro_cta_enabled,
@@ -2166,6 +2280,7 @@ def build_caption_ffconcat(
                     handle_display_mode=handle_display_mode,
                     cold_open_active=cold_open_active,
                     cold_open_teaser_dur=co_teaser_end,
+                    safe_zone=safe_zone,
                     caption_animation=caption_animation,
                     pill_color=pill_color,
                     pacing_density=pacing_density,

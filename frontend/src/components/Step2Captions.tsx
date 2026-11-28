@@ -177,7 +177,7 @@ export const Step2Captions: React.FC<Step2CaptionsProps> = ({
   const selectedWord = selectedWordIdx !== null ? words[selectedWordIdx] : null;
 
   return (
-    <div className="space-y-4 text-xs animate-fadeIn w-full text-[var(--text-primary)]">
+    <div className="pt-2 space-y-4 text-xs animate-fadeIn w-full text-[var(--text-primary)]">
       {/* A. Descript-Style Inline Voice Transcript Editor */}
       <div className="bg-[var(--bg-card)] border border-[var(--border-subtle)] rounded-xl p-3.5 space-y-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">

@@ -437,7 +437,7 @@ def test_all_10_framing_templates_render_distinctly_on_pure_gameplay_and_corner_
         if tpl in ("gameplay_webcam_pip", "portrait_pip_badge"):
             assert "overlay=" in fg and "geq=" in fg, f"{tpl} must overlay rounded PiP even with zero faces"
         if tpl == "webcam_gameplay_split":
-            assert "vstack=" in fg and "h=2" in fg
+            assert "vstack=" in fg and "h=3" in fg
         if tpl == "triple_gaming_hud":
             assert "vstack=" in fg
         if tpl == "side_by_side_50_50":

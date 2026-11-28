@@ -49,6 +49,16 @@ def _normalize_signature_value(val: Any) -> Any:
     return val
 
 
+def _strict_hook_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)):
+        return bool(val)
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 def compute_render_signature(
     clip_id: Any,
     project_id: Any = None,
@@ -67,14 +77,74 @@ def compute_render_signature(
         "_clip_key",
         "_my_token",
     }
+    raw = params or {}
     clean_opts: Dict[str, Any] = {}
-    for k, v in (params or {}).items():
+    for k, v in raw.items():
         if k in excluded_keys:
             continue
         if k == "options":
             clean_opts[k] = _normalize_signature_value(v or {})
         else:
             clean_opts[k] = _normalize_signature_value(v)
+
+    opts_dict = raw.get("options") if isinstance(raw.get("options"), dict) else {}
+    raw_show_flag: Any = None
+    for key in (
+        "show_hook",
+        "top_hook_banner",
+        "enable_hook_banner",
+        "hook_banner_enabled",
+        "show_hook_banner",
+    ):
+        if raw.get(key) is not None:
+            raw_show_flag = raw.get(key)
+            break
+    if raw_show_flag is None:
+        for key in (
+            "show_hook",
+            "top_hook_banner",
+            "enable_hook_banner",
+            "hook_banner_enabled",
+            "show_hook_banner",
+        ):
+            if opts_dict.get(key) is not None:
+                raw_show_flag = opts_dict.get(key)
+                break
+    eff_show_hook = _strict_hook_bool(raw_show_flag) if raw_show_flag is not None else False
+    raw_hook_text = (
+        raw.get("hook_text")
+        if raw.get("hook_text") is not None
+        else (raw.get("hook_headline") if raw.get("hook_headline") is not None else opts_dict.get("hook_headline", ""))
+    )
+    eff_hook_text = str(raw_hook_text or "").strip() if eff_show_hook else ""
+    clean_opts["show_hook"] = eff_show_hook
+    clean_opts["show_hook_banner"] = eff_show_hook
+    clean_opts["hook_text"] = eff_hook_text
+    clean_opts["hook_headline"] = eff_hook_text
+    raw_sz = str(
+        raw.get("safe_zone")
+        if raw.get("safe_zone") is not None
+        else opts_dict.get("safe_zone", "none")
+    ).strip().lower().replace("-", " ").replace("_", " ")
+    raw_sz = " ".join(raw_sz.split())
+    if raw_sz in ("tiktok", "tik tok", "tt"):
+        norm_sz = "tiktok"
+    elif raw_sz in ("reels", "reel", "instagram", "instagram reels", "ig", "ig reels"):
+        norm_sz = "reels"
+    elif raw_sz in ("shorts", "short", "yt shorts", "youtube shorts", "youtube"):
+        norm_sz = "shorts"
+    elif raw_sz == "all":
+        norm_sz = "all"
+    else:
+        norm_sz = "none"
+    clean_opts["safe_zone"] = norm_sz
+    raw_tpl = (
+        raw.get("framing_template")
+        if raw.get("framing_template") is not None
+        else (opts_dict.get("framing_template") or raw.get("frame_layout") or "auto_track")
+    )
+    clean_opts["framing_template"] = str(raw_tpl)
+    clean_opts["frame_layout"] = str(raw_tpl)
 
     s_t = round(float(start_time or 0.0), 3)
     e_t = round(s_t + max(0.0, float(duration or 0.0)), 3)

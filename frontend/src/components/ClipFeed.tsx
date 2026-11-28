@@ -1,11 +1,29 @@
-import React, { useMemo, useState } from 'react';
-import { Flame, Check, Loader2, Sparkles, AlertTriangle, ArrowUpDown, GitMerge, CheckSquare, Square, Clapperboard } from 'lucide-react';
-import { ViralClip } from '../types';
+import React, { useMemo, useRef, useState, useEffect } from 'react';
+import {
+  Flame,
+  Check,
+  Loader2,
+  Sparkles,
+  AlertTriangle,
+  ArrowUpDown,
+  GitMerge,
+  CheckSquare,
+  Square,
+  Clapperboard,
+  SlidersHorizontal,
+  RefreshCw,
+  X,
+} from 'lucide-react';
+import { Project, ViralClip } from '../types';
 
 interface ClipFeedProps {
   clips: ViralClip[];
   selectedClipId: number | null;
+  project?: Project | null;
   onSelectClip: (clip: ViralClip) => void;
+  onUpdateProject?: (updates: Partial<Project>) => void;
+  onRegenerateClips?: () => Promise<void>;
+  isRegeneratingClips?: boolean;
   onMergeClips?: (clipIds: number[], smoothTransition: boolean) => Promise<void>;
   isMerging?: boolean;
   onCompileTrailer?: () => Promise<void>;
@@ -17,7 +35,11 @@ interface ClipFeedProps {
 export const ClipFeed: React.FC<ClipFeedProps> = ({
   clips,
   selectedClipId,
+  project,
   onSelectClip,
+  onUpdateProject,
+  onRegenerateClips,
+  isRegeneratingClips = false,
   onMergeClips,
   isMerging = false,
   onCompileTrailer,
@@ -29,6 +51,18 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
   const [mergeMode, setMergeMode] = useState(false);
   const [mergeSelection, setMergeSelection] = useState<number[]>([]);
   const [smoothTransition, setSmoothTransition] = useState(true);
+  const [showGenPopover, setShowGenPopover] = useState(false);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        setShowGenPopover(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
 
   const toggleMergeSelection = (clipId: number) => {
     setMergeSelection((prev) =>
@@ -70,42 +104,81 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
     return 'bg-[var(--bg-input)] text-[var(--text-primary)] border-[var(--border-subtle)]';
   };
 
+  const clipLengths = ['Auto', '15s', '30s', '45s', '60s', '90s'];
+  const clipCounts = [3, 5, 8, 10];
+  const languages = ['As spoken', 'English', 'Hinglish', 'Hindi', 'Spanish', 'French', 'German', 'Japanese'];
+  const currentLang = project?.caption_language || 'As spoken';
+
   return (
-    <aside className="w-[290px] xl:w-[320px] shrink-0 h-full min-h-0 border-r border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none overflow-hidden">
-      {/* Header */}
-      <div className="px-3.5 py-2.5 border-b border-[var(--border-subtle)] flex items-center justify-between gap-2 shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <Flame className="w-4 h-4 text-[var(--accent-primary)] shrink-0" />
-          <h2 className="text-xs font-bold tracking-tight text-[var(--text-primary)] truncate tabular-nums">
-            Viral Clips ({clips.length})
-          </h2>
+    <aside className="w-[290px] xl:w-[320px] shrink-0 h-full min-h-0 border-r border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none overflow-hidden relative">
+      {/* Clean Clip Queue Header */}
+      <div className="px-3.5 py-2.5 border-b border-[var(--border-subtle)] space-y-2 shrink-0">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2 min-w-0">
+            <Flame className="w-4 h-4 text-[var(--accent-primary)] shrink-0" />
+            <h2 className="text-xs font-bold tracking-tight text-[var(--text-primary)] truncate tabular-nums">
+              Viral Clips ({clips.length})
+            </h2>
+          </div>
+
+          <div className="flex items-center gap-1 shrink-0">
+            <ArrowUpDown className="w-3 h-3 text-[var(--text-secondary)]" />
+            <select
+              aria-label="Sort clips"
+              value={sortBy}
+              onChange={(e) => setSortBy(e.target.value as 'score' | 'timeline')}
+              className="bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-primary)] text-[11px] font-medium rounded-lg px-2 py-1 outline-none focus:border-[var(--accent-primary)] cursor-pointer"
+            >
+              <option value="score">Score</option>
+              <option value="timeline">Timeline</option>
+            </select>
+          </div>
         </div>
 
-        <div className="flex flex-wrap items-center justify-end gap-1 shrink-0">
+        {/* Queue Utility Action Row */}
+        <div className="flex flex-wrap items-center gap-1 relative" ref={popoverRef}>
           {onAutoFrameAll && clips.length > 0 && (
             <button
               type="button"
               disabled={isAutoFramingAll}
               onClick={() => void onAutoFrameAll()}
-              className="px-2 py-1 rounded-lg border bg-[var(--accent-subtle)] border-[var(--accent-primary)]/50 text-[var(--accent-primary)] hover:brightness-110 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50"
-              title="Automatically analyze scene composition and apply ideal framing template to every clip"
+              className="flex-1 min-w-0 px-2 py-1 rounded-lg border bg-[var(--accent-subtle)] border-[var(--accent-primary)]/50 text-[var(--accent-primary)] hover:brightness-110 text-[10px] font-bold flex items-center justify-center gap-1 transition disabled:opacity-50 truncate"
+              title="Automatically analyze scene composition and apply ideal framing template to unlocked clips"
             >
-              {isAutoFramingAll ? <Loader2 className="w-3 h-3 animate-spin" /> : <Sparkles className="w-3 h-3" />}
-              <span>{isAutoFramingAll ? 'Framing...' : 'Smart Auto-Frame All'}</span>
+              {isAutoFramingAll ? <Loader2 className="w-3 h-3 animate-spin shrink-0" /> : <Sparkles className="w-3 h-3 shrink-0" />}
+              <span className="truncate">{isAutoFramingAll ? 'Framing...' : 'Smart Auto-Frame All'}</span>
             </button>
           )}
+
+          {(onUpdateProject || onRegenerateClips) && project && (
+            <button
+              type="button"
+              onClick={() => setShowGenPopover((v) => !v)}
+              className={`px-2 py-1 rounded-lg border text-[10px] font-bold flex items-center gap-1 transition shrink-0 ${
+                showGenPopover
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+              title="Re-Generate Clips, Clip Count & Caption Language"
+            >
+              <SlidersHorizontal className="w-3 h-3" />
+              <span>Gen</span>
+            </button>
+          )}
+
           {onCompileTrailer && clips.length > 0 && (
             <button
               type="button"
               disabled={isCompilingTrailer}
               onClick={() => void onCompileTrailer()}
-              className="px-2 py-1 rounded-lg border bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] hover:border-[var(--accent-primary)]/50 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50"
-              title="Compile top 3-5 viral moments into an AI Supercut Trailer"
+              className="px-2 py-1 rounded-lg border bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)] hover:border-[var(--accent-primary)]/50 text-[10px] font-bold flex items-center gap-1 transition disabled:opacity-50 shrink-0"
+              title="Compile top viral moments into an AI Supercut Trailer"
             >
               {isCompilingTrailer ? <Loader2 className="w-3 h-3 animate-spin" /> : <Clapperboard className="w-3 h-3" />}
               <span>{isCompilingTrailer ? '...' : 'Trailer'}</span>
             </button>
           )}
+
           {onMergeClips && clips.length >= 2 && (
             <button
               type="button"
@@ -113,26 +186,132 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
                 setMergeMode((v) => !v);
                 setMergeSelection([]);
               }}
-              className={`px-2 py-1 rounded-lg border text-[10px] font-bold flex items-center gap-1 transition ${mergeMode
-                ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
-                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)]'
-                }`}
+              className={`px-2 py-1 rounded-lg border text-[10px] font-bold flex items-center gap-1 transition shrink-0 ${
+                mergeMode
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--accent-primary)]'
+              }`}
               title="Select 2+ clips to stitch together"
             >
               <GitMerge className="w-3 h-3" />
               <span>{mergeMode ? 'Done' : 'Merge'}</span>
             </button>
           )}
-          <ArrowUpDown className="w-3 h-3 text-[var(--text-secondary)]" />
-          <select
-            aria-label="Sort clips"
-            value={sortBy}
-            onChange={(e) => setSortBy(e.target.value as 'score' | 'timeline')}
-            className="bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-primary)] text-[11px] font-medium rounded-lg px-2 py-1 outline-none focus:border-[var(--accent-primary)] cursor-pointer"
-          >
-            <option value="score">Score</option>
-            <option value="timeline">Timeline</option>
-          </select>
+
+          {/* Project-Wide Re-Generate Clips / Language Popover */}
+          {showGenPopover && project && (
+            <div className="absolute left-0 right-0 top-[34px] p-3 rounded-xl bg-[var(--bg-surface)] border border-[var(--border-subtle)] shadow-2xl space-y-3 z-50 animate-fadeIn text-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold uppercase tracking-wide text-[var(--text-primary)]">
+                  Re-Generate Clips &amp; Language
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowGenPopover(false)}
+                  className="p-0.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-[10px] text-[var(--text-secondary)] font-semibold">
+                  <span>Number of Clips</span>
+                  <span className="font-mono text-[var(--accent-primary)]">{project.clip_count || 5}</span>
+                </div>
+                <div className="grid grid-cols-4 gap-1">
+                  {clipCounts.map((cnt) => {
+                    const active = (project.clip_count || 5) === cnt;
+                    return (
+                      <button
+                        key={cnt}
+                        type="button"
+                        onClick={() => onUpdateProject?.({ clip_count: cnt })}
+                        className={`py-1 rounded-md border text-[10px] font-bold transition ${
+                          active
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                            : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {cnt}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-[10px] text-[var(--text-secondary)] font-semibold">
+                  <span>Clip Length Target</span>
+                  <span className="font-mono text-[var(--accent-primary)]">{project.duration_preset || 'Auto'}</span>
+                </div>
+                <div className="grid grid-cols-6 gap-1">
+                  {clipLengths.map((len) => {
+                    const active = (project.duration_preset || 'Auto') === len;
+                    return (
+                      <button
+                        key={len}
+                        type="button"
+                        onClick={() => onUpdateProject?.({ duration_preset: len })}
+                        className={`py-1 rounded-md border text-[10px] font-semibold transition ${
+                          active
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                            : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {len}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-[10px] text-[var(--text-secondary)] font-semibold">
+                  <span>Project Caption Language</span>
+                  <span className="font-mono text-[var(--accent-primary)]">{currentLang}</span>
+                </div>
+                <div className="grid grid-cols-4 gap-1">
+                  {languages.map((lang) => {
+                    const active = currentLang === lang;
+                    return (
+                      <button
+                        key={lang}
+                        type="button"
+                        onClick={() => onUpdateProject?.({ caption_language: lang })}
+                        className={`py-1 px-1 rounded-md border text-[10px] font-semibold truncate transition ${
+                          active
+                            ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                            : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {lang}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {onRegenerateClips && (
+                <button
+                  type="button"
+                  disabled={isRegeneratingClips}
+                  onClick={async () => {
+                    setShowGenPopover(false);
+                    await onRegenerateClips();
+                  }}
+                  className="w-full py-2 px-3 rounded-lg bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold text-[11px] flex items-center justify-center gap-1.5 hover:opacity-90 transition disabled:opacity-50"
+                >
+                  {isRegeneratingClips ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-3.5 h-3.5" />
+                  )}
+                  <span>{isRegeneratingClips ? 'Re-Generating...' : 'Re-Generate Project Clips'}</span>
+                </button>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -185,14 +364,15 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
               <div
                 key={clip.id}
                 onClick={() => (mergeMode ? toggleMergeSelection(clip.id) : onSelectClip(clip))}
-                className={`group rounded-xl p-3 border transition-all cursor-pointer space-y-2 ${mergeMode && isCheckedForMerge
-                  ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
-                  : isSelected
+                className={`group rounded-xl p-3 border transition-all cursor-pointer space-y-2 ${
+                  mergeMode && isCheckedForMerge
+                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
+                    : isSelected
                     ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] shadow-sm'
                     : 'bg-[var(--bg-card)] border-[var(--border-subtle)] hover:border-[var(--accent-primary)]/45'
-                  }`}
+                }`}
               >
-                {/* Top Row: Rank pill, Duration + Range, Virality Score Badge */}
+                {/* Top Row */}
                 <div className="flex items-center justify-between gap-2">
                   <div className="flex items-center gap-1.5 min-w-0 tabular-nums">
                     {mergeMode && (
@@ -228,7 +408,7 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
                   </span>
                 </div>
 
-                {/* Middle: Bold 2-line Clip Title + 2-line Rationale Excerpt */}
+                {/* Middle */}
                 <div className="space-y-1">
                   <h3 className="text-sm font-semibold text-[var(--text-primary)] line-clamp-2 leading-snug">
                     {clip.hook_headline || clip.selected_title || 'Viral Clip Moment'}
@@ -239,7 +419,6 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
                     </p>
                   )}
 
-                  {/* Affective Emotion, Narrative Arc & Engine Tags */}
                   {(clip.dominant_emotion || clip.arc_label || clip.analysis_source?.startsWith('offline')) && (
                     <div className="flex flex-wrap items-center gap-1 pt-0.5">
                       {(clip.dominant_emotion || clip.options?.dominant_emotion) && (
@@ -261,7 +440,7 @@ export const ClipFeed: React.FC<ClipFeedProps> = ({
                   )}
                 </div>
 
-                {/* Bottom: Compact Score Strip + Status Pill */}
+                {/* Bottom Score & Status */}
                 <div className="flex items-center justify-between gap-2 pt-2 border-t border-[var(--border-subtle)] text-[11px] tabular-nums">
                   <span className="text-[var(--text-secondary)] font-medium truncate">
                     Hook <strong className="text-[var(--text-primary)]">{clip.hook_score}</strong> · Ret{' '}

@@ -246,7 +246,7 @@ def test_split_top_40_and_auto_track_headroom_smoothing():
         },
     )
     assert "vstack=inputs=2" in vf_split
-    assert "h=2:color=0xFFFFFF@0.28" in vf_split
+    assert "h=3:color=0xFFFFFF@0.28" in vf_split
 
     # EMA alpha=0.14 & deadzone=0.03 filter out small jitter
     assert _smooth_step((0.50, 0.50), (0.52, 0.50), is_cut=False, alpha=0.14, deadzone=0.03) == (0.50, 0.50)

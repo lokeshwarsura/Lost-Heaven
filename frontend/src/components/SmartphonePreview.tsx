@@ -2,11 +2,11 @@ import React, { useRef, useState, useEffect } from 'react';
 import {
   Play, Pause, RefreshCw, Eye, Smartphone, Heart, MessageCircle,
   Share2, Music, Volume2, VolumeX, Download, Zap, CheckCircle2, Loader2, X, Scissors,
-  Sparkles, Package, Copy, Check, Activity, Trash2, Image as ImageIcon, Shield,
-  Crop, Crosshair, Lock, Unlock, Move, RotateCcw, AlertTriangle, ExternalLink, Link2,
-  Unlink, Upload, ChevronDown, ChevronUp, StepBack, StepForward, Grid
+  Sparkles, Package, Activity, Trash2, Image as ImageIcon, Shield,
+  Crop, Crosshair, Lock, Unlock, Move, RotateCcw, StepBack, StepForward, Grid
 } from 'lucide-react';
-import { ViralClip, PlatformCopyMap, RetentionAuditReport, RetentionWarning, PrivacyBlurBox, PreflightReport, PreflightCheck, FramingOverride, FramingBox, BestFrameItem } from '../types';
+import { ViralClip, RetentionAuditReport, RetentionWarning, PrivacyBlurBox, PreflightReport, PreflightCheck, FramingOverride, FramingBox, BestFrameItem } from '../types';
+import { PublishModal } from './PublishModal';
 import { api } from '../api/client';
 
 const YouTubeIcon = ({ className = 'w-4 h-4' }: { className?: string }) => (
@@ -142,35 +142,19 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const preparingClipIdRef = useRef<number | null>(null);
   const lastRenderedHashByClipRef = useRef<Record<number, string>>({});
   const debounceTimerRef = useRef<number | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
   const autoRenderAbortRef = useRef<AbortController | null>(null);
+  const previewAbortRef = useRef<AbortController | null>(null);
+  const triggerNowAutoRenderRef = useRef<(() => void) | null>(null);
+  const prevLayoutKeyRef = useRef<string>('');
   const pendingRestoreRef = useRef<{ relTime: number; shouldPlay: boolean } | null>(null);
   const relCurrentRef = useRef<number>(0);
 
-  const [autoRender, setAutoRender] = useState<boolean>(() => {
-    try {
-      const saved =
-        localStorage.getItem('lost_heaven_auto_render') ??
-        localStorage.getItem('clipship_auto_render');
-      return saved === null ? true : saved === 'true';
-    } catch {
-      return true;
-    }
-  });
+  // Always-on 3-layer sync: Layer 1 (0ms CSS), Layer 2 (100ms AbortController PNG), Layer 3 (900ms MP4)
+  const autoRender = true;
   const [isAutoRendering, setIsAutoRendering] = useState(false);
   const [isPreparingClip, setIsPreparingClip] = useState(false);
   const [videoVersion, setVideoVersion] = useState(0);
-
-  const toggleAutoRender = () => {
-    setAutoRender((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem('lost_heaven_auto_render', String(next));
-      } catch {
-        // ignore storage restrictions
-      }
-      return next;
-    });
-  };
 
   const [stageSize, setStageSize] = useState<{ w: number; h: number }>({ w: 280, h: 460 });
   const [canvasZoom, setCanvasZoom] = useState<'fit' | '75' | '100'>('fit');
@@ -185,8 +169,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const [frameLatencyMs, setFrameLatencyMs] = useState<number | null>(null);
   const [isRenderingFrame, setIsRenderingFrame] = useState(false);
 
-  // YouTube Publish Modal state
+  // YouTube Publish & Unified Export Modal states
   const [isPublishModalOpen, setIsPublishModalOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
   // Depth-Layered AI Thumbnail Studio state
   const [isThumbModalOpen, setIsThumbModalOpen] = useState(false);
@@ -597,35 +582,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       window.removeEventListener('pointerup', onUp);
     };
   }, [draggingBlurIdx, clip, onApplyFixClip]);
-  const [publishTitle, setPublishTitle] = useState('Viral Video #Shorts');
-  const [publishDesc, setPublishDesc] = useState('Created with Lost Heaven Studio! #Shorts');
-  const [publishPrivacy, setPublishPrivacy] = useState<'private' | 'unlisted' | 'public'>('private');
-  const [isPublishing, setIsPublishing] = useState(false);
-  const [publishSuccess, setPublishSuccess] = useState<{
-    video_id: string;
-    url: string;
-    privacy_status: string;
-    channel_title?: string | null;
-  } | null>(null);
-  const [publishError, setPublishError] = useState<string | null>(null);
-  const [ytStatus, setYtStatus] = useState<{
-    client_configured: boolean;
-    connected: boolean;
-    channel_title: string | null;
-    channel_id: string | null;
-  } | null>(null);
-  const [isLoadingYtStatus, setIsLoadingYtStatus] = useState(false);
-  const [isConnectingYt, setIsConnectingYt] = useState(false);
-  const [isUploadingSecrets, setIsUploadingSecrets] = useState(false);
-  const [showOAuthSetup, setShowOAuthSetup] = useState(false);
-  const [ytAuthError, setYtAuthError] = useState<string | null>(null);
-  const clientSecretsInputRef = useRef<HTMLInputElement>(null);
   const [isExportingPack, setIsExportingPack] = useState(false);
   const [packError, setPackError] = useState<string | null>(null);
-  const [socialCopy, setSocialCopy] = useState<Partial<PlatformCopyMap> | null>(null);
-  const [isGeneratingCopy, setIsGeneratingCopy] = useState(false);
-  const [activeCopyPlatform, setActiveCopyPlatform] = useState<'youtube_shorts' | 'tiktok' | 'instagram_reels' | 'x_twitter'>('youtube_shorts');
-  const [copiedField, setCopiedField] = useState<string | null>(null);
 
   // Interactive 150-bin Waveform & ±5s In/Out Trim State
   const waveTrackRef = useRef<HTMLDivElement>(null);
@@ -876,6 +834,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     if (isPlaying) {
       videoRef.current.pause();
       setIsPlaying(false);
+    } else if (clip && !videoFilterAlreadyBaked && triggerNowAutoRenderRef.current) {
+      // Selected template/FX is newer than cached MP4: trigger immediate MP4 sync & auto-play on completion
+      shouldAutoPlayRef.current = true;
+      setIsPreparingClip(true);
+      triggerNowAutoRenderRef.current();
     } else {
       setShowExactFrame(false);
       videoRef.current.play().catch(() => { });
@@ -990,6 +953,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     onUpdateSegments,
     onPlaybackTimeChange,
     handleBladeSplit,
+    togglePlay,
   });
   cmdStateRef.current = {
     clip,
@@ -1001,6 +965,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     onUpdateSegments,
     onPlaybackTimeChange,
     handleBladeSplit,
+    togglePlay,
   };
 
   const previewFps = clip?.export_fps === '60' ? 60 : clip?.export_fps === '24' ? 24 : 30;
@@ -1041,15 +1006,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       if (!detail) return;
       const vid = videoRef.current;
       const st = cmdStateRef.current;
-      if (detail.type === 'togglePlay' && vid) {
-        if (vid.paused) {
-          setShowExactFrame(false);
-          vid.play().catch(() => { });
-          setIsPlaying(true);
-        } else {
-          vid.pause();
-          setIsPlaying(false);
-        }
+      if (detail.type === 'togglePlay') {
+        st.togglePlay();
       } else if (detail.type === 'toggleMute' && vid) {
         const nextMuted = !vid.muted;
         vid.muted = nextMuted;
@@ -1129,8 +1087,24 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
   };
 
+  const mapSafeZoneToBackend = (guide?: string): 'tiktok' | 'reels' | 'shorts' | 'all' | 'none' => {
+    const g = (guide || '').trim().toLowerCase();
+    if (g === 'tiktok') return 'tiktok';
+    if (g === 'instagram' || g === 'reels' || g === 'ig') return 'reels';
+    if (g === 'yt shorts' || g === 'yt_shorts' || g === 'shorts' || g === 'youtube_shorts') return 'shorts';
+    if (g === 'all') return 'all';
+    return 'none';
+  };
+
   const fetchExactFrame = async () => {
     if (!clip) return;
+    if (previewAbortRef.current) {
+      previewAbortRef.current.abort();
+      previewAbortRef.current = null;
+    }
+    const controller = new AbortController();
+    const startTime = performance.now();
+    previewAbortRef.current = controller;
     setIsRenderingFrame(true);
     try {
       const { masterT: absTimestamp } = mapRelToMasterAndSeg(
@@ -1138,6 +1112,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         keepSegments,
         clip.merge_crossfade_sec ?? 0.03
       );
+      const effTpl = clip.framing_template || clip.frame_layout || 'auto_track';
       const res = await api.getPreviewFrame({
         clip_id: clip.id,
         project_id: clip.project_id,
@@ -1146,15 +1121,19 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         aspect_ratio: clip.aspect_ratio,
         custom_width: clip.custom_width,
         custom_height: clip.custom_height,
-        frame_layout: clip.frame_layout,
-        framing_template: clip.frame_layout,
+        frame_layout: effTpl,
+        framing_template: effTpl,
         framing_user_locked: clip.framing_user_locked,
         webcam_corner: clip.webcam_corner,
         source_corner: clip.source_webcam_region?.locked_zone || 'auto',
+        safe_zone: mapSafeZoneToBackend(safeZoneGuide),
+        safe_zone_guide: safeZoneGuide,
         webcam_split_ratio: clip.webcam_split_ratio,
         pip_border_color: clip.pip_border_color,
         source_webcam_region: clip.source_webcam_region,
-        framing_override: clip.framing_override,
+        framing_override: clip.framing_override ?? undefined,
+        frame_crop_override: clip.framing_override ?? null,
+        clear_framing_override: !clip.framing_override,
         clip_size: clip.clip_size,
         export_resolution: clip.clip_size,
         watermark_path: clip.watermark_path,
@@ -1245,9 +1224,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         word_by_word: (clip.how_phrase_arrives || '').toLowerCase().replace('-', ' ') === 'word by word',
         clean_filler_words: clip.clean_filler_words,
         censor_profanity: clip.censor_profanity,
-        show_hook_banner: clip.show_hook_banner,
-        hook_banner_enabled: clip.show_hook_banner,
-        hook_headline: clip.hook_headline,
+        show_hook: Boolean(clip.show_hook ?? clip.show_hook_banner),
+        show_hook_banner: Boolean(clip.show_hook ?? clip.show_hook_banner),
+        hook_banner_enabled: Boolean(clip.show_hook ?? clip.show_hook_banner),
+        hook_headline: (clip.show_hook ?? clip.show_hook_banner) ? (clip.hook_headline || '') : '',
+        hook_text: (clip.show_hook ?? clip.show_hook_banner) ? (clip.hook_headline || '') : '',
         retention_bar_enabled: clip.retention_bar_enabled,
         retention_bar_color: clip.retention_bar_color,
         outro_cta_enabled: clip.outro_cta_enabled,
@@ -1278,9 +1259,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         dynamic_punch_zoom: clip.punch_zoom ?? clip.dynamic_punch_zoom,
         punch_zoom: clip.punch_zoom ?? clip.dynamic_punch_zoom,
         punch_zoom_intensity: clip.punch_zoom_intensity
-      });
+      }, controller.signal);
+      if (controller.signal.aborted) return;
+      const elapsedMs = Math.max(1, Math.round(performance.now() - startTime));
       setExactFrameUrl(res.frame_url);
-      setFrameLatencyMs(res.render_time_ms);
+      setFrameLatencyMs(elapsedMs);
       setShowExactFrame(true);
       if (res.timeline_fx_summary) {
         window.dispatchEvent(
@@ -1289,10 +1272,15 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           })
         );
       }
-    } catch (err) {
-      console.error('Failed to render exact frame:', err);
+    } catch (err: any) {
+      if (err?.name !== 'AbortError' && !controller.signal.aborted) {
+        console.error('Failed to render exact frame:', err);
+      }
     } finally {
-      setIsRenderingFrame(false);
+      if (previewAbortRef.current === controller) {
+        previewAbortRef.current = null;
+        setIsRenderingFrame(false);
+      }
     }
   };
 
@@ -1301,13 +1289,15 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       aspect_ratio: clip.aspect_ratio,
       custom_width: clip.custom_width,
       custom_height: clip.custom_height,
-      frame_layout: clip.frame_layout,
+      frame_layout: clip.framing_template || clip.frame_layout,
+      framing_template: clip.framing_template || clip.frame_layout,
       framing_user_locked: Boolean(clip.framing_user_locked),
       webcam_corner: clip.webcam_corner,
       webcam_split_ratio: clip.webcam_split_ratio,
       pip_border_color: clip.pip_border_color,
       source_webcam_region: clip.source_webcam_region,
       framing_override: clip.framing_override,
+      safe_zone: mapSafeZoneToBackend(safeZoneGuide),
       zoom: clip.zoom,
       pan_x_offset: clip.pan_x_offset,
       color_preset: clip.color_preset,
@@ -1387,8 +1377,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       silence_threshold: clip.silence_threshold,
       start_time: clip.start_time,
       end_time: clip.end_time,
-      show_hook_banner: clip.show_hook_banner,
-      hook_headline: clip.hook_headline,
+      show_hook: Boolean(clip.show_hook ?? clip.show_hook_banner),
+      show_hook_banner: Boolean(clip.show_hook ?? clip.show_hook_banner),
+      hook_headline: (clip.show_hook ?? clip.show_hook_banner) ? (clip.hook_headline || '') : '',
+      hook_text: (clip.show_hook ?? clip.show_hook_banner) ? (clip.hook_headline || '') : '',
       transcript_words: clip.transcript_words,
       clip_size: clip.clip_size,
       watermark_path: clip.watermark_path,
@@ -1473,13 +1465,23 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         punch_zoom: Boolean(clip.punch_zoom ?? clip.dynamic_punch_zoom),
         punch_zoom_intensity: clip.punch_zoom_intensity ?? 1.16,
         silence_threshold: clip.silence_threshold ?? 0.55,
-        frame_layout: clip.frame_layout,
-        framing_template: clip.frame_layout,
+        frame_layout: clip.framing_template || clip.frame_layout,
+        framing_template: clip.framing_template || clip.frame_layout,
         framing_user_locked: clip.framing_user_locked,
+        framing_override: clip.framing_override ?? null,
+        frame_crop_override: clip.framing_override ?? null,
+        clear_framing_override: !clip.framing_override,
         webcam_corner: clip.webcam_corner,
         webcam_split_ratio: clip.webcam_split_ratio,
         pip_border_color: clip.pip_border_color,
         source_corner: clip.source_webcam_region?.locked_zone || 'auto',
+        safe_zone: mapSafeZoneToBackend(safeZoneGuide),
+        safe_zone_guide: safeZoneGuide,
+        show_hook: Boolean(clip.show_hook ?? clip.show_hook_banner),
+        show_hook_banner: Boolean(clip.show_hook ?? clip.show_hook_banner),
+        hook_banner_enabled: Boolean(clip.show_hook ?? clip.show_hook_banner),
+        hook_headline: (clip.show_hook ?? clip.show_hook_banner) ? (clip.hook_headline || '') : '',
+        hook_text: (clip.show_hook ?? clip.show_hook_banner) ? (clip.hook_headline || '') : '',
       })
         .then((res) => {
           if (controller.signal.aborted || res.status === 'superseded') return;
@@ -1529,14 +1531,39 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         window.clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
       }
+      if (previewTimerRef.current !== null) {
+        window.clearTimeout(previewTimerRef.current);
+        previewTimerRef.current = null;
+      }
       if (autoRenderAbortRef.current) {
         autoRenderAbortRef.current.abort();
         autoRenderAbortRef.current = null;
       }
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
+        previewAbortRef.current = null;
+      }
       preparingClipIdRef.current = null;
       setShowExactFrame(false);
       setExactFrameUrl(null);
+      setFrameLatencyMs(null);
+      setIsRenderingFrame(false);
       setIsAutoRendering(false);
+
+      if (!autoRender || !onAutoRenderClip) {
+        triggerNowAutoRenderRef.current = null;
+      } else {
+        const dispatchedSigImmediate = previewConfigSig;
+        const targetClipIdImmediate = clip.id;
+        const targetProjectIdImmediate = clip.project_id;
+        triggerNowAutoRenderRef.current = () => {
+          if (debounceTimerRef.current !== null) {
+            window.clearTimeout(debounceTimerRef.current);
+            debounceTimerRef.current = null;
+          }
+          triggerFastPreviewRender(targetClipIdImmediate, targetProjectIdImmediate, dispatchedSigImmediate, false);
+        };
+      }
 
       if (clipIsRendered) {
         lastRenderedHashByClipRef.current[clip.id] = previewConfigSig;
@@ -1553,7 +1580,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         return;
       }
 
-      // Clip is not rendered yet: immediately fire fast_preview so clicking any clip plays cleanly
+      // Clip is not rendered yet: fire Layer 2 fast preview frame AND Layer 3 MP4 immediately
+      void fetchExactFrame();
       if (onAutoRenderClip) {
         shouldAutoPlayRef.current = true;
         triggerFastPreviewRender(clip.id, clip.project_id, previewConfigSig, true);
@@ -1568,43 +1596,65 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       return;
     }
 
-    // Do not queue edit debounce while the initial unrendered clip preview is still preparing
-    if (preparingClipIdRef.current === clip.id) return;
-
-    if (lastRenderedHashByClipRef.current[clip.id] === previewConfigSig) return;
-
-    if (debounceTimerRef.current !== null) {
-      window.clearTimeout(debounceTimerRef.current);
+    if (lastRenderedHashByClipRef.current[clip.id] === previewConfigSig) {
+      triggerNowAutoRenderRef.current = null;
+      return;
     }
 
-    if (autoRender && onAutoRenderClip) {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
+    if (debounceTimerRef.current !== null) {
+      window.clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
+    }
+
+    const curLayoutKey = `${clip.framing_template || clip.frame_layout}|${clip.webcam_corner}|${clip.aspect_ratio}|${Boolean(clip.cold_open ?? clip.use_cold_open)}|${Boolean(clip.trim_dead_air ?? clip.auto_trim_dead_air)}|${safeZoneGuide}`;
+    const structuralLayoutChanged = prevLayoutKeyRef.current !== curLayoutKey;
+    prevLayoutKeyRef.current = curLayoutKey;
+
+    if (structuralLayoutChanged && videoRef.current && !videoRef.current.paused) {
+      videoRef.current.pause();
+      setIsPlaying(false);
+    }
+
+    // Layer 2: Immediate 0ms exact backend single-frame sync on template/layout changes (or 80ms while sliding)
+    previewTimerRef.current = window.setTimeout(() => {
+      void fetchExactFrame();
+    }, structuralLayoutChanged ? 0 : 80);
+
+    // Layer 3: Background fast_preview MP4 sync so pressing Play reflects the exact template
+    if (autoRender && onAutoRenderClip && preparingClipIdRef.current !== clip.id) {
       const dispatchedSig = previewConfigSig;
       const targetClipId = clip.id;
       const targetProjectId = clip.project_id;
+      triggerNowAutoRenderRef.current = () => {
+        if (debounceTimerRef.current !== null) {
+          window.clearTimeout(debounceTimerRef.current);
+          debounceTimerRef.current = null;
+        }
+        triggerFastPreviewRender(targetClipId, targetProjectId, dispatchedSig, false);
+      };
 
       debounceTimerRef.current = window.setTimeout(() => {
         triggerFastPreviewRender(targetClipId, targetProjectId, dispatchedSig, false);
       }, 900);
-
-      return () => {
-        if (debounceTimerRef.current !== null) {
-          window.clearTimeout(debounceTimerRef.current);
-        }
-      };
     }
 
-    if (isPlaying) return;
-    debounceTimerRef.current = window.setTimeout(() => {
-      void fetchExactFrame();
-    }, 350);
-
     return () => {
+      if (previewTimerRef.current !== null) {
+        window.clearTimeout(previewTimerRef.current);
+        previewTimerRef.current = null;
+      }
       if (debounceTimerRef.current !== null) {
         window.clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = null;
       }
     };
-  }, [clip?.id, previewConfigSig, autoRender, isPlaying, clipIsRendered, isStage5Rendering]);
+  }, [clip?.id, previewConfigSig, isPlaying, clipIsRendered, isStage5Rendering]);
 
+  // Also sync exact frame cleanly at 100ms whenever playhead scrubs/pauses on unrendered or edited clip
   useEffect(() => {
     if (!clip || isPlaying) return;
     const fxOrLayoutActive = Boolean(
@@ -1616,29 +1666,18 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         clip.dynamic_punch_zoom ??
         (clip.frame_layout && clip.frame_layout !== 'auto_track')
     );
-    if (!fxOrLayoutActive) return;
+    const hasPendingEdits = lastRenderedHashByClipRef.current[clip.id] !== previewConfigSig;
+    if (!hasPendingEdits && clipIsRendered && !fxOrLayoutActive) return;
+
     const timer = window.setTimeout(() => {
       void fetchExactFrame();
-    }, 180);
+    }, 100);
     return () => window.clearTimeout(timer);
-  }, [
-    clip?.id,
-    clip?.use_cold_open,
-    clip?.cold_open,
-    clip?.auto_trim_dead_air,
-    clip?.trim_dead_air,
-    clip?.dynamic_punch_zoom,
-    clip?.punch_zoom,
-    clip?.punch_zoom_intensity,
-    clip?.frame_layout,
-    clip?.webcam_corner,
-    clip?.source_webcam_region?.locked_zone,
-    isPlaying,
-  ]);
+  }, [clip?.id, relCurrent, isPlaying, clipIsRendered]);
 
   // Safe-Zone options mapped cleanly to existing backend values
   const safeZones = [
-    { value: 'No guide', label: 'None' },
+    { value: 'No guide', label: 'Off' },
     { value: 'TikTok', label: 'TikTok' },
     { value: 'Instagram', label: 'Reels' },
     { value: 'YT Shorts', label: 'Shorts' }
@@ -1647,6 +1686,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   // Exact aspect ratio math for guaranteed zero-overflow sizing
   const getAspectNumeric = (ar?: string) => {
     switch (ar) {
+      case '2.39:1':
+        return 2.39;
       case '16:9':
         return 16 / 9;
       case '1:1':
@@ -1707,8 +1748,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         aspect_ratio: clip.aspect_ratio,
         custom_width: clip.custom_width,
         custom_height: clip.custom_height,
-        frame_layout: clip.frame_layout,
-        framing_template: clip.frame_layout,
+        frame_layout: clip.framing_template || clip.frame_layout,
+        framing_template: clip.framing_template || clip.frame_layout,
         framing_user_locked: clip.framing_user_locked,
         webcam_corner: clip.webcam_corner,
         source_corner: clip.source_webcam_region?.locked_zone || 'auto',
@@ -1746,15 +1787,57 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       ? 'none'
       : clip && !videoFilterAlreadyBaked
         ? (() => {
+          const presetKey = String(clip.color_preset || 'none').toLowerCase();
+          const pInt = Math.max(0, Math.min(1, (clip.preset_intensity ?? 100) / 100));
+          let pb = 0;
+          let pc = 1;
+          let ps = 1;
+          let pSep = 0;
+          let pGray = 0;
+          let pHue = 0;
+          if (presetKey === 'noir_bw' || presetKey === 'high_contrast_bw') {
+            pGray = 1 * pInt;
+            pc = 1 + 0.25 * pInt;
+          } else if (presetKey === 'vintage_polaroid' || presetKey === 'fuji_classic_chrome') {
+            pSep = 0.28 * pInt;
+            pc = 1 - 0.08 * pInt;
+          } else if (presetKey === 'neon_cyber' || presetKey === 'cyberpunk_neon') {
+            ps = 1 + 0.45 * pInt;
+            pc = 1 + 0.14 * pInt;
+            pHue = -12 * pInt;
+          } else if (presetKey === 'matrix_acid') {
+            pHue = 68 * pInt;
+            pc = 1 + 0.18 * pInt;
+            ps = 1 + 0.25 * pInt;
+          } else if (presetKey === 'cinematic_warm' || presetKey === 'golden_hour' || presetKey === 'kodak_2383') {
+            pSep = 0.16 * pInt;
+            ps = 1 + 0.15 * pInt;
+            pc = 1 + 0.10 * pInt;
+          } else if (presetKey === 'blockbuster_teal_orange' || presetKey === 'teal_orange') {
+            pc = 1 + 0.16 * pInt;
+            ps = 1 + 0.22 * pInt;
+            pHue = -8 * pInt;
+          } else if (presetKey === 'dream_glow' || presetKey === 'pastel_cream') {
+            pb = 0.06 * pInt;
+            ps = 1 - 0.12 * pInt;
+          } else if (presetKey === 'crimson_drama') {
+            pHue = -16 * pInt;
+            pc = 1 + 0.20 * pInt;
+            ps = 1 + 0.18 * pInt;
+          } else if (presetKey !== 'none' && presetKey !== '') {
+            pc = 1 + 0.08 * pInt;
+            ps = 1 + 0.12 * pInt;
+          }
+
           const expShift = (clip.exposure || 0) * 0.65 + (clip.shadows || 0) / 500 + (clip.highlights || 0) / 600;
-          const b = Math.max(0.25, 1 + (clip.brightness || 0) + expShift);
-          const c = Math.max(0.3, (clip.contrast ?? 1.0) - (clip.matte_fade || 0) / 500);
-          const bw = Math.max(0, Math.min(1, clip.black_and_white || 0));
+          const b = Math.max(0.25, 1 + pb + (clip.brightness || 0) + expShift);
+          const c = Math.max(0.3, pc * (clip.contrast ?? 1.0) - (clip.matte_fade || 0) / 500);
+          const bw = Math.max(pGray, Math.max(0, Math.min(1, clip.black_and_white || 0)));
           const vib = 1 + (clip.vibrance || 0) / 220;
-          const s = Math.max(0, (clip.saturation ?? 1.0) * (1 - bw) * vib);
-          const sep = Math.max(0, Math.min(0.45, Math.max(0, (clip.color_temp || 0) / 160) + (clip.vintage || 0) * 0.65));
+          const s = Math.max(0, ps * (clip.saturation ?? 1.0) * (1 - bw) * vib);
+          const sep = Math.max(pSep, Math.max(0, Math.min(0.55, Math.max(0, (clip.color_temp || 0) / 160) + (clip.vintage || 0) * 0.65)));
           const bl = Math.max(0, (clip.blur || 0) * 6);
-          const tempDeg = ((clip.color_temp || 0) / 100) * -12 + (clip.warmth || 0) * -22 + ((clip.tint_shift || 0) / 100) * 14;
+          const tempDeg = pHue + ((clip.color_temp || 0) / 100) * -12 + (clip.warmth || 0) * -22 + ((clip.tint_shift || 0) / 100) * 14;
           const parts = [
             `brightness(${b.toFixed(2)})`,
             `contrast(${c.toFixed(2)})`,
@@ -1768,86 +1851,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         })()
         : 'none';
 
-  const refreshYouTubeStatus = async () => {
-    setIsLoadingYtStatus(true);
-    try {
-      const st = await api.getYouTubeStatus();
-      setYtStatus(st);
-      if (st.connected) {
-        setShowOAuthSetup(false);
-      }
-    } catch (err: any) {
-      setYtAuthError(err?.message || 'Could not inspect YouTube connection status.');
-    } finally {
-      setIsLoadingYtStatus(false);
-    }
-  };
-
-  useEffect(() => {
-    if (isPublishModalOpen) {
-      void refreshYouTubeStatus();
-    }
-  }, [isPublishModalOpen]);
-
   const handleOpenPublish = () => {
-    if (clip) {
-      setPublishTitle(clip.selected_title || clip.youtube_titles?.[0] || 'Viral Video #Shorts');
-      const baseDesc = (clip.youtube_description || 'Created with Lost Heaven Studio! #Shorts').trim();
-      const extraTags = (clip.hashtags || '').trim();
-      setPublishDesc(extraTags && !baseDesc.includes(extraTags) ? `${baseDesc}\n\n${extraTags}` : baseDesc);
-      setPublishPrivacy(clip.privacy_status || 'private');
-      setPublishSuccess(null);
-      setPublishError(null);
-      setYtAuthError(null);
-      setSocialCopy(null);
-    }
     setIsPublishModalOpen(true);
-  };
-
-  const handleUploadClientSecrets = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
-    setIsUploadingSecrets(true);
-    setYtAuthError(null);
-    try {
-      const nextStatus = await api.uploadYouTubeClientSecrets(file);
-      setYtStatus(nextStatus);
-    } catch (err: any) {
-      setYtAuthError(err?.message || 'Failed to save Google OAuth Client JSON.');
-    } finally {
-      setIsUploadingSecrets(false);
-    }
-  };
-
-  const handleConnectYouTube = async () => {
-    if (!ytStatus?.client_configured) {
-      setShowOAuthSetup(true);
-      setYtAuthError('Upload your Google OAuth Client JSON first to connect your YouTube channel.');
-      return;
-    }
-    setIsConnectingYt(true);
-    setYtAuthError(null);
-    try {
-      const nextStatus = await api.connectYouTube();
-      setYtStatus(nextStatus);
-      setShowOAuthSetup(false);
-    } catch (err: any) {
-      setYtAuthError(err?.message || 'YouTube OAuth connection failed.');
-    } finally {
-      setIsConnectingYt(false);
-    }
-  };
-
-  const handleDisconnectYouTube = async () => {
-    setYtAuthError(null);
-    try {
-      const nextStatus = await api.disconnectYouTube();
-      setYtStatus(nextStatus);
-      setPublishSuccess(null);
-    } catch (err: any) {
-      setYtAuthError(err?.message || 'Failed to disconnect YouTube channel.');
-    }
   };
 
   const handleExportPublishPack = async () => {
@@ -1863,81 +1868,6 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     }
   };
 
-  const handleGenerateSocialCopy = async () => {
-    if (!clip) return;
-    setIsGeneratingCopy(true);
-    try {
-      const res = await api.generateSocialCopy(clip.project_id, clip.id);
-      const plats = res?.platforms as Partial<PlatformCopyMap> | undefined;
-      if (plats) {
-        setSocialCopy(plats);
-        const cur = plats[activeCopyPlatform] || plats.youtube_shorts;
-        if (cur && activeCopyPlatform === 'youtube_shorts') {
-          if (cur.title) setPublishTitle(cur.title);
-          const tags = Array.isArray(cur.hashtags) ? cur.hashtags.join(' ') : '';
-          setPublishDesc([cur.description || '', tags].filter(Boolean).join('\n\n'));
-        }
-      }
-    } catch (err: any) {
-      setPublishError(err?.message || 'Failed to generate copy');
-    } finally {
-      setIsGeneratingCopy(false);
-    }
-  };
-
-  const handleCopyText = (key: string, text: string) => {
-    navigator.clipboard?.writeText(text).catch(() => { });
-    setCopiedField(key);
-    window.dispatchEvent(
-      new CustomEvent('lh-toast', {
-        detail: { message: 'Copied social copy & hashtags to clipboard', type: 'success' },
-      })
-    );
-    window.setTimeout(() => setCopiedField(null), 1500);
-  };
-
-  const handlePublishSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!clip) return;
-    if (!ytStatus?.connected) {
-      setPublishError('YouTube account not linked. Connect your channel before uploading.');
-      return;
-    }
-    setIsPublishing(true);
-    setPublishSuccess(null);
-    setPublishError(null);
-    try {
-      const hashtagMatches = publishDesc.match(/#[A-Za-z0-9_]+/g) || [];
-      const cleanTags = Array.from(new Set(hashtagMatches.map((h) => h.replace(/^#/, ''))));
-      const res = await api.publishToYouTube(
-        clip.id,
-        {
-          title: publishTitle,
-          description: publishDesc,
-          tags: cleanTags.length > 0 ? cleanTags : undefined,
-          privacy_status: publishPrivacy,
-        },
-        clip.project_id
-      );
-      setPublishSuccess({
-        video_id: res.video_id,
-        url: res.url,
-        privacy_status: res.privacy_status || publishPrivacy,
-        channel_title: res.channel_title,
-      });
-      onUpdateClip?.({
-        youtube_url: res.url,
-        selected_title: publishTitle,
-        youtube_description: publishDesc,
-        privacy_status: publishPrivacy,
-      });
-    } catch (err: any) {
-      setPublishError(err?.message || 'YouTube upload failed.');
-    } finally {
-      setIsPublishing(false);
-    }
-  };
-
   const tiltDeg =
     !videoFilterAlreadyBaked && Math.abs(clip?.horizon_tilt || 0) > 0.05
       ? (clip?.horizon_tilt || 0)
@@ -1947,139 +1877,104 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
 
   return (
     <aside className="w-[420px] xl:w-[460px] shrink-0 h-full min-h-0 box-border overflow-hidden border-l border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none">
-      {/* Top Control Strip: 2-Row Responsive Toolbar (Studio Tools + Safe-Zone Guide Switcher) */}
+      {/* Top Control Strip: Clean 2-Row Toolbar (Live Sync + Canvas Tools + Safe Zone & Canvas) */}
       <div className="px-3 py-2 border-b border-[var(--border-subtle)] space-y-1.5 shrink-0">
-        {/* Row 1: Status & Studio Tools */}
-        <div className="flex flex-wrap items-center justify-between gap-1.5">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={toggleAutoRender}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap ${autoRender
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              title="Automatically render fast preview MP4 when edits change (900ms debounce)"
-            >
-              {isAutoRendering ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
-              ) : (
-                <Zap className="w-3 h-3" />
-              )}
-              <span>{isAutoRendering ? 'Syncing' : 'Auto-render'}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                if (!showExactFrame) fetchExactFrame();
-                else setShowExactFrame(false);
-              }}
-              disabled={isRenderingFrame || !clip}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 tabular-nums whitespace-nowrap ${showExactFrame
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              title="Render single exact graded FFmpeg frame"
-            >
-              {isRenderingFrame ? (
-                <RefreshCw className="w-3 h-3 animate-spin text-[var(--accent-primary)]" />
-              ) : (
-                <Eye className="w-3 h-3" />
-              )}
-              <span>
-                {isRenderingFrame
-                  ? 'Frame'
-                  : showExactFrame
-                    ? `Live${frameLatencyMs !== null ? ` ${frameLatencyMs}ms` : ''}`
-                    : 'Frame'}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => void handleRunRetentionAudit()}
-              disabled={isAuditing || !clip}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 tabular-nums whitespace-nowrap ${isAuditOpen
-                ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
-                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              title="Second-by-second retention curve & drop-off auditor"
-            >
-              {isAuditing ? (
-                <Loader2 className="w-3 h-3 animate-spin text-[var(--accent-primary)]" />
-              ) : (
-                <Activity className="w-3 h-3" />
-              )}
-              <span>
-                {retentionAudit ? `${retentionAudit.overall_score}` : 'Audit'}
-              </span>
-            </button>
+        {/* Row 1: Live Sync Status & Canvas Tools */}
+        <div className="flex items-center justify-between gap-1 overflow-x-auto no-scrollbar">
+          <div
+            className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-semibold border border-[var(--accent-primary)]/40 bg-[var(--accent-subtle)] text-[var(--accent-primary)] shrink-0 whitespace-nowrap"
+            title={
+              isAutoRendering
+                ? 'Syncing full fast-preview MP4 in background'
+                : 'Always-on 3-layer live sync (0ms CSS + 100ms frame + 900ms MP4)'
+            }
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isRenderingFrame || isAutoRendering
+                  ? 'bg-amber-400 animate-pulse'
+                  : 'bg-emerald-400'
+              }`}
+            />
+            <span>
+              {isRenderingFrame
+                ? 'Syncing...'
+                : frameLatencyMs !== null
+                  ? `Live Sync · ${Math.max(1, frameLatencyMs)}ms`
+                  : isAutoRendering
+                    ? 'Live Sync · MP4'
+                    : 'Live Sync'}
+            </span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-1 shrink-0">
-            {onOpenAnalysisWorkstation && (
-              <button
-                type="button"
-                disabled={!clip}
-                onClick={onOpenAnalysisWorkstation}
-                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-primary)] hover:border-[var(--accent-primary)]/50 transition shrink-0 whitespace-nowrap disabled:opacity-45"
-                title="Open AI Analysis & Best-Frame Workstation"
-              >
-                <Sparkles className="w-3 h-3 text-[var(--accent-primary)]" />
-                <span>AI Analysis</span>
-              </button>
-            )}
-            <button
-              type="button"
-              disabled={!clip}
-              onClick={() => setIsEditFrameOpen((prev) => !prev)}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap disabled:opacity-45 ${isEditFrameOpen
+          <button
+            type="button"
+            disabled={!clip}
+            onClick={() => setIsEditFrameOpen((prev) => !prev)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap disabled:opacity-45 ${
+              isEditFrameOpen
                 ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
                 : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-primary)]/40'
-                }`}
-              title="Visually drag or resize source webcam box and subject focus anchor"
-            >
-              <Crop className="w-3 h-3" />
-              <span>Edit Frame Box</span>
-            </button>
+            }`}
+            title="Visually drag or resize source crop box and focus anchor"
+          >
+            <Crop className="w-3 h-3" />
+            <span>Edit Crop Box</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={!clip}
+            onClick={() => setFreeformCaptionMode((prev) => !prev)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${
+              freeformCaptionMode
+                ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+            title="Toggle interactive free-form caption placement box"
+          >
+            <Move className="w-3 h-3" />
+            <span>Drag Captions</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={!clip}
+            onClick={() => setShowCanvasThirds((prev) => !prev)}
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap disabled:opacity-45 ${
+              showCanvasThirds
+                ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
+                : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+            }`}
+            title="Toggle 3x3 Rule-of-Thirds composition grid"
+          >
+            <Grid className="w-3 h-3" />
+            <span>Grid</span>
+          </button>
+
+          {onCompareOriginalChange && (
             <button
               type="button"
               disabled={!clip}
-              onClick={() => {
-                if (!clip) return;
-                setThumbHeadline(clip.hook_headline || clip.selected_title || 'WATCH THIS');
-                setThumbFormat(clip.aspect_ratio === '16:9' ? '16:9' : '9:16');
-                setThumbAccentColor(clip.active_color || '#C6F32F');
-                setThumbCustomTimestamp(null);
-                setThumbError(null);
-                setIsThumbModalOpen(true);
-              }}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-primary)]/40 transition shrink-0 whitespace-nowrap disabled:opacity-45"
-              title="Open AI Thumbnail & Cover Designer"
+              onPointerDown={() => onCompareOriginalChange(true)}
+              onPointerUp={() => onCompareOriginalChange(false)}
+              onPointerLeave={() => onCompareOriginalChange(false)}
+              onPointerCancel={() => onCompareOriginalChange(false)}
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${
+                compareOriginal
+                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
+                  : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+              }`}
+              title="Hold to preview raw ungraded source frame"
             >
-              <ImageIcon className="w-3 h-3 text-[var(--accent-primary)]" />
-              <span>Cover</span>
+              <Eye className="w-3 h-3" />
+              <span>Hold Original</span>
             </button>
-            <button
-              type="button"
-              disabled={!clip}
-              onClick={() => setIsPreflightOpen((prev) => !prev)}
-              className={`px-2 py-1 rounded-lg text-[10px] font-bold border transition shrink-0 tabular-nums whitespace-nowrap disabled:opacity-45 ${!preflightReport || preflightReport.status === 'pass'
-                ? 'bg-emerald-500/10 border-emerald-500/35 text-emerald-400'
-                : preflightReport.status === 'warn'
-                  ? 'bg-amber-500/10 border-amber-500/40 text-amber-400'
-                  : 'bg-red-500/10 border-red-500/40 text-red-400'
-                }`}
-              title="Toggle Pre-Flight Readiness Checklist"
-            >
-              {preflightReport ? `${preflightReport.readiness_score}/100` : 'Safe'}
-            </button>
-          </div>
+          )}
         </div>
 
-        {/* Row 2: Safe-Zone Guide Switcher + Compare Original (Hold) */}
-        <div className="flex flex-wrap items-center justify-between gap-1.5">
+        {/* Row 2: Safe Zone & Canvas */}
+        <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5 min-w-0">
             <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider shrink-0">
               Safe Zone:
@@ -2090,10 +1985,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                   key={g.value}
                   type="button"
                   onClick={() => onSafeZoneChange(g.value)}
-                  className={`px-2 py-0.5 rounded-md text-[10px] font-semibold transition whitespace-nowrap shrink-0 ${safeZoneGuide === g.value
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
+                  className={`px-2 py-0.5 rounded-md text-[10px] font-semibold transition whitespace-nowrap shrink-0 ${
+                    safeZoneGuide === g.value
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
                 >
                   {g.label}
                 </button>
@@ -2101,62 +1997,32 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
+            <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider hidden sm:inline">
+              Canvas:
+            </span>
             <div
               className="flex items-center gap-0.5 bg-[var(--bg-input)] p-0.5 rounded-lg border border-[var(--border-subtle)] shrink-0"
               title="Preview canvas zoom"
             >
               {([
                 { id: 'fit' as const, label: 'Fit' },
-                { id: '75' as const, label: '75%' },
                 { id: '100' as const, label: '100%' },
               ]).map((zm) => (
                 <button
                   key={zm.id}
                   type="button"
                   onClick={() => setCanvasZoom(zm.id)}
-                  className={`px-1.5 py-0.5 rounded text-[9px] font-bold transition ${canvasZoom === zm.id
-                    ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                    }`}
+                  className={`px-2 py-0.5 rounded text-[10px] font-bold transition ${
+                    canvasZoom === zm.id
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
+                      : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
                 >
                   {zm.label}
                 </button>
               ))}
             </div>
-
-            <button
-              type="button"
-              disabled={!clip}
-              onClick={() => setFreeformCaptionMode((prev) => !prev)}
-              className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${freeformCaptionMode
-                ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
-                : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                }`}
-              title="Toggle free-form interactive caption drag box"
-            >
-              <Move className="w-3 h-3" />
-              <span>Drag Captions</span>
-            </button>
-
-            {onCompareOriginalChange && (
-              <button
-                type="button"
-                disabled={!clip}
-                onPointerDown={() => onCompareOriginalChange(true)}
-                onPointerUp={() => onCompareOriginalChange(false)}
-                onPointerLeave={() => onCompareOriginalChange(false)}
-                onPointerCancel={() => onCompareOriginalChange(false)}
-                className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${compareOriginal
-                  ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
-                  : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                  }`}
-                title="Hold to bypass color grade & preview raw source frame"
-              >
-                <Eye className="w-3 h-3" />
-                <span>Original (Hold)</span>
-              </button>
-            )}
           </div>
         </div>
       </div>
@@ -2441,32 +2307,35 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         </div>
       )}
 
-      {/* Auto-Scaled & Zoomable Preview Stage */}
+      {/* Auto-Scaled & Maximized Portrait Preview Stage */}
       <div
         ref={stageRef}
-        className={`flex-1 min-h-0 flex items-center justify-center p-3 bg-[var(--bg-canvas)] ${canvasZoom === '100' ? 'overflow-auto' : 'overflow-hidden'}`}
+        className={`flex-1 min-h-0 flex items-center justify-center p-2 bg-[var(--bg-canvas)] ${canvasZoom === '100' ? 'overflow-auto' : 'overflow-hidden'}`}
       >
         <div
           style={{ width: `${displayFrameWidth}px`, height: `${displayFrameHeight}px` }}
-          className="relative shrink-0 bg-black rounded-[24px] p-1.5 border-2 border-[var(--border-subtle)] shadow-xl flex flex-col overflow-hidden transition-all duration-200"
+          className="relative shrink-0 bg-black rounded-[26px] p-1.5 border-2 border-[var(--border-subtle)] shadow-2xl flex flex-col overflow-hidden transition-all duration-200"
         >
           <div
             ref={previewStageBoxRef}
             className="relative w-full h-full rounded-[18px] overflow-hidden bg-[#0A0A0A] flex items-center justify-center"
           >
-            {compareOriginal && rawFrameUrl ? (
+            {compareOriginal && rawFrameUrl && (
               <img
                 src={rawFrameUrl}
                 alt="Original Ungraded Frame"
-                className="w-full h-full object-cover"
+                className="absolute inset-0 z-[6] w-full h-full object-cover pointer-events-none"
               />
-            ) : showExactFrame && exactFrameUrl ? (
+            )}
+            {!compareOriginal && showExactFrame && exactFrameUrl && (!isPlaying || !videoFilterAlreadyBaked) && (
               <img
                 src={exactFrameUrl}
+                onClick={togglePlay}
                 alt="Exact FFmpeg Graded Frame"
-                className="w-full h-full object-cover"
+                className="absolute inset-0 z-[5] w-full h-full object-cover cursor-pointer"
               />
-            ) : activeVideoSrc ? (
+            )}
+            {activeVideoSrc ? (
               <video
                 key={`${clip?.project_id ?? 0}-${clip?.id ?? 0}-${videoVersion}`}
                 ref={videoRef}
@@ -2502,7 +2371,17 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                 onClick={togglePlay}
                 style={{
                   filter: videoCssFilter,
-                  transform: tiltDeg !== 0 ? `rotate(${tiltDeg}deg) scale(${tiltScale.toFixed(3)})` : undefined,
+                  transform: (() => {
+                    if (videoFilterAlreadyBaked || !clip) {
+                      return tiltDeg !== 0 ? `rotate(${tiltDeg}deg) scale(${tiltScale.toFixed(3)})` : undefined;
+                    }
+                    const zVal = Math.max(1, Number(clip.zoom || 1));
+                    const pVal = Number(clip.pan_x_offset || 0);
+                    const totalScale = zVal * tiltScale;
+                    const txPct = -pVal * 32;
+                    if (Math.abs(totalScale - 1) < 0.005 && Math.abs(txPct) < 0.2 && tiltDeg === 0) return undefined;
+                    return `translateX(${txPct.toFixed(1)}%) scale(${totalScale.toFixed(3)}) rotate(${tiltDeg}deg)`;
+                  })(),
                 }}
                 className="w-full h-full object-cover cursor-pointer transition-[filter,transform] duration-75"
                 playsInline
@@ -2541,12 +2420,80 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             )}
 
-            {isPreparingClip && activeVideoSrc && (
+            {isPreparingClip && activeVideoSrc && !(showExactFrame && exactFrameUrl) && (
               <div className="absolute inset-0 z-30 bg-black/65 backdrop-blur-[2px] flex flex-col items-center justify-center p-4 text-center pointer-events-none">
                 <Loader2 className="w-7 h-7 mb-2 animate-spin text-[var(--accent-primary)]" />
                 <span className="text-xs font-semibold text-white">Preparing preview...</span>
               </div>
             )}
+
+            {/* Layer 1 (0ms) Geometric Framing Template Guides + Live Captions when playing / awaiting 100ms PNG */}
+            {!showExactFrame && !videoFilterAlreadyBaked && clip && (() => {
+              const lay = clip.framing_template || clip.frame_layout || 'auto_track';
+              const activeWords = (clip.transcript_words || []).filter(
+                (w) => !(w as any).muted && relCurrent >= (w.start - 0.15) && relCurrent <= (w.end + 0.15)
+              );
+              const capX = clip.caption_x ?? ((clip.position_x ?? 50) / 100);
+              const capY = clip.caption_y ?? ((clip.position_y ?? 78) / 100);
+              const capRot = clip.caption_rotation ?? 0;
+              const capMaxW = Math.max(0.45, Math.min(0.92, clip.caption_max_width ?? 0.82));
+              return (
+                <>
+                  {lay === 'webcam_gameplay_split' && (
+                    <div className="pointer-events-none absolute inset-x-0 top-[38%] border-t-2 border-white/35 z-10" />
+                  )}
+                  {lay === 'split_podcast' && (
+                    <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t-2 border-white/35 z-10" />
+                  )}
+                  {lay === 'triple_gaming_hud' && (
+                    <>
+                      <div className="pointer-events-none absolute inset-x-0 top-[26%] border-t-2 border-white/35 z-10" />
+                      <div className="pointer-events-none absolute inset-x-0 top-[78%] border-t-2 border-white/35 z-10" />
+                    </>
+                  )}
+                  {lay === 'side_by_side_50_50' && (
+                    <div className="pointer-events-none absolute inset-y-0 left-1/2 border-l-2 border-white/35 z-10" />
+                  )}
+                  {(lay === 'gameplay_webcam_pip' || lay === 'portrait_pip_badge') && (
+                    <div
+                      style={{ borderColor: clip.pip_border_color || '#F59E0B' }}
+                      className={`pointer-events-none absolute z-10 border-2 rounded-lg bg-black/25 ${
+                        (clip.webcam_corner || 'top_right').includes('bottom') ? 'bottom-4' : 'top-4'
+                      } ${(clip.webcam_corner || 'top_right').includes('left') ? 'left-3' : 'right-3'} ${
+                        lay === 'portrait_pip_badge' ? 'w-[27%] aspect-[3/4]' : 'w-[30%] aspect-[4/3]'
+                      }`}
+                    />
+                  )}
+                  {clip.burn_captions && activeWords.length > 0 && (
+                    <div
+                      style={{
+                        left: `${capX * 100}%`,
+                        top: `${capY * 100}%`,
+                        maxWidth: `${capMaxW * 100}%`,
+                        transform: `translate(-50%, -50%) rotate(${capRot}deg)`,
+                        color: clip.base_color || '#FFFFFF',
+                        fontWeight: clip.bold !== false ? 800 : 500,
+                        textShadow: '0 2px 6px rgba(0,0,0,0.95)',
+                      }}
+                      className="pointer-events-none absolute z-15 text-center leading-tight px-2 py-0.5 text-[11px] uppercase tracking-wide"
+                    >
+                      {activeWords.slice(0, 4).map((w, wi) => {
+                        const isSpeaking = relCurrent >= w.start && relCurrent <= w.end;
+                        return (
+                          <span
+                            key={`${wi}-${w.start}`}
+                            style={{ color: isSpeaking ? (clip.active_color || '#C6F32F') : (clip.base_color || '#FFFFFF') }}
+                            className="mx-0.5 inline-block"
+                          >
+                            {w.word}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
 
             {/* Rule-of-Thirds Overlay Grid on Studio Canvas */}
             {showCanvasThirds && !isEditFrameOpen && (
@@ -2559,7 +2506,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             )}
 
             {/* Top Hook Banner Fallback ONLY when showing raw unrendered video (never duplicate backend PNG/MP4 banners) */}
-            {!showExactFrame && !isRenderedSource && clip?.show_hook_banner && clip?.hook_headline && (
+            {!showExactFrame && !isRenderedSource && clip && Boolean(clip.show_hook ?? clip.show_hook_banner) && Boolean((clip.hook_headline || '').trim()) && (
               <div className="absolute top-6 left-3 right-3 z-20 pointer-events-none flex justify-center">
                 <div className="px-2.5 py-1 rounded-lg bg-black/80 border border-yellow-400 text-yellow-300 font-black text-[10px] uppercase tracking-wide shadow text-center leading-tight">
                   ★ {clip.hook_headline} ★
@@ -3067,7 +3014,17 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             {safeZoneGuide !== 'No guide' && (
               <div className="absolute inset-0 pointer-events-none z-10">
                 <div
-                  style={{ left: '9%', right: '9%', top: '4%' }}
+                  style={{
+                    left: '9%',
+                    right: '9%',
+                    top:
+                      safeZoneGuide === 'TikTok' ||
+                      safeZoneGuide === 'Instagram' ||
+                      safeZoneGuide === 'YT Shorts' ||
+                      safeZoneGuide === 'All'
+                        ? '13%'
+                        : '4%',
+                  }}
                   className="absolute border-t border-dashed border-[var(--accent-primary)]/60 pt-0.5 text-[9px] text-[var(--accent-primary)] font-mono text-center"
                 >
                   {safeZoneGuide} Safe Top
@@ -3403,7 +3360,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         );
       })()}
 
-      {/* Dedicated Export & Action Dock */}
+      {/* Clean Unified Export & Action Footer */}
       <div className="p-3 border-t border-[var(--border-subtle)] bg-[var(--bg-card)] space-y-2 shrink-0">
         {isRendering && (
           <div className="space-y-1 tabular-nums">
@@ -3420,6 +3377,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           </div>
         )}
 
+        {/* Primary Row: Re-render Clip + Download MP4 with Format Badge */}
         <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
@@ -3449,79 +3407,54 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             <a
               href={downloadUrl}
               download
-              className="h-9 px-3 rounded-xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 transition"
+              className="h-9 px-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 transition"
             >
-              <Download className="w-3.5 h-3.5" />
-              <span>Download MP4</span>
+              <Download className="w-3.5 h-3.5 shrink-0 text-[var(--accent-primary)]" />
+              <span className="truncate">Download MP4</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-[var(--bg-input)] border border-[var(--border-subtle)] text-[var(--text-secondary)] shrink-0">
+                {(clip?.clip_size && clip.clip_size !== 'Auto' ? clip.clip_size : '1080p')} H.264
+              </span>
             </a>
           ) : (
             <button
               type="button"
               disabled
-              className="h-9 px-3 rounded-xl bg-[var(--bg-input)] text-[var(--text-secondary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 opacity-50 cursor-not-allowed"
+              className="h-9 px-2.5 rounded-xl bg-[var(--bg-input)] text-[var(--text-secondary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 opacity-50 cursor-not-allowed"
               title="Render clip first to download MP4"
             >
-              <Download className="w-3.5 h-3.5" />
-              <span>Download MP4</span>
+              <Download className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">Download MP4</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-[var(--bg-card)] border border-[var(--border-subtle)] shrink-0">
+                {(clip?.clip_size && clip.clip_size !== 'Auto' ? clip.clip_size : '1080p')} H.264
+              </span>
             </button>
           )}
         </div>
 
+        {/* Secondary Row: Export & Deliver... + Post to YouTube */}
         <div className="grid grid-cols-2 gap-2">
           <button
             type="button"
-            onClick={handleOpenPublish}
-            disabled={!isCompleted}
-            className="h-8 px-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-red-500/40 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
-            title={isCompleted ? 'Publish rendered clip directly to YouTube & Social Studio' : 'Render clip first to publish'}
+            disabled={!clip}
+            onClick={() => setIsExportModalOpen(true)}
+            className="h-8 px-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
+            title="Open unified Export, Multi-Aspect Batch, Subtitles (.SRT/.VTT), NLE XML, AI Cover, and Publish Pack modal"
           >
-            <YouTubeIcon className="w-3.5 h-3.5 text-red-500 shrink-0" />
-            <span className="truncate">Export &amp; Publish</span>
+            <Package className="w-3.5 h-3.5 text-[var(--accent-primary)] shrink-0" />
+            <span className="truncate">Export &amp; Deliver...</span>
           </button>
 
-          {clip ? (
-            <select
-              aria-label="Export Pro NLE Format"
-              defaultValue=""
-              onChange={(e) => {
-                const fmt = e.target.value as 'fcpxml' | 'premiere' | 'edl' | 'srt' | 'vtt' | 'ass' | 'zip';
-                if (!fmt) return;
-                const url = api.getNleExportUrl(clip.project_id, clip.id, fmt);
-                window.open(url, '_blank');
-                e.target.value = '';
-              }}
-              className="h-8 px-2 rounded-xl bg-[var(--bg-surface)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-[11px] outline-none cursor-pointer"
-            >
-              <option value="" disabled>
-                Pro NLE &amp; Captions ▾
-              </option>
-              <option value="fcpxml">DaVinci / FCPXML</option>
-              <option value="premiere">Adobe Premiere .XML</option>
-              <option value="edl">CMX 3600 .EDL</option>
-              <option value="srt">Captions .SRT</option>
-              <option value="vtt">WebVTT .VTT</option>
-              <option value="ass">Styled Subtitles .ASS</option>
-              <option value="zip">Full Studio .ZIP</option>
-            </select>
-          ) : (
-            <div />
-          )}
+          <button
+            type="button"
+            onClick={handleOpenPublish}
+            disabled={!clip}
+            className="h-8 px-2.5 rounded-xl bg-[var(--bg-surface)] hover:border-red-500/40 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
+            title="Open Publish & Multi-Platform Social Studio"
+          >
+            <YouTubeIcon className="w-3.5 h-3.5 text-red-500 shrink-0" />
+            <span className="truncate">Publish &amp; Social</span>
+          </button>
         </div>
-
-        <button
-          type="button"
-          onClick={handleExportPublishPack}
-          disabled={!clip || isExportingPack}
-          className="w-full h-8 px-2.5 rounded-xl bg-[var(--accent-subtle)] hover:bg-[var(--accent-primary)] hover:text-[var(--accent-foreground)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40 font-bold text-[11px] flex items-center justify-center gap-1.5 transition disabled:opacity-45 disabled:cursor-not-allowed"
-          title="Export 9:16 + 4:5 + 16:9 MP4s, AI Cover Thumbnail, Captions .SRT, and Social Copy .TXT in one .zip"
-        >
-          {isExportingPack ? (
-            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-          ) : (
-            <Package className="w-3.5 h-3.5 shrink-0" />
-          )}
-          <span className="truncate">{isExportingPack ? 'Building Publish Pack...' : 'Download Multi-Platform Publish Pack (.zip)'}</span>
-        </button>
 
         {packError && (
           <div className="text-[10px] text-red-400 bg-red-500/10 border border-red-500/25 rounded-lg px-2 py-1 truncate">
@@ -3530,344 +3463,128 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         )}
       </div>
 
-      {/* YouTube & Multi-Platform Social Copy Publishing Modal */}
-      {isPublishModalOpen && (
+      {/* Unified Export & Deliver Studio Modal */}
+      {isExportModalOpen && clip && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4 animate-fadeIn">
-          <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl w-full max-w-xl max-h-[90vh] overflow-y-auto p-6 space-y-4 shadow-2xl text-[var(--text-primary)]">
+          <div className="bg-[var(--bg-surface)] border border-[var(--border-subtle)] rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-5 space-y-4 shadow-2xl text-[var(--text-primary)]">
             <div className="flex items-center justify-between border-b border-[var(--border-subtle)] pb-3">
               <div className="flex items-center gap-2 font-bold text-sm">
-                <YouTubeIcon className="w-5 h-5 text-red-500" />
-                <span>Publish &amp; Multi-Platform Social Studio</span>
+                <Package className="w-4 h-4 text-[var(--accent-primary)]" />
+                <span>Export &amp; Deliver Studio</span>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleGenerateSocialCopy}
-                  disabled={isGeneratingCopy || !clip}
-                  className="px-2.5 py-1.5 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent-primary)]/40 text-[var(--accent-primary)] hover:bg-[var(--accent-primary)] hover:text-[var(--accent-foreground)] text-[11px] font-bold flex items-center gap-1.5 transition disabled:opacity-50"
-                >
-                  {isGeneratingCopy ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <Sparkles className="w-3.5 h-3.5" />
-                  )}
-                  <span>{isGeneratingCopy ? 'Writing Copy...' : 'Generate Platform Copy'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setIsPublishModalOpen(false)}
-                  className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
+              <button
+                type="button"
+                onClick={() => setIsExportModalOpen(false)}
+                className="text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+              >
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 space-y-2.5 text-xs">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                {isLoadingYtStatus ? (
-                  <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    Checking YouTube channel status...
-                  </span>
-                ) : ytStatus?.connected ? (
-                  <span
-                    data-testid="yt-connected-badge"
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/40 text-[11px] font-bold"
-                  >
-                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                    <span>Connected: {ytStatus.channel_title || 'YouTube Channel'}</span>
-                  </span>
-                ) : (
-                  <span
-                    data-testid="yt-not-linked-badge"
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/40 text-[11px] font-bold"
-                  >
-                    <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                    <span>YouTube Not Linked</span>
-                  </span>
-                )}
-
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {ytStatus?.connected ? (
-                    <button
-                      type="button"
-                      onClick={handleDisconnectYouTube}
-                      className="px-2.5 py-1 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-red-400 hover:border-red-500/40 text-[11px] font-semibold flex items-center gap-1 transition"
-                    >
-                      <Unlink className="w-3 h-3" />
-                      <span>Disconnect</span>
-                    </button>
-                  ) : (
-                    <>
-                      <button
-                        type="button"
-                        onClick={() => setShowOAuthSetup((prev) => !prev)}
-                        className="px-2.5 py-1 rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[var(--text-primary)] hover:border-[var(--accent-primary)]/50 text-[11px] font-semibold flex items-center gap-1 transition"
-                      >
-                        <Upload className="w-3 h-3 text-[var(--accent-primary)]" />
-                        <span>Setup Google OAuth Client JSON</span>
-                        {showOAuthSetup ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleConnectYouTube}
-                        disabled={isConnectingYt}
-                        className="px-3 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[11px] font-bold flex items-center gap-1.5 transition disabled:opacity-50"
-                      >
-                        {isConnectingYt ? <Loader2 className="w-3 h-3 animate-spin" /> : <Link2 className="w-3 h-3" />}
-                        <span>{isConnectingYt ? 'Waiting for Google Sign-In...' : 'Connect YouTube Channel'}</span>
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              {!ytStatus?.connected && showOAuthSetup && (
-                <div className="rounded-lg bg-[var(--bg-surface)] border border-[var(--border-subtle)] p-3 space-y-2 text-[11px] text-[var(--text-muted)]">
-                  <ol className="list-decimal list-inside space-y-1 text-[var(--text-primary)]">
-                    <li>Open Google Cloud Console and enable the <strong>YouTube Data API v3</strong>.</li>
-                    <li>Go to <strong>Credentials -&gt; Create Credentials -&gt; OAuth client ID (Desktop app)</strong> and download the JSON.</li>
-                    <li>Upload your <code>client_secret_*.json</code> file below, then click <strong>Connect YouTube Channel</strong>.</li>
-                  </ol>
-                  <div className="flex items-center justify-between gap-2 pt-1 flex-wrap">
-                    <input
-                      ref={clientSecretsInputRef}
-                      type="file"
-                      accept=".json,application/json"
-                      onChange={handleUploadClientSecrets}
-                      className="hidden"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => clientSecretsInputRef.current?.click()}
-                      disabled={isUploadingSecrets}
-                      className="px-3 py-1.5 rounded-lg bg-[var(--accent-subtle)] border border-[var(--accent-primary)]/40 text-[var(--accent-primary)] font-bold flex items-center gap-1.5 hover:opacity-90 transition disabled:opacity-50"
-                    >
-                      {isUploadingSecrets ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
-                      <span>{isUploadingSecrets ? 'Saving JSON...' : 'Upload Google OAuth Client JSON'}</span>
-                    </button>
-                    {ytStatus?.client_configured && (
-                      <span className="text-[10px] font-semibold text-emerald-400">
-                        Client JSON configured
-                      </span>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {ytAuthError && (
-                <div className="rounded-lg bg-red-500/10 border border-red-500/40 px-2.5 py-2 text-[11px] text-red-400">
-                  {ytAuthError}
-                </div>
-              )}
-            </div>
-
-            {socialCopy && (
-              <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-input)] p-3 space-y-2.5 text-xs">
-                <div className="grid grid-cols-4 gap-1 bg-[var(--bg-surface)] p-1 rounded-lg border border-[var(--border-subtle)]">
-                  {([
-                    { id: 'youtube_shorts', label: 'YouTube' },
-                    { id: 'tiktok', label: 'TikTok' },
-                    { id: 'instagram_reels', label: 'Reels' },
-                    { id: 'x_twitter', label: 'X' },
-                  ] as const).map((tab) => (
-                    <button
-                      key={tab.id}
-                      type="button"
-                      onClick={() => setActiveCopyPlatform(tab.id)}
-                      className={`py-1 rounded-md text-[11px] font-bold transition ${activeCopyPlatform === tab.id
-                        ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)]'
-                        : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
-                        }`}
-                    >
-                      {tab.label}
-                    </button>
-                  ))}
-                </div>
-
-                {(() => {
-                  const entry = socialCopy[activeCopyPlatform];
-                  if (!entry) return null;
-                  const tagsStr = Array.isArray(entry.hashtags) ? entry.hashtags.join(' ') : '';
-                  const fullCopy = `${entry.title}\n\n${entry.description}${tagsStr ? `\n\n${tagsStr}` : ''}`;
-                  return (
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="font-bold text-[var(--text-primary)] truncate">
-                          {entry.title}
-                        </span>
-                        <div className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => handleCopyText(activeCopyPlatform, fullCopy)}
-                            className="px-2 py-1 rounded-md bg-[var(--bg-surface)] border border-[var(--border-subtle)] text-[10px] font-semibold flex items-center gap-1 hover:border-[var(--accent-primary)]/50"
-                          >
-                            {copiedField === activeCopyPlatform ? (
-                              <Check className="w-3 h-3 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3 h-3" />
-                            )}
-                            <span>{copiedField === activeCopyPlatform ? 'Copied' : 'Copy All'}</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setPublishTitle(entry.title || publishTitle);
-                              setPublishDesc([entry.description || '', tagsStr].filter(Boolean).join('\n\n'));
-                            }}
-                            className="px-2 py-1 rounded-md bg-[var(--accent-subtle)] text-[var(--accent-primary)] text-[10px] font-bold hover:opacity-90"
-                          >
-                            Apply Below
-                          </button>
-                        </div>
-                      </div>
-                      <p className="text-[11px] text-[var(--text-secondary)] whitespace-pre-line">
-                        {entry.description}
-                      </p>
-                      {entry.pinned_comment && (
-                        <div className="text-[10px] text-[var(--text-secondary)] bg-[var(--bg-surface)] px-2 py-1 rounded border border-[var(--border-subtle)]">
-                          <span className="font-semibold text-[var(--text-primary)]">Pinned: </span>
-                          {entry.pinned_comment}
-                        </div>
-                      )}
-                      {tagsStr && (
-                        <div className="text-[10px] font-mono text-[var(--accent-primary)] break-words">
-                          {tagsStr}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-            )}
-
-            <form onSubmit={handlePublishSubmit} className="space-y-3.5 text-xs">
-              <div>
-                <label className="text-[var(--text-secondary)] font-semibold block mb-1">
-                  Title (with #Shorts)
-                </label>
-                <input
-                  type="text"
-                  value={publishTitle}
-                  onChange={(e) => setPublishTitle(e.target.value)}
-                  className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-xl px-3 py-2 text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="text-[var(--text-secondary)] font-semibold block mb-1">
-                  Description & Hashtags
-                </label>
-                <textarea
-                  rows={3}
-                  value={publishDesc}
-                  onChange={(e) => setPublishDesc(e.target.value)}
-                  className="w-full bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-xl px-3 py-2 text-[var(--text-primary)] outline-none focus:border-[var(--accent-primary)]"
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-2 flex-wrap pt-1">
+            {/* Multi-Aspect Batch & Publish Pack */}
+            <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2.5">
+              <div className="flex items-center justify-between">
                 <div>
-                  <label className="text-[var(--text-secondary)] font-semibold block mb-1">Visibility</label>
-                  <select
-                    value={publishPrivacy}
-                    onChange={(e) => setPublishPrivacy(e.target.value as 'private' | 'unlisted' | 'public')}
-                    className="bg-[var(--bg-input)] border border-[var(--border-subtle)] rounded-lg px-2.5 py-1.5 text-[var(--text-primary)] outline-none"
-                  >
-                    <option value="private">Private</option>
-                    <option value="unlisted">Unlisted</option>
-                    <option value="public">Public</option>
-                  </select>
-                </div>
-
-                <div className="flex items-center gap-2 flex-wrap ml-auto">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleCopyText('modal_copy', `${publishTitle}\n\n${publishDesc}`.trim())
-                    }
-                    className="px-3 py-2 rounded-xl bg-[var(--bg-elevated)] hover:border-[var(--accent-primary)]/50 text-[var(--text-primary)] border border-[var(--border-subtle)] font-semibold text-xs flex items-center gap-1.5 transition"
-                  >
-                    {copiedField === 'modal_copy' ? (
-                      <Check className="w-3.5 h-3.5 text-emerald-400" />
-                    ) : (
-                      <Copy className="w-3.5 h-3.5" />
-                    )}
-                    <span>{copiedField === 'modal_copy' ? 'Copied' : 'Copy Title & Hashtags'}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleExportPublishPack}
-                    disabled={!clip || isExportingPack}
-                    className="px-3 py-2 rounded-xl bg-[var(--accent-subtle)] hover:bg-[var(--accent-primary)] hover:text-[var(--accent-foreground)] text-[var(--accent-primary)] border border-[var(--accent-primary)]/40 font-bold text-xs flex items-center gap-1.5 transition disabled:opacity-45"
-                  >
-                    {isExportingPack ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Package className="w-3.5 h-3.5" />}
-                    <span>{isExportingPack ? 'Building Zip...' : 'Download Social Pack (.zip)'}</span>
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={isPublishing || !ytStatus?.connected || !isCompleted}
-                    title={
-                      !ytStatus?.connected
-                        ? 'Connect your YouTube channel above before uploading'
-                        : !isCompleted
-                        ? 'Render clip MP4 first'
-                        : 'Upload rendered MP4 to your connected YouTube channel'
-                    }
-                    className={`px-4 py-2 font-bold text-xs rounded-xl transition shadow-md flex items-center gap-1.5 ${
-                      ytStatus?.connected
-                        ? 'bg-red-600 hover:bg-red-700 text-white disabled:opacity-50'
-                        : 'bg-[var(--bg-elevated)] text-[var(--text-muted)] border border-[var(--border-subtle)] opacity-70 cursor-not-allowed'
-                    }`}
-                  >
-                    {isPublishing ? <Loader2 className="w-4 h-4 animate-spin" /> : <YouTubeIcon className="w-4 h-4" />}
-                    <span>
-                      {!ytStatus?.connected
-                        ? 'Connect YouTube to Upload'
-                        : isPublishing
-                        ? 'Uploading rendered MP4 to YouTube...'
-                        : 'Upload Video'}
-                    </span>
-                  </button>
-                </div>
-              </div>
-
-              {publishSuccess && (
-                <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/35 text-emerald-400 space-y-1.5 text-xs">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-bold">
-                      Uploaded to {publishSuccess.channel_title || 'YouTube'} ({publishSuccess.privacy_status})
-                    </span>
-                    <a
-                      href={publishSuccess.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="underline font-bold inline-flex items-center gap-1 shrink-0"
-                    >
-                      <span>Open on YouTube</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  </div>
-                  <div className="break-all font-mono text-[11px]">{publishSuccess.url}</div>
-                  <p className="text-[10px] text-[var(--text-muted)] leading-snug">
-                    Note: Unverified Google Cloud OAuth apps upload videos as <strong>Private</strong> in YouTube Studio by default until Google app verification is approved.
+                  <h4 className="text-xs font-bold text-[var(--text-primary)]">Multi-Aspect Social Publish Pack</h4>
+                  <p className="text-[10px] text-[var(--text-secondary)]">
+                    Exports 9:16 + 4:5 + 16:9 MP4s, Cover PNG, .SRT subtitles &amp; social copy in one .zip
                   </p>
                 </div>
-              )}
+              </div>
+              <button
+                type="button"
+                onClick={handleExportPublishPack}
+                disabled={isExportingPack}
+                className="w-full h-9 px-3 rounded-xl bg-[var(--accent-primary)] text-[var(--accent-foreground)] font-bold text-xs flex items-center justify-center gap-1.5 hover:opacity-90 transition disabled:opacity-50"
+              >
+                {isExportingPack ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Package className="w-3.5 h-3.5" />}
+                <span>{isExportingPack ? 'Building Multi-Aspect Publish Pack...' : 'Download Multi-Aspect Publish Pack (.zip)'}</span>
+              </button>
+            </div>
 
-              {publishError && (
-                <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/40 text-red-400 text-xs break-words">
-                  {publishError}
-                </div>
-              )}
-            </form>
+            {/* Captions & Pro NLE Timelines */}
+            <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2">
+              <h4 className="text-xs font-bold text-[var(--text-primary)]">Captions &amp; Pro NLE Timelines</h4>
+              <div className="grid grid-cols-3 gap-1.5">
+                {([
+                  { id: 'srt' as const, label: 'Captions .SRT' },
+                  { id: 'vtt' as const, label: 'WebVTT .VTT' },
+                  { id: 'ass' as const, label: 'Styled .ASS' },
+                  { id: 'fcpxml' as const, label: 'DaVinci / FCPXML' },
+                  { id: 'premiere' as const, label: 'Premiere .XML' },
+                  { id: 'edl' as const, label: 'CMX 3600 .EDL' },
+                ]).map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => window.open(api.getNleExportUrl(clip.project_id, clip.id, item.id), '_blank')}
+                    className="py-2 px-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] text-[11px] font-semibold text-[var(--text-primary)] transition truncate"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Cover PNG & Studio Diagnostics */}
+            <div className="p-3.5 rounded-xl bg-[var(--bg-card)] border border-[var(--border-subtle)] space-y-2">
+              <h4 className="text-xs font-bold text-[var(--text-primary)]">Cover Artwork &amp; Delivery QA</h4>
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExportModalOpen(false);
+                    setThumbHeadline(clip.hook_headline || clip.selected_title || 'WATCH THIS');
+                    setThumbFormat(clip.aspect_ratio === '16:9' ? '16:9' : '9:16');
+                    setThumbAccentColor(clip.active_color || '#C6F32F');
+                    setThumbCustomTimestamp(null);
+                    setThumbError(null);
+                    setIsThumbModalOpen(true);
+                  }}
+                  className="py-2 px-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] text-[11px] font-semibold flex items-center justify-center gap-1 transition"
+                >
+                  <ImageIcon className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  <span>Cover PNG</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExportModalOpen(false);
+                    setIsPreflightOpen(true);
+                    void handleRunPreflight(true);
+                  }}
+                  className="py-2 px-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] text-[11px] font-semibold flex items-center justify-center gap-1 transition"
+                >
+                  <Shield className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Pre-Flight Check</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsExportModalOpen(false);
+                    void handleRunRetentionAudit(true);
+                  }}
+                  className="py-2 px-2 rounded-lg bg-[var(--bg-input)] border border-[var(--border-subtle)] hover:border-[var(--accent-primary)] text-[11px] font-semibold flex items-center justify-center gap-1 transition"
+                >
+                  <Activity className="w-3.5 h-3.5 text-[var(--accent-primary)]" />
+                  <span>Retention Audit</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}
+
+      {/* Publish & Multi-Platform Social Studio 2-Column Workstation Modal */}
+      <PublishModal
+        isOpen={isPublishModalOpen}
+        clip={clip}
+        videoUrl={activeVideoSrc}
+        previewFrameUrl={exactFrameUrl}
+        clipIsRendered={clipIsRendered}
+        onClose={() => setIsPublishModalOpen(false)}
+        onUpdateClip={onUpdateClip}
+      />
 
       {/* Depth-Layer AI Thumbnail & Cover Designer Modal */}
       {isThumbModalOpen && clip && (

@@ -396,6 +396,7 @@ def _analyze_speaker_diarization(
     raw_dual_f0: np.ndarray,
     mel_fb_small: np.ndarray,
     dct_small: np.ndarray,
+    raw_vocal_ratio: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Vectorized acoustic utterance speaker diarization (`Speaker A..D`), dominance ratios,
@@ -632,7 +633,24 @@ def _analyze_speaker_diarization(
     switches = sum(1 for i in range(1, len(turns)) if turns[i]["speaker_id"] != turns[i - 1]["speaker_id"])
     switch_rate = round((switches / max(1.0, float(total_dur))) * 10.0, 2)
 
-    # Cross-talk overlap detection: high spectral entropy + dual-pitch competing bursts
+    # Require genuine multi-speaker turn dynamics before attributing simultaneous crosstalk clashes:
+    # at least 2 speakers with >= 22% dominance each + >= 3 speaker turns within a 15s window.
+    meaningful_speakers = [sp for sp, ratio in dominance_ratios.items() if float(ratio) >= 0.22]
+    max_turns_15s = 0
+    for ti in range(len(turns)):
+        t_win_start = float(turns[ti]["start"])
+        distinct_win = set()
+        turns_in_win = 0
+        for tj in range(ti, len(turns)):
+            if float(turns[tj]["start"]) - t_win_start > 15.0:
+                break
+            turns_in_win += 1
+            distinct_win.add(turns[tj]["speaker_id"])
+        if len(distinct_win) >= 2 and turns_in_win > max_turns_15s:
+            max_turns_15s = turns_in_win
+    has_debate_turns = len(meaningful_speakers) >= 2 and max_turns_15s >= 3
+
+    # Cross-talk overlap detection: requires >=2 meaningful speakers, rapid turns, human formant dominance (300-3400Hz), and dual-pitch bursts
     turn_change_times = [turns[i]["start"] for i in range(1, len(turns))]
     ct_overlaps: List[Dict[str, Any]] = []
     ct_start_idx: Optional[int] = None
@@ -643,10 +661,16 @@ def _analyze_speaker_diarization(
         ent = float(raw_entropy[b])
         dual_r = float(raw_dual_ratio[b])
         hnr_v = float(pt["hnr_norm"])
+        vocal_r = float(raw_vocal_ratio[b]) if raw_vocal_ratio is not None else 1.0
         near_switch = any(abs(float(pt["t"]) - st) <= 0.65 for st in turn_change_times)
         dual_hit = dual_r >= 0.44 and float(raw_dual_f0[b]) >= 75.0 and (ent >= 0.28 or hnr_v < 0.85)
         dense_clash = ent >= 0.68 and rms_v >= 0.28 and (dual_r >= 0.28 or near_switch or float(pt["flux"]) >= 0.28)
-        is_ct = bool(rms_v >= 0.20 and (dual_hit or dense_clash))
+        is_ct = bool(
+            has_debate_turns
+            and vocal_r >= 0.25
+            and rms_v >= 0.20
+            and (dual_hit or dense_clash)
+        )
         pt["is_crosstalk"] = is_ct
         pt["spectral_entropy"] = round(ent, 4)
 
@@ -661,25 +685,35 @@ def _analyze_speaker_diarization(
         elif ct_start_idx is not None:
             t0 = float(timeline[ct_start_idx]["t"])
             t1 = round(float(timeline[b - 1]["t"]) + step, 3)
+            if (b - ct_start_idx) >= 2 or max(ct_confs) >= 0.72:
+                ct_overlaps.append({
+                    "t": round(t0, 2),
+                    "end": round(t1, 2),
+                    "confidence": round(sum(ct_confs) / max(1, len(ct_confs)), 3),
+                    "spectral_entropy": round(max(ct_ents), 3),
+                })
+            else:
+                for clr_i in range(ct_start_idx, b):
+                    timeline[clr_i]["is_crosstalk"] = False
+            ct_start_idx = None
+    if ct_start_idx is not None:
+        t0 = float(timeline[ct_start_idx]["t"])
+        t1 = round(float(timeline[-1]["t"]) + step, 3)
+        if (len(timeline) - ct_start_idx) >= 2 or max(ct_confs) >= 0.72:
             ct_overlaps.append({
                 "t": round(t0, 2),
                 "end": round(t1, 2),
                 "confidence": round(sum(ct_confs) / max(1, len(ct_confs)), 3),
                 "spectral_entropy": round(max(ct_ents), 3),
             })
-            ct_start_idx = None
-    if ct_start_idx is not None:
-        t0 = float(timeline[ct_start_idx]["t"])
-        t1 = round(float(timeline[-1]["t"]) + step, 3)
-        ct_overlaps.append({
-            "t": round(t0, 2),
-            "end": round(t1, 2),
-            "confidence": round(sum(ct_confs) / max(1, len(ct_confs)), 3),
-            "spectral_entropy": round(max(ct_ents), 3),
-        })
+        else:
+            for clr_i in range(ct_start_idx, len(timeline)):
+                timeline[clr_i]["is_crosstalk"] = False
 
     return {
         "speaker_count": len(speakers_meta),
+        "meaningful_speaker_count": len(meaningful_speakers),
+        "max_turns_15s": max_turns_15s,
         "speakers": speakers_meta,
         "dominance_ratios": dominance_ratios,
         "turns": turns,
@@ -1331,6 +1365,7 @@ def analyze_audio_track(
     sub_bass_mask = (freqs >= 25.0) & (freqs <= 180.0)
     music_low_mask = (freqs >= 50.0) & (freqs <= 180.0)
     tonal_band_mask = (freqs >= 50.0) & (freqs <= 2000.0)
+    vocal_formant_mask = (freqs >= 300.0) & (freqs <= 3400.0)
     entropy_band_mask = (freqs >= 100.0) & (freqs <= 4500.0)
     high_air_mask = (freqs >= 1200.0) & (freqs <= 6000.0)
     bright_mask = freqs >= 2000.0
@@ -1356,6 +1391,7 @@ def analyze_audio_track(
     raw_sub_bass_db = np.full(n_bins, -70.0, dtype=np.float32)
     raw_low_music_ratio = np.zeros(n_bins, dtype=np.float32)
     raw_tonal_ratio = np.zeros(n_bins, dtype=np.float32)
+    raw_vocal_ratio = np.zeros(n_bins, dtype=np.float32)
     raw_high_air = np.zeros(n_bins, dtype=np.float32)
     raw_laugh = np.zeros(n_bins, dtype=np.float32)
     prev_norm_mag: Optional[np.ndarray] = None
@@ -1426,6 +1462,8 @@ def analyze_audio_track(
 
         if np.any(music_low_mask):
             raw_low_music_ratio[b0:b1] = np.where(valid, np.sum(power_mat[:, music_low_mask], axis=1) / tot_pows, 0.0)
+        if np.any(vocal_formant_mask):
+            raw_vocal_ratio[b0:b1] = np.where(valid, np.sum(power_mat[:, vocal_formant_mask], axis=1) / tot_pows, 0.0)
 
         # Vectorized pitch + HNR + dual-pitch cross-talk cue
         f0_b, hnr_b, dual_r_b, dual_f0_b = _estimate_pitch_hnr_dual_batch(chunks, sr)
@@ -1705,6 +1743,7 @@ def analyze_audio_track(
         raw_dual_f0=raw_dual_f0,
         mel_fb_small=mel_fb_small,
         dct_small=dct_small,
+        raw_vocal_ratio=raw_vocal_ratio,
     )
     speech_fluency = _analyze_speech_fluency(
         clean_words=clean_words,

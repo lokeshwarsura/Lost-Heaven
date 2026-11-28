@@ -20,7 +20,7 @@ from app.config import settings
 from app.database import init_db, get_session
 from app.models import (
     Project, ViralClip, BrandPreset, CaptionStylePreset,
-    YouTubeImportRequest, UpdateClipRequest, UpdateClipMetadataRequest, PublishYouTubeRequest,
+    YouTubeImportRequest, UpdateClipRequest, UpdateClipMetadataRequest, PublishYouTubeRequest, YouTubeCredentialsRequest,
     RenderClipRequest, TrimClipRequest, UpdateSegmentsRequest, MergeClipsRequest,
     DiarizeClipRequest, UpdateSpeakersRequest, ExtractCalloutsRequest,
     TranslateClipRequest, DubClipRequest, CompileTrailerRequest, GenerateThumbnailRequest,
@@ -41,6 +41,7 @@ from app.services.gemini_clipper import (
     DEFAULT_MODEL_CASCADE
 )
 from app.services.transcriber import transcribe_clip, filter_filler_words, reset_whisper_model_cache
+from app.services.caption_renderer import coerce_strict_bool, resolve_hook_banner_state
 from app.services.system_profiler import (
     profile_system_specs,
     build_first_run_recommendations,
@@ -49,12 +50,14 @@ from app.services.system_profiler import (
 )
 from app.services.renderer import render_clip_ultra, RenderSupersededError
 from app.services.preview_frame import render_exact_preview_frame
+from app.services.reframer import canonicalize_framing_template
 from app.services.timeline_editor import extract_waveform_bins
 from app.services.broll_engine import suggest_broll_cutaways
 from app.services.nle_exporter import export_clip_nle
 from app.services.exporter import export_pro_master, export_full_res_cover_png, export_multi_aspect_batch_zip
 from app.services.hook_generator import generate_hook_variants
 from app.services.social_copywriter import generate_multi_platform_copy
+from app.services.social_publisher import generate_all_platform_social_copy, build_social_pack_zip
 from app.services.publish_pack import build_publish_pack_zip
 from app.services.retention_auditor import audit_clip_retention
 from app.services.diarizer import diarize_clip_speakers
@@ -79,6 +82,7 @@ from app.services.youtube_publisher import (
     get_youtube_status,
     is_youtube_authenticated,
     save_youtube_client_secrets,
+    save_youtube_oauth_credentials,
     upload_clip_to_youtube,
 )
 from app.services.job_manager import job_manager, get_persisted_settings, save_persisted_settings
@@ -727,7 +731,14 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
     clip_opts = clip_obj.get_options() if clip_obj else {}
     if isinstance(req.options, dict):
         clip_opts = {**clip_opts, **req.options}
-    if req.framing_override is not None:
+    explicit_clear_override_prev = bool(
+        req.clear_framing_override
+        or ("framing_override" in req.model_fields_set and req.framing_override is None)
+        or ("frame_crop_override" in req.model_fields_set and req.frame_crop_override is None)
+    )
+    if explicit_clear_override_prev:
+        clip_framing_override = None
+    elif req.framing_override is not None:
         clip_framing_override = req.framing_override
 
     if not target_video_path and proj_id:
@@ -776,6 +787,46 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "bypass_color": bool(req.bypass_color),
     }
 
+    raw_hook_flag_prev = next(
+        (
+            v
+            for v in (
+                req.show_hook,
+                req.top_hook_banner,
+                req.enable_hook_banner,
+                req.hook_banner_enabled,
+                req.show_hook_banner,
+            )
+            if v is not None
+        ),
+        clip_opts.get(
+            "show_hook",
+            bool(clip_obj.show_hook_banner) if clip_obj is not None else True,
+        ),
+    )
+    raw_hook_text_prev = (
+        req.hook_text
+        if req.hook_text is not None
+        else (
+            req.hook_headline
+            if req.hook_headline
+            else (clip_obj.hook_headline if clip_obj is not None and req.hook_headline == "" else req.hook_headline)
+        )
+    )
+    eff_show_hook_prev, eff_hook_text_prev = resolve_hook_banner_state(
+        show_hook=raw_hook_flag_prev,
+        hook_text=raw_hook_text_prev,
+    )
+    eff_safe_zone_prev = (
+        req.safe_zone
+        if req.safe_zone is not None
+        else (
+            req.safe_zone_guide
+            if req.safe_zone_guide is not None
+            else clip_opts.get("safe_zone", "none")
+        )
+    )
+
     caption_options = {
         "caption_style": req.style_preset or req.caption_style,
         "caption_font": req.font_family or req.caption_font,
@@ -816,8 +867,12 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "word_by_word": req.word_by_word,
         "clean_filler_words": req.clean_filler_words,
         "censor_profanity": req.censor_profanity,
-        "show_hook_banner": req.hook_banner_enabled if req.hook_banner_enabled is not None else req.show_hook_banner,
-        "hook_headline": req.hook_headline,
+        "show_hook": eff_show_hook_prev,
+        "show_hook_banner": eff_show_hook_prev,
+        "hook_banner_enabled": eff_show_hook_prev,
+        "hook_headline": eff_hook_text_prev,
+        "hook_text": eff_hook_text_prev,
+        "safe_zone": eff_safe_zone_prev,
         "retention_bar_enabled": req.retention_bar_enabled,
         "retention_bar_color": req.retention_bar_color,
         "outro_cta_enabled": req.outro_cta_enabled,
@@ -858,6 +913,19 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
         "silence_threshold": rflags["silence_threshold"],
     }
 
+    eff_tpl_prev = (
+        req.framing_template
+        if req.framing_template is not None
+        else (
+            req.frame_layout
+            if ("frame_layout" in req.model_fields_set or clip_obj is None)
+            else (
+                getattr(clip_obj, "framing_template", None)
+                or clip_opts.get("framing_template")
+                or clip_obj.frame_layout
+            )
+        )
+    )
     try:
         result = render_exact_preview_frame(
             video_path=target_video_path,
@@ -865,7 +933,9 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             aspect_ratio=req.aspect_ratio,
             custom_width=req.custom_width,
             custom_height=req.custom_height,
-            frame_layout=req.framing_template or req.frame_layout,
+            frame_layout=eff_tpl_prev,
+            framing_template=eff_tpl_prev,
+            clear_framing_override=explicit_clear_override_prev,
             webcam_corner=req.webcam_corner,
             source_corner=req.source_corner or (
                 (clip_webcam_region or {}).get("locked_zone") if isinstance(clip_webcam_region, dict) else None
@@ -884,6 +954,12 @@ def preview_frame_endpoint(req: PreviewFrameRequest, session: Session = Depends(
             color_grading=color_grading,
             burn_captions=req.burn_captions,
             caption_options=caption_options,
+            show_hook=eff_show_hook_prev,
+            show_hook_banner=eff_show_hook_prev,
+            hook_banner_enabled=eff_show_hook_prev,
+            hook_text=eff_hook_text_prev,
+            hook_headline=eff_hook_text_prev,
+            safe_zone=eff_safe_zone_prev,
             transcript_words=transcript_words,
             clip_start_time=clip_start_time,
             clip_duration=clip_duration,
@@ -1824,6 +1900,7 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     cdict["best_frames"] = clip.get_best_frames()
     opts = clip.get_options()
     cdict["options"] = opts
+    cdict["social_copy"] = opts.get("social_copy")
     cdict["pill_color"] = opts.get("pill_color", "")
     cdict["pacing_density"] = opts.get("pacing_density", "3-4 Words Viral")
     cdict["text_case"] = opts.get("text_case", "ALL CAPS" if clip.all_caps else "As Spoken")
@@ -1857,9 +1934,22 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
         ("outro_logo_path", None),
     ):
         cdict[k_opt] = opts.get(k_opt, k_def)
+    cdict["framing_template"] = (
+        getattr(clip, "framing_template", None)
+        or opts.get("framing_template")
+        or clip.frame_layout
+    )
+    cdict["frame_layout"] = cdict["framing_template"]
     cdict["cold_open"] = bool(getattr(clip, "use_cold_open", False))
     cdict["trim_dead_air"] = bool(getattr(clip, "auto_trim_dead_air", False))
     cdict["punch_zoom"] = bool(getattr(clip, "dynamic_punch_zoom", False))
+    eff_ser_hook = (
+        coerce_strict_bool(opts["show_hook"])
+        if "show_hook" in opts and opts.get("show_hook") is not None
+        else bool(getattr(clip, "show_hook_banner", True))
+    )
+    cdict["show_hook"] = eff_ser_hook
+    cdict["show_hook_banner"] = eff_ser_hook
     cdict["caption_x"] = float(opts["caption_x"]) if opts.get("caption_x") is not None else round(float(clip.position_x or 50.0) / 100.0, 4)
     cdict["caption_y"] = float(opts["caption_y"]) if opts.get("caption_y") is not None else round(float(clip.position_y or 78.0) / 100.0, 4)
     cdict["caption_custom_position"] = bool(opts.get("caption_custom_position", False))
@@ -1895,8 +1985,10 @@ def _serialize_clip(clip: ViralClip, project: Optional[Project] = None) -> Dict[
     if has_rendered:
         try:
             ver = int(os.path.getmtime(rendered_file) * 1000)
+            cdict["video_size_bytes"] = int(os.path.getsize(rendered_file))
         except OSError:
             ver = int(time.time() * 1000)
+            cdict["video_size_bytes"] = None
         stream_url = f"/api/clips/{clip.project_id}/{clip.id}/video?v={ver}"
         cdict["rendered_path"] = rendered_file
         cdict["rendered_video_path"] = rendered_file
@@ -2598,9 +2690,15 @@ def get_clip(clip_id: int, session: Session = Depends(get_session)):
     return _serialize_clip(clip, project)
 
 @app.patch("/api/clips/{clip_id}")
-def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends(get_session)):
+@app.patch("/api/clips/{project_id}/{clip_id}")
+def update_clip(
+    clip_id: int,
+    req: UpdateClipRequest,
+    project_id: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
     clip = session.get(ViralClip, clip_id)
-    if not clip:
+    if not clip or (project_id is not None and clip.project_id != project_id):
         raise HTTPException(status_code=404, detail="Clip not found")
 
     # Time boundaries & multi-segment blade cuts
@@ -2625,10 +2723,27 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
             clip.set_keep_segments(clamped or [[clip.start_time, clip.end_time]])
 
     # Hooks & Retention
-    if req.hook_headline is not None:
-        clip.hook_headline = req.hook_headline
-    if req.show_hook_banner is not None:
-        clip.show_hook_banner = req.show_hook_banner
+    raw_hook_text_upd = req.hook_headline if req.hook_headline is not None else req.hook_text
+    if raw_hook_text_upd is not None:
+        clip.hook_headline = raw_hook_text_upd
+    raw_hook_toggle_upd = next(
+        (
+            v
+            for v in (
+                req.show_hook,
+                req.top_hook_banner,
+                req.enable_hook_banner,
+                req.hook_banner_enabled,
+                req.show_hook_banner,
+            )
+            if v is not None
+        ),
+        None,
+    )
+    if raw_hook_toggle_upd is not None:
+        clip.show_hook_banner = coerce_strict_bool(raw_hook_toggle_upd)
+    elif isinstance(req.options, dict) and "show_hook" in req.options and req.options.get("show_hook") is not None:
+        clip.show_hook_banner = coerce_strict_bool(req.options.get("show_hook"))
     if req.cold_open_quote is not None:
         clip.cold_open_quote = req.cold_open_quote
     if req.cold_open_climax is not None:
@@ -2647,13 +2762,19 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.dynamic_punch_zoom = bool(req.punch_zoom)
     elif req.dynamic_punch_zoom is not None:
         clip.dynamic_punch_zoom = bool(req.dynamic_punch_zoom)
+    if req.options is not None and isinstance(req.options, dict):
+        clip.set_options(req.options)
     clip.set_options({
         "cold_open": bool(clip.use_cold_open),
         "trim_dead_air": bool(clip.auto_trim_dead_air),
         "punch_zoom": bool(clip.dynamic_punch_zoom),
+        "show_hook": bool(clip.show_hook_banner),
+        **(
+            {"safe_zone": req.safe_zone if req.safe_zone is not None else req.safe_zone_guide}
+            if (req.safe_zone is not None or req.safe_zone_guide is not None)
+            else {}
+        ),
     })
-    if req.options is not None and isinstance(req.options, dict):
-        clip.set_options(req.options)
 
     # Step 1: Layout & Framing
     if req.aspect_ratio is not None:
@@ -2662,12 +2783,15 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.custom_width = req.custom_width
     if req.custom_height is not None:
         clip.custom_height = req.custom_height
-    if req.frame_layout is not None:
-        clip.frame_layout = req.frame_layout
-        clip.set_options({"framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
-    elif req.framing_template is not None:
-        clip.frame_layout = req.framing_template
-        clip.set_options({"framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
+    chosen_tpl_upd = req.framing_template if req.framing_template is not None else req.frame_layout
+    if chosen_tpl_upd is not None:
+        canon_upd = canonicalize_framing_template(chosen_tpl_upd)
+        clip.frame_layout = canon_upd
+        clip.framing_template = canon_upd
+        clip.set_options({
+            "framing_template": canon_upd,
+            "framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked),
+        })
     elif req.framing_user_locked is not None:
         clip.set_options({"framing_user_locked": bool(req.framing_user_locked)})
     if req.webcam_corner is not None:
@@ -2676,7 +2800,13 @@ def update_clip(clip_id: int, req: UpdateClipRequest, session: Session = Depends
         clip.webcam_split_ratio = req.webcam_split_ratio
     if req.source_webcam_region is not None:
         clip.set_source_webcam_region(req.source_webcam_region)
-    if req.framing_override is not None:
+    if (
+        req.clear_framing_override is True
+        or ("framing_override" in req.model_fields_set and req.framing_override is None)
+        or ("frame_crop_override" in req.model_fields_set and req.frame_crop_override is None)
+    ):
+        clip.set_framing_override(None)
+    elif req.framing_override is not None:
         clip.set_framing_override(req.framing_override)
     if req.pip_border_color is not None:
         clip.pip_border_color = req.pip_border_color
@@ -4455,21 +4585,71 @@ def generate_clip_social_copy_endpoint(
     clip_id: int,
     session: Session = Depends(get_session),
 ):
-    """Generate tailored YouTube Shorts, TikTok, Instagram Reels, and X copy + hashtags."""
+    """Generate tailored YouTube Shorts, Instagram Reels, TikTok, and X copy + hashtags (Gemini & Offline AI)."""
     clip = session.get(ViralClip, clip_id)
     project = session.get(Project, project_id)
     if not clip or not project or clip.project_id != project_id:
         raise HTTPException(status_code=404, detail="Clip not found")
     api_key, gemini_model = _resolve_gemini_runtime()
-    res = generate_multi_platform_copy(
-        transcript_words=clip.get_transcript(),
-        hook_headline=clip.hook_headline or "",
-        selected_title=clip.selected_title or "",
-        existing_description=clip.youtube_description or "",
+    res = generate_all_platform_social_copy(
+        clip=clip,
+        project=project,
         api_key=api_key,
         preferred_model=gemini_model,
     )
-    return {"clip_id": clip.id, "project_id": project_id, **res}
+    try:
+        opts = clip.get_options()
+        opts["social_copy"] = {
+            "youtube": res.get("youtube"),
+            "instagram": res.get("instagram"),
+            "tiktok": res.get("tiktok"),
+            "x": res.get("x"),
+        }
+        clip.set_options(opts)
+        session.add(clip)
+        session.commit()
+    except Exception:
+        pass
+    return res
+
+
+@app.get("/api/clips/{project_id}/{clip_id}/social-pack")
+def download_social_pack_endpoint(
+    project_id: int,
+    clip_id: int,
+    session: Session = Depends(get_session),
+):
+    """
+    Build and download `<clip_slug>_social_pack.zip` containing `<clip_slug>_final.mp4`,
+    `cover_thumbnail.png`, `captions.srt`, `youtube_shorts.txt`, `instagram_reels.txt`, and `tiktok.txt`.
+    Auto-renders the MP4 cleanly if not yet rendered on disk.
+    """
+    clip = session.get(ViralClip, clip_id)
+    project = session.get(Project, project_id)
+    if not clip or not project or clip.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Clip not found")
+    api_key, gemini_model = _resolve_gemini_runtime()
+    try:
+        zip_path, zip_filename = build_social_pack_zip(
+            clip=clip,
+            project=project,
+            session=session,
+            api_key=api_key,
+            gemini_model=gemini_model,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    try:
+        from app.services.analytics_ledger import record_export_event
+        record_export_event(session, clip, event_type="social_pack")
+    except Exception:
+        pass
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=zip_filename,
+        headers={"Content-Disposition": f'attachment; filename="{zip_filename}"'},
+    )
 
 
 @app.post("/api/clips/{project_id}/{clip_id}/export-publish-pack")
@@ -4703,6 +4883,10 @@ def update_clip_metadata(
         clip.pinned_comment = req.pinned_comment
     if req.privacy_status is not None:
         clip.privacy_status = req.privacy_status
+    if req.social_copy is not None and isinstance(req.social_copy, dict):
+        opts = clip.get_options()
+        opts["social_copy"] = req.social_copy
+        clip.set_options(opts)
 
     session.add(clip)
     session.commit()
@@ -4738,7 +4922,8 @@ def _render_clip_from_snapshot(
         aspect_ratio=clip_data["aspect_ratio"],
         custom_width=clip_data["custom_width"],
         custom_height=clip_data["custom_height"],
-        frame_layout=clip_data["frame_layout"],
+        frame_layout=clip_data.get("framing_template") or clip_data["frame_layout"],
+        framing_template=clip_data.get("framing_template") or clip_data["frame_layout"],
         webcam_corner=clip_data["webcam_corner"],
         webcam_split_ratio=clip_data["webcam_split_ratio"],
         source_webcam_region=clip_data.get("source_webcam_region"),
@@ -4812,8 +4997,27 @@ def _render_clip_from_snapshot(
         outro_cta_text=clip_data.get("outro_cta_text", "Subscribe for More"),
         broll_segments=clip_data.get("broll_segments") or [],
         hardware_mode=clip_data["hardware_mode"],
-        hook_headline=clip_data["hook_headline"],
-        show_hook_banner=clip_data["show_hook_banner"],
+        hook_headline=(
+            clip_data["hook_headline"]
+            if (clip_data.get("show_hook") if clip_data.get("show_hook") is not None else clip_data["show_hook_banner"])
+            else ""
+        ),
+        hook_text=(
+            clip_data.get("hook_text", clip_data["hook_headline"])
+            if (clip_data.get("show_hook") if clip_data.get("show_hook") is not None else clip_data["show_hook_banner"])
+            else ""
+        ),
+        show_hook_banner=bool(
+            clip_data.get("show_hook") if clip_data.get("show_hook") is not None else clip_data["show_hook_banner"]
+        ),
+        show_hook=bool(
+            clip_data.get("show_hook") if clip_data.get("show_hook") is not None else clip_data["show_hook_banner"]
+        ),
+        safe_zone=str(
+            clip_data.get("safe_zone")
+            if clip_data.get("safe_zone") is not None
+            else ((clip_data.get("options") or {}).get("safe_zone", "none"))
+        ),
         cold_open_quote=clip_data["cold_open_quote"],
         use_cold_open=clip_data["use_cold_open"],
         auto_trim_dead_air=clip_data["auto_trim_dead_air"],
@@ -4917,7 +5121,24 @@ def _snapshot_clip(clip: ViralClip) -> Dict[str, Any]:
     snap["visual_map"] = clip.get_visual_map()
     snap["framing_override"] = clip.get_framing_override()
     snap["best_frames"] = clip.get_best_frames()
-    snap["options"] = clip.get_options()
+    snap_opts = clip.get_options()
+    snap["options"] = snap_opts
+    snap_tpl = (
+        getattr(clip, "framing_template", None)
+        or snap_opts.get("framing_template")
+        or clip.frame_layout
+    )
+    snap["framing_template"] = snap_tpl
+    snap["frame_layout"] = snap_tpl
+    eff_snap_show_hook = (
+        coerce_strict_bool(snap_opts["show_hook"])
+        if "show_hook" in snap_opts and snap_opts.get("show_hook") is not None
+        else bool(getattr(clip, "show_hook_banner", True))
+    )
+    snap["show_hook"] = eff_snap_show_hook
+    snap["show_hook_banner"] = eff_snap_show_hook
+    snap["hook_text"] = (clip.hook_headline or "") if eff_snap_show_hook else ""
+    snap["safe_zone"] = str(snap_opts.get("safe_zone", "none") or "none")
     return snap
 
 
@@ -5044,10 +5265,40 @@ def trigger_render(
             clip.dynamic_punch_zoom = bool(req.dynamic_punch_zoom); dirty_req = True
         if req.punch_zoom_intensity is not None:
             clip.punch_zoom_intensity = max(1.04, min(1.35, float(req.punch_zoom_intensity))); dirty_req = True
+        raw_hook_text_rnd = req.hook_headline if req.hook_headline is not None else req.hook_text
+        if raw_hook_text_rnd is not None and str(raw_hook_text_rnd).strip():
+            clip.hook_headline = raw_hook_text_rnd; dirty_req = True
+        raw_hook_toggle_rnd = next(
+            (
+                v
+                for v in (
+                    req.show_hook,
+                    req.top_hook_banner,
+                    req.enable_hook_banner,
+                    req.hook_banner_enabled,
+                    req.show_hook_banner,
+                )
+                if v is not None
+            ),
+            None,
+        )
+        if raw_hook_toggle_rnd is not None:
+            clip.show_hook_banner = coerce_strict_bool(raw_hook_toggle_rnd); dirty_req = True
+        elif isinstance(req.options, dict) and "show_hook" in req.options and req.options.get("show_hook") is not None:
+            clip.show_hook_banner = coerce_strict_bool(req.options.get("show_hook")); dirty_req = True
+        if req.options is not None and isinstance(req.options, dict):
+            merged_opts = dict(req.options)
+            merged_opts["show_hook"] = bool(clip.show_hook_banner)
+            if req.safe_zone is not None or req.safe_zone_guide is not None:
+                merged_opts["safe_zone"] = req.safe_zone if req.safe_zone is not None else req.safe_zone_guide
+            clip.set_options(merged_opts); dirty_req = True
+        elif req.safe_zone is not None or req.safe_zone_guide is not None:
+            clip.set_options({"safe_zone": req.safe_zone if req.safe_zone is not None else req.safe_zone_guide}); dirty_req = True
         clip.set_options({
             "cold_open": bool(clip.use_cold_open),
             "trim_dead_air": bool(clip.auto_trim_dead_air),
             "punch_zoom": bool(clip.dynamic_punch_zoom),
+            "show_hook": bool(clip.show_hook_banner),
         })
         if req.silence_threshold is not None:
             clip.silence_threshold = max(0.25, min(2.0, float(req.silence_threshold))); dirty_req = True
@@ -5090,17 +5341,24 @@ def trigger_render(
             ov = getattr(req, opt_o, None)
             if ov is not None:
                 clip.set_options({opt_o: ov}); dirty_req = True
-        if req.framing_template is not None:
-            clip.frame_layout = canonicalize_framing_template(req.framing_template)
-            clip.set_options({"framing_template": clip.frame_layout, "framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
-            dirty_req = True
-        elif req.frame_layout is not None:
-            clip.frame_layout = canonicalize_framing_template(req.frame_layout)
-            clip.set_options({"framing_template": clip.frame_layout, "framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
+        chosen_rnd_tpl = req.framing_template if req.framing_template is not None else req.frame_layout
+        if chosen_rnd_tpl is not None:
+            canon_rnd = canonicalize_framing_template(chosen_rnd_tpl)
+            clip.frame_layout = canon_rnd
+            clip.framing_template = canon_rnd
+            clip.set_options({"framing_template": canon_rnd, "framing_user_locked": True if req.framing_user_locked is None else bool(req.framing_user_locked)})
             dirty_req = True
         elif req.framing_user_locked is not None:
             clip.set_options({"framing_user_locked": bool(req.framing_user_locked)})
             dirty_req = True
+        if (
+            req.clear_framing_override is True
+            or ("framing_override" in req.model_fields_set and req.framing_override is None)
+            or ("frame_crop_override" in req.model_fields_set and req.frame_crop_override is None)
+        ):
+            clip.set_framing_override(None); dirty_req = True
+        elif req.framing_override is not None:
+            clip.set_framing_override(req.framing_override); dirty_req = True
         if req.webcam_corner is not None:
             clip.webcam_corner = req.webcam_corner; dirty_req = True
         if req.webcam_split_ratio is not None:
@@ -5118,8 +5376,6 @@ def trigger_render(
             clip.position_y = round(max(8.0, min(92.0, float(req.caption_y) * 100.0)), 2)
         if req.caption_custom_position and req.face_safe_captions is None:
             clip.face_safe_captions = False
-        if req.options is not None and isinstance(req.options, dict):
-            clip.set_options(req.options); dirty_req = True
         if dirty_req:
             session.add(clip)
             session.commit()
@@ -5312,6 +5568,16 @@ async def upload_youtube_client_secrets_endpoint(
         raise HTTPException(status_code=400, detail=f"Failed to save YouTube client secrets: {exc}")
 
 
+@app.post("/api/youtube/auth/credentials")
+def save_youtube_oauth_credentials_endpoint(req: YouTubeCredentialsRequest):
+    try:
+        return save_youtube_oauth_credentials(req.client_id, req.client_secret)
+    except YouTubeConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to save YouTube OAuth credentials: {exc}")
+
+
 @app.post("/api/youtube/auth/connect")
 def connect_youtube_endpoint():
     try:
@@ -5334,6 +5600,7 @@ def handle_youtube_publish(
     privacy: Optional[str],
     session: Session,
     tags: Optional[List[str]] = None,
+    category_id: Optional[str] = "22",
 ):
     if not clip.rendered_video_path or not os.path.exists(clip.rendered_video_path):
         raise HTTPException(status_code=400, detail="Render the clip before publishing to YouTube.")
@@ -5350,6 +5617,7 @@ def handle_youtube_publish(
             tags=tags,
             privacy_status=final_privacy,
             aspect_ratio=clip.aspect_ratio,
+            category_id=category_id or "22",
         )
     except YouTubeAuthError as auth_err:
         raise HTTPException(status_code=401, detail=str(auth_err))
@@ -5387,6 +5655,7 @@ def publish_clip_to_youtube_scoped(
         privacy=privacy,
         session=session,
         tags=req.tags,
+        category_id=req.category_id,
     )
 
 
@@ -5413,6 +5682,7 @@ def publish_to_youtube_generic(
         privacy=privacy,
         session=session,
         tags=req.tags,
+        category_id=req.category_id,
     )
 
 
@@ -5433,6 +5703,7 @@ def publish_to_youtube_clip(
         privacy=privacy,
         session=session,
         tags=req.tags,
+        category_id=req.category_id,
     )
 
 # -------------------------------------------------------------

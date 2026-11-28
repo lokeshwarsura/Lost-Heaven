@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Activity, Sun, Droplets, Sparkles, Shield, Upload, Music, Volume2, Copy, Check, RotateCcw, Save, Film, Flag, Eye, Sliders,
-  Download, Package, Image as ImageIcon, Loader2, ChevronDown, ChevronUp
+  Download, Package, Image as ImageIcon, Loader2, ChevronDown, ChevronUp, Cpu, Zap
 } from 'lucide-react';
-import { ViralClip, BrollSegment, PresetPreviewsResponse } from '../types';
+import { ViralClip, Project, BrollSegment, PresetPreviewsResponse } from '../types';
 import { api } from '../api/client';
 import { GradeSlider } from './GradeSlider';
 
@@ -236,6 +236,7 @@ const ColorScopesPanel: React.FC<ColorScopesPanelProps> = ({ clip, sampleImageUr
 interface Step3VideoProps {
   clip: ViralClip | null;
   onUpdateClip: (updates: Partial<ViralClip>) => void;
+  onUpdateProject?: (updates: Partial<Project>) => void;
   onUploadAsset?: (file: File) => Promise<{ url: string; filename: string; path: string }>;
   compareOriginal?: boolean;
   onCompareOriginalChange?: (held: boolean) => void;
@@ -244,6 +245,7 @@ interface Step3VideoProps {
 export const Step3Video: React.FC<Step3VideoProps> = ({
   clip,
   onUpdateClip,
+  onUpdateProject,
   onUploadAsset,
   compareOriginal = false,
   onCompareOriginalChange,
@@ -754,7 +756,7 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
   };
 
   return (
-    <div className="space-y-4 text-xs animate-fadeIn w-full text-[var(--text-primary)]">
+    <div className="pt-2 space-y-4 text-xs animate-fadeIn w-full text-[var(--text-primary)]">
       {/* Top Row: Pro Mastering Export Output + Live-Thumbnail Look Presets */}
       <div className="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-4 items-stretch">
         {/* Left: Pro Mastering & Multi-Deliverable Export Output */}
@@ -885,6 +887,47 @@ export const Step3Video: React.FC<Step3VideoProps> = ({
                   }`}
                 >
                   {exportBurnCaptions ? 'Burned-In Captions' : 'Clean Master'}
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between text-[10px] text-[var(--text-secondary)] mb-1">
+                <span>Encoder Engine</span>
+                <span className="font-mono text-[var(--accent-primary)] font-semibold uppercase">
+                  {clip.hardware_mode === 'cpu' ? 'CPU' : 'GPU'}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    onUpdateClip({ hardware_mode: 'gpu' });
+                    onUpdateProject?.({ hardware_mode: 'gpu' });
+                  }}
+                  className={`flex items-center justify-center gap-1 py-1 px-2 rounded-lg border text-[10px] font-semibold transition ${
+                    (clip.hardware_mode || 'gpu') === 'gpu'
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] font-bold'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <Zap className="w-3 h-3" />
+                  <span>GPU</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onUpdateClip({ hardware_mode: 'cpu' });
+                    onUpdateProject?.({ hardware_mode: 'cpu' });
+                  }}
+                  className={`flex items-center justify-center gap-1 py-1 px-2 rounded-lg border text-[10px] font-semibold transition ${
+                    clip.hardware_mode === 'cpu'
+                      ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)] font-bold'
+                      : 'bg-[var(--bg-input)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
+                  }`}
+                >
+                  <Cpu className="w-3 h-3" />
+                  <span>CPU</span>
                 </button>
               </div>
             </div>

@@ -96,10 +96,46 @@ export interface HookVariant {
 
 export interface PlatformCopyEntry {
   platform?: string;
-  title: string;
-  description: string;
+  title?: string;
+  description?: string;
+  caption?: string;
+  post_text?: string;
   pinned_comment?: string;
-  hashtags: string[];
+  hashtags?: string[];
+  tags?: string[];
+  category_id?: string;
+}
+
+export interface SocialCopyBundle {
+  youtube?: {
+    title: string;
+    description: string;
+    tags: string[];
+    pinned_comment: string;
+    category_id: string;
+  };
+  instagram?: {
+    title?: string;
+    caption: string;
+    pinned_comment: string;
+    hashtags?: string[];
+  };
+  tiktok?: {
+    title?: string;
+    caption: string;
+    pinned_comment: string;
+    hashtags?: string[];
+  };
+  x?: {
+    title?: string;
+    post_text: string;
+    pinned_comment?: string;
+    hashtags?: string[];
+  };
+  platforms?: Partial<Record<'youtube_shorts' | 'tiktok' | 'instagram_reels' | 'x_twitter', PlatformCopyEntry>>;
+  source?: string;
+  mode?: 'gemini' | 'offline' | string;
+  categories?: Array<{ id: string; label: string }>;
 }
 
 export type PlatformCopyMap = Record<'youtube_shorts' | 'tiktok' | 'instagram_reels' | 'x_twitter', PlatformCopyEntry>;
@@ -317,7 +353,9 @@ export interface ViralClip {
 
   // Hooks & Retention FX
   hook_headline: string;
+  hook_text?: string;
   show_hook_banner: boolean;
+  show_hook?: boolean;
   cold_open_quote: string;
   use_cold_open: boolean;
   cold_open?: boolean;
@@ -329,7 +367,7 @@ export interface ViralClip {
   framing_user_locked?: boolean;
 
   // Step 1: Multi-format & layouts
-  aspect_ratio: '9:16' | '16:9' | '1:1' | '4:5' | '4:3' | 'custom';
+  aspect_ratio: '9:16' | '16:9' | '1:1' | '4:5' | '4:3' | '2.39:1' | 'custom';
   custom_width: number;
   custom_height: number;
   frame_layout:
@@ -344,10 +382,13 @@ export interface ViralClip {
     | 'portrait_pip_badge'
     | 'dynamic_punch_crop'
     | 'side_by_side_50_50';
+  framing_template?: ViralClip['frame_layout'];
   webcam_corner: 'auto' | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right';
   webcam_split_ratio: number;
   source_webcam_region?: SourceWebcamRegion | null;
   framing_override?: FramingOverride | null;
+  frame_crop_override?: any;
+  clear_framing_override?: boolean;
   visual_map_summary?: {
     has_corner_webcam?: boolean;
     face_presence_ratio?: number;
@@ -526,6 +567,8 @@ export interface ViralClip {
   preview_url?: string;
   video_url?: string;
   rendered_video_path?: string;
+  video_size_bytes?: number | null;
+  social_copy?: SocialCopyBundle | null;
   youtube_video_id?: string;
   youtube_url?: string;
   created_at: string;

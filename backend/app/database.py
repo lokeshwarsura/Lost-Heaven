@@ -75,6 +75,7 @@ def init_db():
                     "broll_layout": "ALTER TABLE viral_clips ADD COLUMN broll_layout TEXT DEFAULT 'fullscreen'",
                     "depth_pop": "ALTER TABLE viral_clips ADD COLUMN depth_pop FLOAT DEFAULT 0.0",
                     "best_frames_json": "ALTER TABLE viral_clips ADD COLUMN best_frames_json TEXT DEFAULT '[]'",
+                    "framing_template": "ALTER TABLE viral_clips ADD COLUMN framing_template TEXT",
                     "options_json": "ALTER TABLE viral_clips ADD COLUMN options_json TEXT DEFAULT '{}'",
                 }
                 added = False
