@@ -962,7 +962,7 @@ def build_multi_aspect_filter(
     """
     Generate complete FFmpeg video filtergraph string for all 5 unified framing templates:
     1. auto_track (deadzone-damped spring speaker & zero-face action saliency + cut snaps)
-    2. fit_blur (full width fit + gblur=sigma=28,eq=brightness=-0.18:saturation=1.15 + 1px rim highlight)
+    2. fit_blur (full width fit + gblur=sigma=24,eq=brightness=-0.12:saturation=1.15:gamma=1.18 + 1px rim highlight)
     3. webcam_gameplay_split (40% top cam/speaker + 3px divider + 60% action-tracked gameplay)
     4. gameplay_webcam_pip (action-tracked gameplay + 36% rounded PiP card, 0 vignette, safe fallback)
     5. split_podcast (cutaway-aware 2-speaker stack with active glow & 1-speaker full-frame cutaways)
@@ -1298,7 +1298,7 @@ def build_multi_aspect_filter(
             f"[{out1}][{out2}]{stack_filter}[v]"
         )
 
-    # 4. FIT + ADAPTIVE AMBIENT BLURRED BACKDROP (full uncropped center + brightness=-0.18 + 1px rim highlight)
+    # 4. FIT + ADAPTIVE AMBIENT BLURRED BACKDROP (full uncropped center + visible Gaussian blur + balanced brightness)
     if layout == "fit_blur":
         z_fg = z * motion_zoom_mult if not is_video_render else z
         fg_w = int(source_w / z_fg)
@@ -1326,10 +1326,10 @@ def build_multi_aspect_filter(
         return _finish(
             f"[{input_label}]split=2[vbg][vfg];"
             f"[vbg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h},gblur=sigma=28,eq=brightness=-0.18:saturation=1.15[bg];"
+            f"crop={target_w}:{target_h},gblur=sigma=24,eq=brightness=-0.12:saturation=1.15:gamma=1.18[bg];"
             f"[vfg]{fg_crop}{fg_scale},"
-            f"format=rgba,drawbox=x=0:y=0:w=iw:h=1:color=0xFFFFFF@0.22:t=fill,"
-            f"drawbox=x=0:y=ih-1:w=iw:h=1:color=0xFFFFFF@0.22:t=fill[fg];"
+            f"format=rgba,drawbox=x=0:y=0:w=iw:h=1:color=0xFFFFFF@0.28:t=fill,"
+            f"drawbox=x=0:y=ih-1:w=iw:h=1:color=0xFFFFFF@0.28:t=fill[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v]"
         )
 
@@ -1344,7 +1344,7 @@ def build_multi_aspect_filter(
         return _finish(
             f"[{input_label}]split=2[cbg][cfg];"
             f"[cbg]scale={target_w}:{target_h}:force_original_aspect_ratio=increase,"
-            f"crop={target_w}:{target_h},gblur=sigma=30,eq=brightness=-0.22:saturation=1.10[bg];"
+            f"crop={target_w}:{target_h},gblur=sigma=26,eq=brightness=-0.14:saturation=1.15:gamma=1.15[bg];"
             f"[cfg]crop={cin_w}:{cin_h}:{cin_x}:{cin_y},scale={fg_w}:{fg_h},"
             f"drawbox=x=0:y=0:w=iw:h={matte_bar}:color=black@1.0:t=fill,"
             f"drawbox=x=0:y=ih-{matte_bar}:w=iw:h={matte_bar}:color=black@1.0:t=fill,"

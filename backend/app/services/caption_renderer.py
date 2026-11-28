@@ -1630,7 +1630,14 @@ def render_caption_frame(
             height=height,
             face_keyframes=face_keyframes,
         )
-    start_y = max(top_safe_pad, min(height - total_h - bot_safe_pad, float(anchor_y) - total_h / 2.0))
+    pad_y_safe = (
+        max(10, int(round(12 * scale))) + stroke_px
+        if (cfg["is_full_line_block"] or cfg["highlight_shape"] in ("filled_box", "underline"))
+        else stroke_px + max(2, int(round(4 * scale)))
+    )
+    min_start_y = top_safe_pad + pad_y_safe
+    max_start_y = max(min_start_y, height - total_h - bot_safe_pad - pad_y_safe)
+    start_y = max(min_start_y, min(max_start_y, float(anchor_y) - total_h / 2.0))
     block_mid_y = start_y + total_h / 2.0
 
     shadow_px = max(0, int(round(cfg["shadow"] * scale)))

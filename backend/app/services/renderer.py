@@ -399,8 +399,10 @@ def _render_clip_ultra_impl(
         else max(0.5, float(duration))
     )
 
+    # Unified Render Graph Plan (Single Source of Truth with preview_frame.py)
+    from app.services.render_graph import compile_clip_render_plan
+
     render_words = [dict(w) for w in (words or []) if not w.get("muted", False)]
-    from app.services.caption_renderer import resolve_hook_banner_state
     _hook_opts = options if isinstance(options, dict) else {}
     eff_hook_flag = show_hook if show_hook is not None else (
         None if show_hook_banner is False else (
@@ -409,35 +411,42 @@ def _render_clip_ultra_impl(
     )
     if show_hook is None and show_hook_banner is False:
         eff_hook_flag = False
-    eff_show_hook, eff_hook_text = resolve_hook_banner_state(
-        show_hook=eff_hook_flag,
-        hook_text=hook_text,
-        hook_headline=hook_headline,
-        options=_hook_opts,
-    )
-    from app.services.reframer import canonicalize_safe_zone as _canon_sz
-    eff_safe_zone = _canon_sz(
-        safe_zone if safe_zone is not None else _hook_opts.get("safe_zone", _hook_opts.get("safe_zone_guide"))
-    )
     eff_cold_open = bool(cold_open) if cold_open is not None else bool(use_cold_open)
     eff_trim_dead_air = bool(trim_dead_air) if trim_dead_air is not None else bool(auto_trim_dead_air)
     eff_punch_zoom = bool(punch_zoom) if punch_zoom is not None else bool(dynamic_punch_zoom)
     eff_punch_intensity = float(punch_zoom_intensity if punch_zoom_intensity is not None else 1.16)
-
-    # Unified Timeline Edit Plan: trim_dead_air -> cold_open (2.8s climax + 0.2s flash + +2.8s word shift) -> punch_zoom (top 6 peaks)
     eff_cf_sec = (
         max(0.03, float(merge_crossfade_sec or 0.03))
         if (tighten_pacing or eff_trim_dead_air)
         else float(merge_crossfade_sec or 0.03)
     )
-    tl_plan = build_timeline_edit_plan(
-        video_path=master_video_path,
-        clip_start_time=source_start_anchor,
-        clip_duration=source_span,
+
+    render_plan = compile_clip_render_plan(
+        master_video_path=master_video_path,
+        clip_id=int(clip_id or 0),
+        project_id=int(project_id or 0),
+        start_time=source_start_anchor,
+        duration=source_span,
         words=render_words,
-        cold_open=eff_cold_open,
+        aspect_ratio=aspect_ratio,
+        clip_size=eff_resolution,
+        custom_w=custom_width,
+        custom_h=custom_height,
+        frame_layout=layout,
+        framing_template=layout,
+        webcam_corner=webcam_corner,
+        webcam_split_ratio=webcam_split_ratio,
+        pip_border_color=pip_border_color,
+        zoom=zoom,
+        pan_x=pan_x if pan_x is not None else pan_x_offset,
+        camera_motion=camera_motion,
+        whip_pan_cuts=whip_pan_cuts,
+        safe_zone=safe_zone,
+        source_webcam_region=source_webcam_region,
+        frame_crop_override=None if (clear_framing_override or frame_crop_override is None) else framing_override,
+        use_cold_open=eff_cold_open,
         cold_open_quote=cold_open_quote,
-        trim_dead_air=eff_trim_dead_air,
+        auto_trim_dead_air=eff_trim_dead_air,
         tighten_pacing=tighten_pacing,
         silence_threshold=silence_threshold,
         clean_filler_words=clean_filler_words,
@@ -445,12 +454,26 @@ def _render_clip_ultra_impl(
         punch_zoom_intensity=eff_punch_intensity,
         explicit_keep_segments=explicit_abs_segs,
         crossfade_sec=eff_cf_sec,
+        color_preset=color_preset,
+        watermark_opacity=watermark_opacity,
+        burn_captions=burn_captions,
+        show_hook=eff_hook_flag,
+        hook_text=hook_text,
+        hook_headline=hook_headline,
+        hardware_mode=hardware_mode,
+        quality_mode=quality_mode,
+        options=_hook_opts,
     )
+    layout = render_plan.spec.framing_template
+    target_w, target_h = render_plan.out_w, render_plan.out_h
+    eff_show_hook, eff_hook_text = render_plan.show_hook, render_plan.hook_text
+    eff_safe_zone = render_plan.spec.safe_zone
+    tl_plan = render_plan.timeline_plan
     kept_segments = tl_plan.keep_intervals
     kept_segments_abs = tl_plan.kept_segments_abs
     has_cuts = tl_plan.has_cuts
     main_duration = tl_plan.main_duration
-    post_cut_words = [dict(w) for w in tl_plan.remapped_words]
+    post_cut_words = [dict(w) for w in render_plan.remapped_words]
     use_multi_input = len(kept_segments_abs) > 1
 
     cold_open_active = tl_plan.cold_open_active
@@ -687,17 +710,21 @@ def _render_clip_ultra_impl(
         fg_segments: List[str] = []
         tl_fg = ""
 
-        if has_cuts:
+        if has_cuts and use_multi_input:
             tl_fg, v_in_lbl, a_in_lbl = build_timeline_trim_concat_filter(
-                kept_segments_abs if use_multi_input else kept_segments,
+                kept_segments_abs,
                 crossfade_sec=float(tl_plan.crossfade_sec),
                 has_audio=has_audio,
-                multi_input=use_multi_input,
+                multi_input=True,
             )
             fg_segments.append(tl_fg)
         else:
+            # Input [0] is already seeked with -ss single_s -t single_t; never re-apply filter trim on top of -ss!
             fg_segments.append("[0:v]setpts=PTS-STARTPTS[v_pts]")
             v_in_lbl = "v_pts"
+            if has_cuts and has_audio:
+                fg_segments.append("[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a_pts]")
+                a_in_lbl = "a_pts"
 
         # Chain timeline_editor (trim_dead_air + cold_open concat) directly BEFORE reframer.build_multi_aspect_filter
         v_reframe_in = v_in_lbl
@@ -742,12 +769,21 @@ def _render_clip_ultra_impl(
             if opts.get("caption_y") is not None
             else (float(position_y) / 100.0 if position_y is not None else None)
         )
+        # Early 4K downscale: shrink >1080p input before reframing / blur when targeting <= 1080p
+        rf_src_w, rf_src_h = src_w, src_h
+        is_hi_res_out = str(eff_resolution or "1080p").strip().lower() in ("2k", "4k", "1440p", "2160p") or max(target_w, target_h) > 1920
+        if src_w > 1920 and not is_hi_res_out:
+            fg_segments.append(f"[{v_reframe_in}]scale='min(1920,iw)':-2[v_4k_ds]")
+            v_reframe_in = "v_4k_ds"
+            rf_src_w = 1920
+            rf_src_h = max(2, int(round(src_h * (1920.0 / float(src_w)) / 2.0) * 2))
+
         layout_vf = build_multi_aspect_filter(
             aspect_ratio=aspect_ratio,
             frame_layout=layout,
             framing_template=layout,
-            source_w=src_w,
-            source_h=src_h,
+            source_w=rf_src_w,
+            source_h=rf_src_h,
             custom_w=target_w,
             custom_h=target_h,
             webcam_corner=effective_corner,
@@ -891,9 +927,9 @@ def _render_clip_ultra_impl(
         else:
             single_s = kept_segments_abs[0][0] if kept_segments_abs else max(0.0, start_time)
             single_t = (
-                max(0.1, kept_segments_abs[0][1] - kept_segments_abs[0][0])
-                if (kept_segments_abs and not has_cuts)
-                else max(0.1, source_span)
+                max(0.12, kept_segments_abs[0][1] - kept_segments_abs[0][0])
+                if kept_segments_abs
+                else max(0.12, source_span)
             )
             input_args.extend([
                 "-ss", f"{max(0.0, single_s):.3f}",
@@ -1169,7 +1205,17 @@ def _render_clip_ultra_impl(
         audio_codec_args = ["-c:a", "libopus", "-b:a", "192k"] if export_codec in ("vp9", "webm_vp9") else (
             ["-c:a", "pcm_s16le"] if export_codec in ("prores", "mov_prores") else ["-c:a", "aac", "-b:a", "192k"]
         )
-        if use_fc_audio and a_in_lbl:
+        if not has_audio:
+            silent_idx = next_in_idx
+            input_args.extend([
+                "-f", "lavfi",
+                "-t", f"{max(0.2, float(cap_duration)):.3f}",
+                "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            ])
+            next_in_idx += 1
+            fg_segments.append(f"[{silent_idx}:a]asetpts=PTS-STARTPTS[a_out]")
+            audio_cli_args = ["-map", "[a_out]", *audio_codec_args]
+        elif use_fc_audio and a_in_lbl:
             curr_a = a_in_lbl
             if prof_intervals:
                 fg_segments.append(
@@ -1296,18 +1342,85 @@ def _render_clip_ultra_impl(
         if rc != 0:
             if active_codec != cpu_enc_args[1]:
                 logger.warning(
-                    f"{active_codec} render failed ({target_w}x{target_h}), retrying with {cpu_enc_args[1]} keeping full filtergraph: "
-                    f"{(stderr_text or '').strip()[-400:]}"
+                    f"{active_codec} render failed ({target_w}x{target_h}), retrying with {cpu_enc_args[1]} keeping full filtergraph:\n"
+                    f"{stderr_text or ''}"
                 )
-                rc2, stderr2 = _run_cancellable_popen(_build_cmd(cpu_enc_args))
-                if rc2 != 0:
-                    err_tail = (stderr2 or "").strip()[-400:]
-                    logger.error(f"FFmpeg render failed (codec={cpu_enc_args[1]}, res={target_w}x{target_h}): {err_tail}")
-                    raise RuntimeError(f"FFmpeg render failed (codec={cpu_enc_args[1]}, res={target_w}x{target_h}): {err_tail}")
-            else:
-                err_tail = (stderr_text or "").strip()[-400:]
-                logger.error(f"FFmpeg render failed (codec={active_codec}, res={target_w}x{target_h}): {err_tail}")
-                raise RuntimeError(f"FFmpeg render failed (codec={active_codec}, res={target_w}x{target_h}): {err_tail}")
+                rc, stderr_text = _run_cancellable_popen(_build_cmd(cpu_enc_args))
+
+        if rc != 0:
+            # One automatic clean single-segment fallback (e.g. avoids loudnorm NaN on digital-zero audio or edge-case concat)
+            logger.error(f"Primary render failed (rc={rc}, res={target_w}x{target_h}). Full FFmpeg stderr:\n{stderr_text or ''}")
+            from app.services.render_graph import compile_clip_render_plan
+
+            fb_plan = compile_clip_render_plan(
+                master_video_path=master_video_path,
+                clip_id=int(clip_id or 0),
+                project_id=int(project_id or 0),
+                start_time=float(start_time or 0.0),
+                duration=float(duration or 5.0),
+                words=caption_words,
+                aspect_ratio=aspect_ratio,
+                clip_size=eff_resolution,
+                custom_w=custom_width,
+                custom_h=custom_height,
+                frame_layout=layout,
+                framing_template=layout,
+                webcam_corner=effective_corner,
+                webcam_split_ratio=webcam_split_ratio,
+                pip_border_color=pip_border_color,
+                zoom=zoom,
+                pan_x=pan_x if pan_x is not None else pan_x_offset,
+                camera_motion=camera_motion,
+                whip_pan_cuts=whip_pan_cuts,
+                safe_zone=opts.get("safe_zone", "none"),
+                face_track_data=face_track_data,
+                source_webcam_region=source_webcam_region,
+                frame_crop_override=None if (clear_framing_override or frame_crop_override is None) else framing_override,
+                color_preset=color_preset,
+                watermark_opacity=watermark_opacity,
+                burn_captions=burn_captions,
+                show_hook=opts.get("show_hook"),
+                hook_headline=opts.get("hook_headline") or opts.get("hook_text"),
+                hardware_mode="cpu",
+                quality_mode=quality_mode,
+                options=opts,
+            )
+            fb_inputs: List[str] = []
+            fb_cap_idx: Optional[int] = None
+            has_cap_ff = bool(render_overlay and (exec_dir / "captions.ffconcat").exists())
+            if has_cap_ff:
+                fb_cap_idx = 1
+            fb_graph = fb_plan.build_export_filtergraph(
+                caption_input_idx=fb_cap_idx,
+                use_single_segment_fallback=True,
+            )
+            fb_s, fb_e = fb_graph["input_segments"][0]
+            fb_inputs.extend(["-ss", f"{fb_s:.3f}", "-t", f"{max(0.2, fb_e - fb_s):.3f}", "-i", os.path.abspath(master_video_path)])
+            if has_cap_ff:
+                fb_inputs.extend(["-f", "concat", "-safe", "0", "-i", "captions.ffconcat"])
+            fb_fg = fb_graph["filter_complex"]
+            fb_a_map = fb_graph.get("a_out_label")
+            if not fb_graph.get("has_audio") or not fb_a_map:
+                anull_i = 2 if has_cap_ff else 1
+                fb_inputs.extend(["-f", "lavfi", "-t", f"{max(0.2, fb_e - fb_s):.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+                fb_fg = f"{fb_fg};[{anull_i}:a]asetpts=PTS-STARTPTS[a_fb_out]"
+                fb_a_map = "a_fb_out"
+            fb_fg_path = exec_dir / "filtergraph_fallback.txt"
+            fb_fg_path.write_text(fb_fg, encoding="utf-8")
+            fb_fg_args = build_filter_complex_args(ffmpeg, str(fb_fg_path.name), fb_fg)
+            fb_cmd = [
+                ffmpeg, "-y",
+                *fb_inputs,
+                *fb_fg_args,
+                "-map", "[vout]", "-map", f"[{fb_a_map}]",
+                *cfr_args, *fps_cli_args, *cpu_enc_args,
+                "-pix_fmt", "yuv420p", *audio_codec_args, *mov_flags,
+                output_mp4,
+            ]
+            rc2, stderr2 = _run_cancellable_popen(fb_cmd)
+            if rc2 != 0:
+                logger.error(f"FFmpeg fallback render also failed (rc={rc2}, codec={cpu_enc_args[1]}, res={target_w}x{target_h}). Full FFmpeg stderr:\n{stderr2 or ''}")
+                raise RuntimeError(f"FFmpeg render failed (rc={rc2}, codec={cpu_enc_args[1]}, res={target_w}x{target_h}): {stderr2 or ''}")
 
         # Best-effort clean up older versioned renders for this clip (Windows file-lock safe)
         if not output_path_override:

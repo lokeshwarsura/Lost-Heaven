@@ -7,6 +7,7 @@ import {
 } from 'lucide-react';
 import { ViralClip, RetentionAuditReport, RetentionWarning, PrivacyBlurBox, PreflightReport, PreflightCheck, FramingOverride, FramingBox, BestFrameItem } from '../types';
 import { PublishModal } from './PublishModal';
+import { LiveTemplateOverlay } from './LiveTemplateOverlay';
 import { api } from '../api/client';
 
 const YouTubeIcon = ({ className = 'w-4 h-4' }: { className?: string }) => (
@@ -141,6 +142,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const shouldAutoPlayRef = useRef<boolean>(false);
   const preparingClipIdRef = useRef<number | null>(null);
   const lastRenderedHashByClipRef = useRef<Record<number, string>>({});
+  const lastBakedLayoutByClipRef = useRef<Record<number, string>>({});
+  const prevVideoClipIdRef = useRef<number | null>(null);
+  const prevVideoSrcRef = useRef<string | undefined>(undefined);
   const debounceTimerRef = useRef<number | null>(null);
   const previewTimerRef = useRef<number | null>(null);
   const autoRenderAbortRef = useRef<AbortController | null>(null);
@@ -154,7 +158,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   const autoRender = true;
   const [isAutoRendering, setIsAutoRendering] = useState(false);
   const [isPreparingClip, setIsPreparingClip] = useState(false);
-  const [videoVersion, setVideoVersion] = useState(0);
+  const [playbackError, setPlaybackError] = useState<string | null>(null);
 
   const [stageSize, setStageSize] = useState<{ w: number; h: number }>({ w: 280, h: 460 });
   const [canvasZoom, setCanvasZoom] = useState<'fit' | '75' | '100'>('fit');
@@ -756,11 +760,13 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
 
   useEffect(() => {
     if (seekTime !== undefined && clip) {
-      setCurrentTime(seekTime);
-      onPlaybackTimeChange?.(seekTime);
+      const clampedRel = Math.max(0, Math.min(clipBoundDuration, seekTime));
+      const absSeek = clipStartOffset + clampedRel;
+      setCurrentTime(absSeek);
+      onPlaybackTimeChange?.(clampedRel);
       setShowExactFrame(false);
       if (videoRef.current && clipIsRendered) {
-        videoRef.current.currentTime = seekTime;
+        videoRef.current.currentTime = absSeek;
       }
     }
   }, [seekTime]);
@@ -796,53 +802,94 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     };
   }, [isThumbModalOpen, clip?.id]);
 
-  // Force clean <video> reload & reset playback position whenever active clip or rendered URL changes
+  const isRenderedSource = clipIsRendered;
+  const isMasterStream = Boolean(activeVideoSrc && activeVideoSrc.includes('/media/masters/'));
+  const clipStartOffset = clip && isMasterStream ? Math.max(0, Number(clip.start_time || 0)) : 0;
+  const clipBoundDuration = clip
+    ? isMasterStream
+      ? Math.max(0.2, Number(clip.end_time || 30) - clipStartOffset)
+      : Math.max(0.2, Number(duration || clip.duration || (Number(clip.end_time || 30) - Number(clip.start_time || 0)) || 30))
+    : 30;
+  const clipPlayEnd = clipStartOffset + clipBoundDuration;
+  const relCurrent = Math.max(0, Math.min(clipBoundDuration, currentTime - clipStartOffset));
+  relCurrentRef.current = relCurrent;
+
+  const emitToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    window.dispatchEvent(new CustomEvent('lh-toast', { detail: { message, type } }));
+  };
+
+  // Preserve playhead & playing state seamlessly across MP4 source swaps; reset only when switching clips
   useEffect(() => {
     if (!clip) {
+      prevVideoClipIdRef.current = null;
+      prevVideoSrcRef.current = undefined;
       setIsPlaying(false);
       setCurrentTime(0);
+      setPlaybackError(null);
       return;
     }
 
-    setVideoVersion((v) => v + 1);
-    setShowExactFrame(false);
-    setExactFrameUrl(null);
-    setDuration(clip.duration || 30);
+    const sameClip = prevVideoClipIdRef.current === clip.id;
+    const prevSrc = prevVideoSrcRef.current;
+    prevVideoClipIdRef.current = clip.id;
 
-    if (!pendingRestoreRef.current) {
-      setCurrentTime(0);
-      setIsPlaying(false);
-    }
-  }, [clip?.id, activeVideoSrc]);
-
-  useEffect(() => {
-    const vid = videoRef.current;
-    if (vid && activeVideoSrc) {
-      try {
-        if (!pendingRestoreRef.current) {
-          vid.currentTime = 0;
-        }
-        vid.load();
-      } catch {
-        // ignore pre-metadata load issues
-      }
-    }
-  }, [clip?.id, activeVideoSrc, videoVersion]);
-
-  const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (isPlaying) {
-      videoRef.current.pause();
-      setIsPlaying(false);
-    } else if (clip && !videoFilterAlreadyBaked && triggerNowAutoRenderRef.current) {
-      // Selected template/FX is newer than cached MP4: trigger immediate MP4 sync & auto-play on completion
-      shouldAutoPlayRef.current = true;
-      setIsPreparingClip(true);
-      triggerNowAutoRenderRef.current();
-    } else {
+    if (!sameClip) {
+      pendingRestoreRef.current = null;
+      prevVideoSrcRef.current = activeVideoSrc;
       setShowExactFrame(false);
-      videoRef.current.play().catch(() => { });
+      setExactFrameUrl(null);
+      setPlaybackError(null);
+      setDuration(clip.duration || Math.max(0.5, (clip.end_time || 30) - (clip.start_time || 0)));
+      const initTime = isMasterStream ? Math.max(0, Number(clip.start_time || 0)) : 0;
+      setCurrentTime(initTime);
+      relCurrentRef.current = 0;
+      setIsPlaying(false);
+      return;
+    }
+
+    if (activeVideoSrc && prevSrc !== activeVideoSrc) {
+      const vid = videoRef.current;
+      if (!pendingRestoreRef.current && vid) {
+        pendingRestoreRef.current = {
+          relTime: Math.max(0, (Number.isFinite(vid.currentTime) ? vid.currentTime : clipStartOffset + relCurrentRef.current) - clipStartOffset),
+          shouldPlay: !vid.paused && !vid.ended,
+        };
+      }
+      prevVideoSrcRef.current = activeVideoSrc;
+      setPlaybackError(null);
+    }
+  }, [clip?.id, activeVideoSrc, isMasterStream]);
+
+  const togglePlay = async () => {
+    const vid = videoRef.current;
+    if (!vid) {
+      if (clip && triggerNowAutoRenderRef.current) {
+        shouldAutoPlayRef.current = true;
+        setIsPreparingClip(true);
+        triggerNowAutoRenderRef.current();
+      }
+      return;
+    }
+    if (!vid.paused) {
+      vid.pause();
+      setIsPlaying(false);
+      return;
+    }
+    setPlaybackError(null);
+    setShowExactFrame(false);
+    const maxPlayT = Number.isFinite(vid.duration) && vid.duration > 0 ? Math.min(clipPlayEnd, vid.duration) : clipPlayEnd;
+    if (vid.currentTime < clipStartOffset || vid.currentTime >= Math.max(clipStartOffset + 0.05, maxPlayT - 0.02)) {
+      vid.currentTime = clipStartOffset;
+      setCurrentTime(clipStartOffset);
+    }
+    try {
+      await vid.play();
       setIsPlaying(true);
+    } catch (err: any) {
+      setIsPlaying(false);
+      const msg = err?.message || 'Unable to start video playback';
+      setPlaybackError(msg);
+      emitToast(`Playback failed: ${msg}`, 'error');
     }
   };
 
@@ -850,15 +897,6 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     if (!videoRef.current) return;
     videoRef.current.muted = !isMuted;
     setIsMuted(!isMuted);
-  };
-
-  const isRenderedSource = clipIsRendered;
-  const clipStartOffset = 0;
-  const relCurrent = Math.max(0, Math.min(duration, currentTime - clipStartOffset));
-  relCurrentRef.current = relCurrent;
-
-  const emitToast = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
-    window.dispatchEvent(new CustomEvent('lh-toast', { detail: { message, type } }));
   };
 
   const handleBladeSplit = (customRelT?: number) => {
@@ -937,9 +975,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   };
 
   const seekToRelTime = (nextRel: number) => {
-    const clamped = Math.max(0, Math.min(duration || 30, nextRel));
-    setCurrentTime(clamped);
-    if (videoRef.current) videoRef.current.currentTime = clamped;
+    const clamped = Math.max(0, Math.min(clipBoundDuration, nextRel));
+    const absTarget = clipStartOffset + clamped;
+    setCurrentTime(absTarget);
+    if (videoRef.current) videoRef.current.currentTime = absTarget;
     onPlaybackTimeChange?.(clamped);
   };
 
@@ -947,7 +986,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     clip,
     relCurrent,
     clipStartOffset,
-    duration,
+    duration: clipBoundDuration,
     keepSegments,
     onTrimClip,
     onUpdateSegments,
@@ -959,7 +998,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     clip,
     relCurrent,
     clipStartOffset,
-    duration,
+    duration: clipBoundDuration,
     keepSegments,
     onTrimClip,
     onUpdateSegments,
@@ -989,8 +1028,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     }
     const maxDur =
       vid && Number.isFinite(vid.duration) && vid.duration > 0
-        ? Math.max(0.2, vid.duration - clipStartOffset)
-        : Math.max(1, duration || 30);
+        ? Math.max(0.2, Math.min(clipBoundDuration, vid.duration - clipStartOffset))
+        : Math.max(0.2, clipBoundDuration);
     const stepSec = framesDelta / Math.max(1, previewFps);
     const nextRel = Math.max(0, Math.min(maxDur, Number((relCurrent + stepSec).toFixed(4))));
     const absTarget = clipStartOffset + nextRel;
@@ -1007,7 +1046,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       const vid = videoRef.current;
       const st = cmdStateRef.current;
       if (detail.type === 'togglePlay') {
-        st.togglePlay();
+        void st.togglePlay();
       } else if (detail.type === 'toggleMute' && vid) {
         const nextMuted = !vid.muted;
         vid.muted = nextMuted;
@@ -1020,8 +1059,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         const fpsVal = st.clip?.export_fps === '60' ? 60 : st.clip?.export_fps === '24' ? 24 : 30;
         const maxDur =
           vid && Number.isFinite(vid.duration) && vid.duration > 0
-            ? Math.max(0.2, vid.duration - (st.clipStartOffset || 0))
-            : Math.max(1, st.duration);
+            ? Math.max(0.2, Math.min(st.duration, vid.duration - (st.clipStartOffset || 0)))
+            : Math.max(0.2, st.duration);
         const stepSec = (detail.frames || 0) / fpsVal;
         const nextRel = Math.max(0, Math.min(maxDur, Number((st.relCurrent + stepSec).toFixed(4))));
         const absT = (st.clipStartOffset || 0) + nextRel;
@@ -1031,15 +1070,15 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       } else if (detail.type === 'seekDelta') {
         const maxDur =
           vid && Number.isFinite(vid.duration) && vid.duration > 0
-            ? Math.max(0.2, vid.duration - (st.clipStartOffset || 0))
-            : Math.max(1, st.duration);
+            ? Math.max(0.2, Math.min(st.duration, vid.duration - (st.clipStartOffset || 0)))
+            : Math.max(0.2, st.duration);
         const nextRel = Math.max(0, Math.min(maxDur, st.relCurrent + (detail.delta || 0)));
         const absT = (st.clipStartOffset || 0) + nextRel;
         if (vid) vid.currentTime = absT;
         setCurrentTime(absT);
         st.onPlaybackTimeChange?.(nextRel);
       } else if (detail.type === 'bladeSplit') {
-        st.handleBladeSplit(vid ? vid.currentTime : st.relCurrent);
+        st.handleBladeSplit(vid ? Math.max(0, vid.currentTime - (st.clipStartOffset || 0)) : st.relCurrent);
       } else if (detail.type === 'trimIn' && st.clip && st.onTrimClip) {
         const targetAbs = Math.max(
           0,
@@ -1063,15 +1102,29 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
   }, []);
 
   const handleTimeUpdate = () => {
-    if (videoRef.current) {
-      const t = videoRef.current.currentTime;
-      setCurrentTime(t);
-      onPlaybackTimeChange?.(Math.max(0, t - clipStartOffset));
+    const vid = videoRef.current;
+    if (!vid) return;
+    const t = vid.currentTime;
+    if (t < clipStartOffset - 0.02) {
+      vid.currentTime = clipStartOffset;
+      setCurrentTime(clipStartOffset);
+      onPlaybackTimeChange?.(0);
+      return;
     }
+    if (clipPlayEnd > clipStartOffset + 0.15 && t >= clipPlayEnd) {
+      if (!vid.paused) {
+        vid.currentTime = clipStartOffset;
+      }
+      setCurrentTime(clipStartOffset);
+      onPlaybackTimeChange?.(0);
+      return;
+    }
+    setCurrentTime(t);
+    onPlaybackTimeChange?.(Math.max(0, t - clipStartOffset));
   };
 
   const handleScrubberChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newRel = parseFloat(e.target.value);
+    const newRel = Math.max(0, Math.min(clipBoundDuration, parseFloat(e.target.value) || 0));
     const absolute = clipStartOffset + newRel;
     setCurrentTime(absolute);
     if (videoRef.current) {
@@ -1436,6 +1489,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       targetClipId: number,
       targetProjectId: number,
       dispatchedSig: string,
+      dispatchedTpl: string,
       isInitialPrepare: boolean
     ) => {
       if (!onAutoRenderClip) return;
@@ -1465,8 +1519,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         punch_zoom: Boolean(clip.punch_zoom ?? clip.dynamic_punch_zoom),
         punch_zoom_intensity: clip.punch_zoom_intensity ?? 1.16,
         silence_threshold: clip.silence_threshold ?? 0.55,
-        frame_layout: clip.framing_template || clip.frame_layout,
-        framing_template: clip.framing_template || clip.frame_layout,
+        frame_layout: dispatchedTpl,
+        framing_template: dispatchedTpl,
         framing_user_locked: clip.framing_user_locked,
         framing_override: clip.framing_override ?? null,
         frame_crop_override: clip.framing_override ?? null,
@@ -1487,16 +1541,22 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           if (controller.signal.aborted || res.status === 'superseded') return;
           if (res.status === 'completed') {
             lastRenderedHashByClipRef.current[targetClipId] = dispatchedSig;
+            lastBakedLayoutByClipRef.current[targetClipId] = dispatchedTpl;
             const nextUrl = res.video_url || res.preview_url;
             if (nextUrl) {
-              if (isInitialPrepare) {
+              const vid = videoRef.current;
+              if (isInitialPrepare && !vid) {
                 pendingRestoreRef.current = null;
                 shouldAutoPlayRef.current = true;
               } else {
-                const shouldResume = Boolean(videoRef.current && !videoRef.current.paused);
+                const wasPlaying = Boolean(vid && !vid.paused && !vid.ended);
+                const savedTime =
+                  vid && Number.isFinite(vid.currentTime)
+                    ? Math.max(0, vid.currentTime - clipStartOffset)
+                    : relCurrentRef.current;
                 pendingRestoreRef.current = {
-                  relTime: relCurrentRef.current,
-                  shouldPlay: shouldResume
+                  relTime: savedTime,
+                  shouldPlay: wasPlaying
                 };
               }
               setShowExactFrame(false);
@@ -1550,6 +1610,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       setIsRenderingFrame(false);
       setIsAutoRendering(false);
 
+      const initialTpl = clip.framing_template || clip.frame_layout || 'auto_track';
       if (!autoRender || !onAutoRenderClip) {
         triggerNowAutoRenderRef.current = null;
       } else {
@@ -1561,12 +1622,19 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             window.clearTimeout(debounceTimerRef.current);
             debounceTimerRef.current = null;
           }
-          triggerFastPreviewRender(targetClipIdImmediate, targetProjectIdImmediate, dispatchedSigImmediate, false);
+          triggerFastPreviewRender(
+            targetClipIdImmediate,
+            targetProjectIdImmediate,
+            dispatchedSigImmediate,
+            initialTpl,
+            false
+          );
         };
       }
 
       if (clipIsRendered) {
         lastRenderedHashByClipRef.current[clip.id] = previewConfigSig;
+        lastBakedLayoutByClipRef.current[clip.id] = initialTpl;
         setIsPreparingClip(false);
         shouldAutoPlayRef.current = switchedFromAnother;
         return;
@@ -1575,6 +1643,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       // Stage 5 initial pre-render is already running on the backend: wait for polling instead of duplicating
       if (isStage5Rendering) {
         lastRenderedHashByClipRef.current[clip.id] = previewConfigSig;
+        lastBakedLayoutByClipRef.current[clip.id] = initialTpl;
         setIsPreparingClip(false);
         shouldAutoPlayRef.current = switchedFromAnother;
         return;
@@ -1584,7 +1653,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       void fetchExactFrame();
       if (onAutoRenderClip) {
         shouldAutoPlayRef.current = true;
-        triggerFastPreviewRender(clip.id, clip.project_id, previewConfigSig, true);
+        triggerFastPreviewRender(clip.id, clip.project_id, previewConfigSig, initialTpl, true);
       } else {
         setIsPreparingClip(false);
       }
@@ -1610,23 +1679,22 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       debounceTimerRef.current = null;
     }
 
-    const curLayoutKey = `${clip.framing_template || clip.frame_layout}|${clip.webcam_corner}|${clip.aspect_ratio}|${Boolean(clip.cold_open ?? clip.use_cold_open)}|${Boolean(clip.trim_dead_air ?? clip.auto_trim_dead_air)}|${safeZoneGuide}`;
+    const activeTpl = clip.framing_template || clip.frame_layout || 'auto_track';
+    const curLayoutKey = `${activeTpl}|${clip.webcam_corner}|${clip.aspect_ratio}|${Boolean(clip.cold_open ?? clip.use_cold_open)}|${Boolean(clip.trim_dead_air ?? clip.auto_trim_dead_air)}|${safeZoneGuide}`;
     const structuralLayoutChanged = prevLayoutKeyRef.current !== curLayoutKey;
     prevLayoutKeyRef.current = curLayoutKey;
 
-    if (structuralLayoutChanged && videoRef.current && !videoRef.current.paused) {
-      videoRef.current.pause();
-      setIsPlaying(false);
+    // Layer 2: Immediate 0ms exact backend single-frame sync when paused (never stall smooth playback)
+    if (!isPlaying) {
+      previewTimerRef.current = window.setTimeout(() => {
+        void fetchExactFrame();
+      }, structuralLayoutChanged ? 0 : 80);
     }
 
-    // Layer 2: Immediate 0ms exact backend single-frame sync on template/layout changes (or 80ms while sliding)
-    previewTimerRef.current = window.setTimeout(() => {
-      void fetchExactFrame();
-    }, structuralLayoutChanged ? 0 : 80);
-
-    // Layer 3: Background fast_preview MP4 sync so pressing Play reflects the exact template
+    // Layer 3: Background fast_preview MP4 sync so rendered output catches up seamlessly
     if (autoRender && onAutoRenderClip && preparingClipIdRef.current !== clip.id) {
       const dispatchedSig = previewConfigSig;
+      const dispatchedTpl = activeTpl;
       const targetClipId = clip.id;
       const targetProjectId = clip.project_id;
       triggerNowAutoRenderRef.current = () => {
@@ -1634,11 +1702,11 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
           window.clearTimeout(debounceTimerRef.current);
           debounceTimerRef.current = null;
         }
-        triggerFastPreviewRender(targetClipId, targetProjectId, dispatchedSig, false);
+        triggerFastPreviewRender(targetClipId, targetProjectId, dispatchedSig, dispatchedTpl, false);
       };
 
       debounceTimerRef.current = window.setTimeout(() => {
-        triggerFastPreviewRender(targetClipId, targetProjectId, dispatchedSig, false);
+        triggerFastPreviewRender(targetClipId, targetProjectId, dispatchedSig, dispatchedTpl, false);
       }, 900);
     }
 
@@ -1879,10 +1947,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
     <aside className="w-[420px] xl:w-[460px] shrink-0 h-full min-h-0 box-border overflow-hidden border-l border-[var(--border-subtle)] bg-[var(--bg-surface)] flex flex-col select-none">
       {/* Top Control Strip: Clean 2-Row Toolbar (Live Sync + Canvas Tools + Safe Zone & Canvas) */}
       <div className="px-3 py-2 border-b border-[var(--border-subtle)] space-y-1.5 shrink-0">
-        {/* Row 1: Live Sync Status & Canvas Tools */}
-        <div className="flex items-center justify-between gap-1 overflow-x-auto no-scrollbar">
+        {/* Row 1: Live Sync Status & Canvas Tools (flex-wrap prevents right-edge button clipping) */}
+        <div className="flex flex-wrap items-center gap-1.5">
           <div
-            className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-semibold border border-[var(--accent-primary)]/40 bg-[var(--accent-subtle)] text-[var(--accent-primary)] shrink-0 whitespace-nowrap"
+            className="flex items-center gap-1.5 px-2 py-1 rounded-lg text-xs font-semibold border border-[var(--accent-primary)]/40 bg-[var(--accent-subtle)] text-[var(--accent-primary)] whitespace-nowrap"
             title={
               isAutoRendering
                 ? 'Syncing full fast-preview MP4 in background'
@@ -1911,7 +1979,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             type="button"
             disabled={!clip}
             onClick={() => setIsEditFrameOpen((prev) => !prev)}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap disabled:opacity-45 ${
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-semibold border transition whitespace-nowrap disabled:opacity-45 ${
               isEditFrameOpen
                 ? 'bg-[var(--accent-subtle)] border-[var(--accent-primary)] text-[var(--accent-primary)]'
                 : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--accent-primary)]/40'
@@ -1926,7 +1994,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             type="button"
             disabled={!clip}
             onClick={() => setFreeformCaptionMode((prev) => !prev)}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-semibold border transition whitespace-nowrap select-none disabled:opacity-45 ${
               freeformCaptionMode
                 ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
                 : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -1941,7 +2009,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             type="button"
             disabled={!clip}
             onClick={() => setShowCanvasThirds((prev) => !prev)}
-            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap disabled:opacity-45 ${
+            className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-semibold border transition whitespace-nowrap disabled:opacity-45 ${
               showCanvasThirds
                 ? 'bg-[var(--accent-subtle)] text-[var(--accent-primary)] border-[var(--accent-primary)]'
                 : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -1960,7 +2028,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               onPointerUp={() => onCompareOriginalChange(false)}
               onPointerLeave={() => onCompareOriginalChange(false)}
               onPointerCancel={() => onCompareOriginalChange(false)}
-              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-semibold border transition shrink-0 whitespace-nowrap select-none disabled:opacity-45 ${
+              className={`flex items-center gap-1 px-2 py-1 rounded-lg text-xs font-semibold border transition whitespace-nowrap select-none disabled:opacity-45 ${
                 compareOriginal
                   ? 'bg-[var(--accent-primary)] text-[var(--accent-foreground)] border-[var(--accent-primary)]'
                   : 'bg-[var(--bg-card)] border-[var(--border-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]'
@@ -1974,7 +2042,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         </div>
 
         {/* Row 2: Safe Zone & Canvas */}
-        <div className="flex items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-1.5">
           <div className="flex items-center gap-1.5 min-w-0">
             <span className="text-[10px] font-semibold text-[var(--text-muted)] uppercase tracking-wider shrink-0">
               Safe Zone:
@@ -2327,7 +2395,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                 className="absolute inset-0 z-[6] w-full h-full object-cover pointer-events-none"
               />
             )}
-            {!compareOriginal && showExactFrame && exactFrameUrl && (!isPlaying || !videoFilterAlreadyBaked) && (
+            {!compareOriginal && !isPlaying && showExactFrame && exactFrameUrl && (
               <img
                 src={exactFrameUrl}
                 onClick={togglePlay}
@@ -2337,35 +2405,76 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
             )}
             {activeVideoSrc ? (
               <video
-                key={`${clip?.project_id ?? 0}-${clip?.id ?? 0}-${videoVersion}`}
+                key={`${clip?.project_id ?? 0}-${clip?.id ?? 0}`}
                 ref={videoRef}
                 src={activeVideoSrc}
                 muted={isMuted}
                 preload="auto"
-                onPlay={() => setIsPlaying(true)}
+                onPlay={() => {
+                  setIsPlaying(true);
+                  setShowExactFrame(false);
+                  setPlaybackError(null);
+                  if (previewAbortRef.current) {
+                    previewAbortRef.current.abort();
+                    previewAbortRef.current = null;
+                    setIsRenderingFrame(false);
+                  }
+                }}
                 onPause={() => setIsPlaying(false)}
                 onTimeUpdate={handleTimeUpdate}
-                onLoadedMetadata={() => {
+                onError={() => {
+                  setIsPlaying(false);
+                  const msg = 'Unable to decode preview video stream';
+                  setPlaybackError(msg);
+                  emitToast(msg, 'error');
+                }}
+                onLoadedData={() => {
                   const vid = videoRef.current;
                   if (!vid) return;
-                  if (Number.isFinite(vid.duration) && vid.duration > 0) {
-                    setDuration(vid.duration);
-                  }
+                  const vidDur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : duration;
+                  const boundedDur = isMasterStream
+                    ? Math.max(0.2, Number(clip?.end_time || vidDur) - clipStartOffset)
+                    : vidDur;
+                  setDuration(boundedDur);
+
                   const restore = pendingRestoreRef.current;
                   if (restore) {
-                    vid.currentTime = restore.relTime;
-                    setCurrentTime(restore.relTime);
-                    if (restore.shouldPlay) {
-                      vid.play().catch(() => { });
-                    }
+                    const targetAbs = Math.max(
+                      clipStartOffset,
+                      Math.min(clipStartOffset + Math.max(0.05, boundedDur - 0.05), clipStartOffset + restore.relTime)
+                    );
+                    vid.currentTime = targetAbs;
+                    setCurrentTime(targetAbs);
+                    relCurrentRef.current = Math.max(0, targetAbs - clipStartOffset);
+                    const shouldResume = restore.shouldPlay;
                     pendingRestoreRef.current = null;
-                  } else {
-                    vid.currentTime = 0;
-                    setCurrentTime(0);
-                    if (shouldAutoPlayRef.current) {
-                      shouldAutoPlayRef.current = false;
-                      vid.play().catch(() => { });
+                    if (shouldResume) {
+                      setShowExactFrame(false);
+                      vid.play()
+                        .then(() => setIsPlaying(true))
+                        .catch((err: any) => {
+                          setIsPlaying(false);
+                          const msg = err?.message || 'Unable to resume video playback';
+                          setPlaybackError(msg);
+                          emitToast(`Playback resume failed: ${msg}`, 'error');
+                        });
                     }
+                  } else if (shouldAutoPlayRef.current) {
+                    shouldAutoPlayRef.current = false;
+                    vid.currentTime = clipStartOffset;
+                    setCurrentTime(clipStartOffset);
+                    setShowExactFrame(false);
+                    vid.play()
+                      .then(() => setIsPlaying(true))
+                      .catch((err: any) => {
+                        setIsPlaying(false);
+                        const msg = err?.message || 'Autoplay blocked by browser';
+                        setPlaybackError(msg);
+                        emitToast(`Autoplay blocked: ${msg}`, 'error');
+                      });
+                  } else if (vid.currentTime < clipStartOffset || vid.currentTime > clipStartOffset + boundedDur) {
+                    vid.currentTime = clipStartOffset;
+                    setCurrentTime(clipStartOffset);
                   }
                 }}
                 onClick={togglePlay}
@@ -2375,7 +2484,10 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                     if (videoFilterAlreadyBaked || !clip) {
                       return tiltDeg !== 0 ? `rotate(${tiltDeg}deg) scale(${tiltScale.toFixed(3)})` : undefined;
                     }
-                    const zVal = Math.max(1, Number(clip.zoom || 1));
+                    const activeTpl = clip.framing_template || clip.frame_layout || 'auto_track';
+                    let zVal = Math.max(1, Number(clip.zoom || 1));
+                    if (activeTpl === 'dynamic_punch_crop') zVal = Math.max(1.28, zVal * 1.28);
+                    else if (activeTpl === 'portrait_pip_badge') zVal = Math.max(1.08, zVal);
                     const pVal = Number(clip.pan_x_offset || 0);
                     const totalScale = zVal * tiltScale;
                     const txPct = -pVal * 32;
@@ -2420,80 +2532,47 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
               </div>
             )}
 
-            {isPreparingClip && activeVideoSrc && !(showExactFrame && exactFrameUrl) && (
+            {isPreparingClip && activeVideoSrc && !isPlaying && !(showExactFrame && exactFrameUrl) && (
               <div className="absolute inset-0 z-30 bg-black/65 backdrop-blur-[2px] flex flex-col items-center justify-center p-4 text-center pointer-events-none">
                 <Loader2 className="w-7 h-7 mb-2 animate-spin text-[var(--accent-primary)]" />
                 <span className="text-xs font-semibold text-white">Preparing preview...</span>
               </div>
             )}
 
-            {/* Layer 1 (0ms) Geometric Framing Template Guides + Live Captions when playing / awaiting 100ms PNG */}
-            {!showExactFrame && !videoFilterAlreadyBaked && clip && (() => {
-              const lay = clip.framing_template || clip.frame_layout || 'auto_track';
-              const activeWords = (clip.transcript_words || []).filter(
-                (w) => !(w as any).muted && relCurrent >= (w.start - 0.15) && relCurrent <= (w.end + 0.15)
-              );
-              const capX = clip.caption_x ?? ((clip.position_x ?? 50) / 100);
-              const capY = clip.caption_y ?? ((clip.position_y ?? 78) / 100);
-              const capRot = clip.caption_rotation ?? 0;
-              const capMaxW = Math.max(0.45, Math.min(0.92, clip.caption_max_width ?? 0.82));
-              return (
-                <>
-                  {lay === 'webcam_gameplay_split' && (
-                    <div className="pointer-events-none absolute inset-x-0 top-[38%] border-t-2 border-white/35 z-10" />
-                  )}
-                  {lay === 'split_podcast' && (
-                    <div className="pointer-events-none absolute inset-x-0 top-1/2 border-t-2 border-white/35 z-10" />
-                  )}
-                  {lay === 'triple_gaming_hud' && (
-                    <>
-                      <div className="pointer-events-none absolute inset-x-0 top-[26%] border-t-2 border-white/35 z-10" />
-                      <div className="pointer-events-none absolute inset-x-0 top-[78%] border-t-2 border-white/35 z-10" />
-                    </>
-                  )}
-                  {lay === 'side_by_side_50_50' && (
-                    <div className="pointer-events-none absolute inset-y-0 left-1/2 border-l-2 border-white/35 z-10" />
-                  )}
-                  {(lay === 'gameplay_webcam_pip' || lay === 'portrait_pip_badge') && (
-                    <div
-                      style={{ borderColor: clip.pip_border_color || '#F59E0B' }}
-                      className={`pointer-events-none absolute z-10 border-2 rounded-lg bg-black/25 ${
-                        (clip.webcam_corner || 'top_right').includes('bottom') ? 'bottom-4' : 'top-4'
-                      } ${(clip.webcam_corner || 'top_right').includes('left') ? 'left-3' : 'right-3'} ${
-                        lay === 'portrait_pip_badge' ? 'w-[27%] aspect-[3/4]' : 'w-[30%] aspect-[4/3]'
-                      }`}
-                    />
-                  )}
-                  {clip.burn_captions && activeWords.length > 0 && (
-                    <div
-                      style={{
-                        left: `${capX * 100}%`,
-                        top: `${capY * 100}%`,
-                        maxWidth: `${capMaxW * 100}%`,
-                        transform: `translate(-50%, -50%) rotate(${capRot}deg)`,
-                        color: clip.base_color || '#FFFFFF',
-                        fontWeight: clip.bold !== false ? 800 : 500,
-                        textShadow: '0 2px 6px rgba(0,0,0,0.95)',
-                      }}
-                      className="pointer-events-none absolute z-15 text-center leading-tight px-2 py-0.5 text-[11px] uppercase tracking-wide"
-                    >
-                      {activeWords.slice(0, 4).map((w, wi) => {
-                        const isSpeaking = relCurrent >= w.start && relCurrent <= w.end;
-                        return (
-                          <span
-                            key={`${wi}-${w.start}`}
-                            style={{ color: isSpeaking ? (clip.active_color || '#C6F32F') : (clip.base_color || '#FFFFFF') }}
-                            className="mx-0.5 inline-block"
-                          >
-                            {w.word}
-                          </span>
-                        );
-                      })}
-                    </div>
-                  )}
-                </>
-              );
-            })()}
+            {/* Inline Playback Error Toast inside Player Stage */}
+            {playbackError && (
+              <div className="absolute top-3 inset-x-3 z-40 px-2.5 py-1.5 rounded-lg bg-red-950/95 border border-red-500/60 text-red-100 text-[10px] font-semibold flex items-center justify-between gap-2 shadow-lg">
+                <span className="truncate">{playbackError}</span>
+                <button
+                  type="button"
+                  onClick={() => setPlaybackError(null)}
+                  className="text-red-300 hover:text-white shrink-0"
+                  aria-label="Dismiss playback error"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            )}
+
+            {/* Instant Client-Side Template Compositing, Color Grade & Live Karaoke Captions during 60fps Playback */}
+            {clip && (
+              <LiveTemplateOverlay
+                clip={clip}
+                videoRef={videoRef}
+                isPlaying={isPlaying}
+                showExactFrame={showExactFrame}
+                hasExactFrameUrl={Boolean(exactFrameUrl)}
+                videoFilterAlreadyBaked={videoFilterAlreadyBaked}
+                bakedLayout={lastBakedLayoutByClipRef.current[clip.id] || clip.framing_template || clip.frame_layout || 'auto_track'}
+                relCurrent={relCurrent}
+                duration={clipBoundDuration}
+                compareOriginal={compareOriginal}
+                safeZoneGuide={safeZoneGuide}
+                videoCssFilter={videoCssFilter}
+                tiltDeg={tiltDeg}
+                tiltScale={tiltScale}
+              />
+            )}
 
             {/* Rule-of-Thirds Overlay Grid on Studio Canvas */}
             {showCanvasThirds && !isEditFrameOpen && (
@@ -2502,15 +2581,6 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
                 <div className="absolute inset-y-0 left-2/3 border-l border-white/30" />
                 <div className="absolute inset-x-0 top-1/3 border-t border-white/30" />
                 <div className="absolute inset-x-0 top-2/3 border-t border-white/30" />
-              </div>
-            )}
-
-            {/* Top Hook Banner Fallback ONLY when showing raw unrendered video (never duplicate backend PNG/MP4 banners) */}
-            {!showExactFrame && !isRenderedSource && clip && Boolean(clip.show_hook ?? clip.show_hook_banner) && Boolean((clip.hook_headline || '').trim()) && (
-              <div className="absolute top-6 left-3 right-3 z-20 pointer-events-none flex justify-center">
-                <div className="px-2.5 py-1 rounded-lg bg-black/80 border border-yellow-400 text-yellow-300 font-black text-[10px] uppercase tracking-wide shadow text-center leading-tight">
-                  ★ {clip.hook_headline} ★
-                </div>
               </div>
             )}
 
@@ -3074,8 +3144,8 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
       <div className="px-3 py-2 border-t border-[var(--border-subtle)] bg-[var(--bg-surface)] flex items-center gap-1.5 shrink-0">
         <button
           type="button"
-          onClick={togglePlay}
-          disabled={!activeVideoSrc}
+          onClick={() => void togglePlay()}
+          disabled={!activeVideoSrc && !(clip && onAutoRenderClip)}
           className="w-7 h-7 rounded-lg bg-[var(--bg-card)] hover:border-[var(--accent-primary)]/50 text-[var(--accent-primary)] border border-[var(--border-subtle)] flex items-center justify-center transition shrink-0 disabled:opacity-40"
           title={isPlaying ? 'Pause (Space)' : 'Play (Space)'}
         >
@@ -3107,7 +3177,7 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
         <input
           type="range"
           min={0}
-          max={Math.max(1, duration)}
+          max={Math.max(0.2, clipBoundDuration)}
           step={1 / previewFps}
           value={relCurrent}
           onChange={handleScrubberChange}
@@ -3117,9 +3187,9 @@ export const SmartphonePreview: React.FC<SmartphonePreviewProps> = ({
 
         <span
           className="text-[10px] font-mono text-[var(--text-secondary)] shrink-0 tabular-nums"
-          title={`Elapsed ${formatMMSS(relCurrent)} / ${formatMMSS(duration)} @ ${previewFps}fps`}
+          title={`Elapsed ${formatMMSS(relCurrent)} / ${formatMMSS(clipBoundDuration)} @ ${previewFps}fps`}
         >
-          {formatSMPTE(relCurrent, previewFps)} <span className="opacity-60">/ {formatSMPTE(duration, previewFps)}</span>
+          {formatSMPTE(relCurrent, previewFps)} <span className="opacity-60">/ {formatSMPTE(clipBoundDuration, previewFps)}</span>
         </span>
 
         <button

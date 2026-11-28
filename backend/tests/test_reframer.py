@@ -51,4 +51,4 @@ def test_build_multi_aspect_filter_layouts():
 
     # 5. fit_blur
     vf_blur = build_multi_aspect_filter("9:16", "fit_blur", 1920, 1080)
-    assert "gblur=sigma=28" in vf_blur
+    assert "gblur=sigma=24" in vf_blur

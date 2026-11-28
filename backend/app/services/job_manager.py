@@ -2238,26 +2238,35 @@ class JobManager:
                 for c_obj in saved_clips:
                     session.refresh(c_obj)
 
-                # Extract Top 6 Best Frames per clip & auto-snap unhealthy clip openers forward (<= +0.6s)
+                # Extract Top 6 Best Frames per clip concurrently (<4s across 8 clips) & auto-snap unhealthy clip openers forward
                 if project.source_path and os.path.exists(project.source_path):
                     try:
-                        from app.services.best_frame_engine import extract_best_frames
+                        from app.services.best_frame_engine import extract_best_frames_batch
 
                         bf_dir = Path(settings.STORAGE_DIR) / "assets" / "best_frames" / str(project_id)
                         bf_dir.mkdir(parents=True, exist_ok=True)
-                        for c_obj in saved_clips:
-                            if self.is_cancelled(project_id):
-                                return
-                            bf_res = extract_best_frames(
-                                video_path=project.source_path,
-                                video_analysis=vid_analysis,
-                                audio_analysis=aud_analysis,
-                                start_time=float(c_obj.start_time or 0.0),
-                                end_time=float(c_obj.end_time or 0.0),
-                                output_dir=str(bf_dir),
-                                clip_id=int(c_obj.id or 0),
-                                project_id=project_id,
-                            )
+                        bf_windows = [
+                            {
+                                "clip_id": int(c_obj.id or idx),
+                                "start_time": float(c_obj.start_time or 0.0),
+                                "end_time": float(c_obj.end_time or 0.0),
+                            }
+                            for idx, c_obj in enumerate(saved_clips)
+                        ]
+                        bf_map = extract_best_frames_batch(
+                            video_path=project.source_path,
+                            clip_windows=bf_windows,
+                            video_analysis=vid_analysis,
+                            audio_analysis=aud_analysis,
+                            output_dir=str(bf_dir),
+                            project_id=project_id,
+                            max_workers=4,
+                            is_cancelled_cb=lambda: self.is_cancelled(project_id),
+                        )
+                        if self.is_cancelled(project_id):
+                            return
+                        for idx, c_obj in enumerate(saved_clips):
+                            bf_res = bf_map.get(int(c_obj.id or idx), {})
                             sugg_start = bf_res.get("suggested_start_time")
                             if sugg_start is not None and (float(c_obj.end_time) - float(sugg_start)) >= 1.2:
                                 new_s = round(float(sugg_start), 2)
@@ -2326,6 +2335,7 @@ class JobManager:
                             "custom_width": c_row.custom_width,
                             "custom_height": c_row.custom_height,
                             "frame_layout": c_row.frame_layout,
+                            "framing_template": getattr(c_row, "framing_template", None) or c_row.frame_layout,
                             "webcam_corner": c_row.webcam_corner,
                             "webcam_split_ratio": c_row.webcam_split_ratio,
                             "source_webcam_region": c_row.get_source_webcam_region(),

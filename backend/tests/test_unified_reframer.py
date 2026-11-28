@@ -213,7 +213,8 @@ def test_all_five_templates_and_split_podcast_cutaway(
 
     # 2. fit_blur verification (darkened adaptive backdrop + crisp 1px edge highlight + full width uncropped center)
     vf_blur = build_multi_aspect_filter("9:16", "fit_blur", 1920, 1080)
-    assert "brightness=-0.18:saturation=1.15" in vf_blur
+    assert "brightness=-0.12:saturation=1.15" in vf_blur
+    assert "gblur=sigma=24" in vf_blur
     assert "drawbox=x=0:y=0:w=iw:h=1" in vf_blur
 
     # 3. gameplay_webcam_pip on zero-face gameplay still renders 32% rounded PiP of deterministic secondary_box

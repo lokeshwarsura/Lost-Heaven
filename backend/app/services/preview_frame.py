@@ -253,14 +253,31 @@ def render_exact_preview_frame(
             if clip_start_time > 0 and seek_ts < clip_start_time:
                 seek_ts = clip_start_time + seek_ts
 
-        # Multi-segment timeline edit plan (trim_dead_air, cold_open 2.8s climax, & punch_zoom 6 peaks)
-        from app.services.timeline_editor import (
-            build_timeline_edit_plan,
-            map_output_time_to_source_time,
-        )
+        # Compile Unified Render Graph Plan (Single Source of Truth with renderer.py)
+        from app.services.render_graph import compile_clip_render_plan
 
-        preview_words = [dict(w) for w in (transcript_words or []) if not w.get("muted", False)]
         co = caption_options or {}
+        cg = color_grading or {}
+        abs_segs: Optional[List[tuple[float, float]]] = None
+        if keep_segments:
+            parsed_abs = [
+                (max(0.0, float(seg[0])), float(seg[1]))
+                for seg in keep_segments
+                if isinstance(seg, (list, tuple)) and len(seg) >= 2 and float(seg[1]) > float(seg[0]) + 0.05
+            ]
+            if parsed_abs:
+                abs_segs = parsed_abs
+
+        total_vid_dur = float(meta.get("duration") or 0.0) if "meta" in locals() and isinstance(meta, dict) else 0.0
+        min_s = min(s for s, _ in abs_segs) if abs_segs else max(0.0, float(clip_start_time or 0.0))
+        inferred_span = (
+            max(e for _, e in abs_segs) - min_s
+            if abs_segs
+            else max(
+                float(clip_duration or 0.0),
+                max(0.5, total_vid_dur - min_s) if total_vid_dur > min_s + 0.5 else 4.0,
+            )
+        )
         eff_tighten = bool(co.get("tighten_pacing", False))
         eff_trim_dead_air = bool(
             trim_dead_air
@@ -280,34 +297,33 @@ def render_exact_preview_frame(
         eff_punch_intensity = float(punch_zoom_intensity if punch_zoom_intensity is not None else 1.16)
         eff_silence_thresh = float(co.get("silence_threshold", silence_threshold) or 0.55)
 
-        total_vid_dur = float(meta.get("duration") or 0.0) if "meta" in locals() and isinstance(meta, dict) else 0.0
-        abs_segs: Optional[List[tuple[float, float]]] = None
-        if keep_segments:
-            parsed_abs = [
-                (max(0.0, float(seg[0])), float(seg[1]))
-                for seg in keep_segments
-                if isinstance(seg, (list, tuple)) and len(seg) >= 2 and float(seg[1]) > float(seg[0]) + 0.05
-            ]
-            if parsed_abs:
-                abs_segs = parsed_abs
-
-        min_s = min(s for s, _ in abs_segs) if abs_segs else max(0.0, float(clip_start_time or 0.0))
-        inferred_span = (
-            max(e for _, e in abs_segs) - min_s
-            if abs_segs
-            else max(
-                float(clip_duration or 0.0),
-                max(0.5, total_vid_dur - min_s) if total_vid_dur > min_s + 0.5 else 4.0,
-            )
-        )
-        tl_plan = build_timeline_edit_plan(
-            video_path=video_path,
-            clip_start_time=min_s,
-            clip_duration=inferred_span,
-            words=preview_words,
-            cold_open=eff_cold_open,
+        render_plan = compile_clip_render_plan(
+            master_video_path=video_path,
+            clip_id=0,
+            project_id=int(project_id or 0),
+            start_time=min_s,
+            duration=inferred_span,
+            words=[dict(w) for w in (transcript_words or []) if not w.get("muted", False)],
+            aspect_ratio=aspect_ratio,
+            clip_size=export_resolution or clip_size,
+            custom_w=custom_width,
+            custom_h=custom_height,
+            frame_layout=frame_layout,
+            framing_template=framing_template,
+            webcam_corner=webcam_corner,
+            source_corner=source_corner,
+            webcam_split_ratio=webcam_split_ratio,
+            pip_border_color=pip_border_color,
+            zoom=zoom,
+            pan_x=pan_x if pan_x is not None else pan_x_offset,
+            camera_motion=camera_motion,
+            whip_pan_cuts=whip_pan_cuts,
+            safe_zone=safe_zone,
+            source_webcam_region=source_webcam_region,
+            frame_crop_override=None if (clear_framing_override or frame_crop_override is None) else framing_override,
+            use_cold_open=eff_cold_open,
             cold_open_quote=cold_open_quote,
-            trim_dead_air=eff_trim_dead_air,
+            auto_trim_dead_air=eff_trim_dead_air,
             tighten_pacing=eff_tighten,
             silence_threshold=eff_silence_thresh,
             clean_filler_words=bool(co.get("clean_filler_words", False)),
@@ -315,54 +331,43 @@ def render_exact_preview_frame(
             punch_zoom_intensity=eff_punch_intensity,
             explicit_keep_segments=abs_segs,
             crossfade_sec=float(merge_crossfade_sec or 0.03),
+            color_preset=cg.get("preset") or cg.get("color_preset") or "none",
+            show_hook=show_hook,
+            show_hook_banner=show_hook_banner,
+            hook_banner_enabled=hook_banner_enabled,
+            hook_text=hook_text,
+            hook_headline=hook_headline,
+            watermark_opacity=watermark_opacity,
+            burn_captions=burn_captions,
+            options={**co, **cg, "framing_override": framing_override},
         )
+        tl_plan = render_plan.timeline_plan
+        target_w, target_h = render_plan.out_w, render_plan.out_h
+        layout = render_plan.spec.framing_template
         eff_segs = tl_plan.kept_segments_abs
-        preview_words = [dict(w) for w in tl_plan.remapped_words]
+        preview_words = [dict(w) for w in render_plan.remapped_words]
         preview_cap_start = 0.0 if (eff_segs or tl_plan.cold_open_active or tl_plan.has_cuts) else clip_start_time
-        preview_cap_dur = tl_plan.effective_duration if (tl_plan.cold_open_active or tl_plan.has_cuts or abs_segs) else clip_duration
+        preview_cap_dur = render_plan.effective_duration if (tl_plan.cold_open_active or tl_plan.has_cuts or abs_segs) else clip_duration
 
-        if clip_duration and clip_duration > 0.2:
-            if clip_start_time <= 0.0 and clip_rel_ts_override is None:
-                clip_rel_ts = seek_ts
-            main_framing_segs = list(eff_segs) if eff_segs else [(min_s, min_s + float(clip_duration))]
-        else:
-            s_anchor = max(0.0, float(seek_ts) - 2.0)
-            e_anchor = float(seek_ts) + 3.0
-            if total_vid_dur > 0.2:
-                e_anchor = min(total_vid_dur, max(s_anchor + 1.0, e_anchor))
-            if not tl_plan.cold_open_active and not tl_plan.has_cuts and not abs_segs:
-                clip_rel_ts = max(0.0, float(seek_ts) - s_anchor)
-                main_framing_segs = [(s_anchor, e_anchor)]
-            else:
-                main_framing_segs = list(eff_segs)
-
-        cold_open_active = tl_plan.cold_open_active
-        cold_open_net_offset = tl_plan.teaser_duration
-        main_dur_eval = tl_plan.main_duration
+        seek_info = render_plan.build_preview_seek_and_filter(
+            timestamp=seek_ts if clip_rel_ts_override is None else None,
+            clip_rel_ts_override=clip_rel_ts_override,
+        )
+        seek_ts = seek_info["src_seek_ts"]
+        clip_rel_ts = seek_info["out_rel_t"]
+        main_framing_segs = list(eff_segs) if eff_segs else [(min_s, min_s + max(0.5, float(clip_duration or 4.0)))]
         framing_segs = list(main_framing_segs)
         framing_rel_t = clip_rel_ts
-
+        main_dur_eval = float(tl_plan.main_duration or inferred_span)
+        cold_open_active = tl_plan.cold_open_active
+        cold_open_net_offset = tl_plan.teaser_duration
         if cold_open_active and tl_plan.climax_window is not None:
             co_s, co_e = tl_plan.climax_window
-            if clip_rel_ts < cold_open_net_offset:
-                seek_ts = co_s + clip_rel_ts
+            if seek_info["is_climax_teaser"]:
                 framing_segs = [(co_s, co_e)]
                 framing_rel_t = clip_rel_ts
             else:
-                eff_main_t = max(0.0, clip_rel_ts - cold_open_net_offset)
-                seek_ts = map_output_time_to_source_time(
-                    eff_main_t,
-                    main_framing_segs,
-                    crossfade_sec=float(tl_plan.crossfade_sec),
-                )
-                framing_rel_t = eff_main_t
-        elif (tl_plan.has_cuts or (abs_segs and (len(abs_segs) > 1 or clip_rel_ts_override is not None))) and eff_segs:
-            seek_ts = map_output_time_to_source_time(
-                clip_rel_ts,
-                eff_segs,
-                crossfade_sec=float(tl_plan.crossfade_sec),
-            )
-            framing_rel_t = clip_rel_ts
+                framing_rel_t = max(0.0, clip_rel_ts - cold_open_net_offset)
 
         abs_video = os.path.abspath(video_path)
         v_sig = _video_stat_sig(abs_video)
@@ -601,8 +606,10 @@ def render_exact_preview_frame(
             safe_zone=eff_safe_zone,
         )
 
-        # 2. Punch Zoom FX + Footage Color Grading & FX BEFORE captions
+        # 2. Punch Zoom FX + Cold-Open Flash + Footage Color Grading & FX BEFORE captions
         filter_elements: List[str] = []
+        if seek_info.get("flash_alpha", 0.0) > 0.02:
+            filter_elements.append(f"drawbox=x=0:y=0:w=iw:h=ih:color=white@{seek_info['flash_alpha']:.2f}:t=fill")
         if eff_punch_zoom and tl_plan.punch_intervals:
             pz_now = compute_punch_zoom_factor_at_t(clip_rel_ts, tl_plan.punch_intervals)
             if pz_now > 1.005:
@@ -777,16 +784,7 @@ def render_exact_preview_frame(
         filter_complex = ";".join(fg_segments)
 
         co = caption_options or {}
-        eff_show_hook, eff_hook_text = resolve_hook_banner_state(
-            show_hook=show_hook if show_hook is not None else co.get("show_hook"),
-            show_hook_banner=show_hook_banner if show_hook_banner is not None else co.get("show_hook_banner"),
-            hook_banner_enabled=hook_banner_enabled if hook_banner_enabled is not None else co.get("hook_banner_enabled"),
-            enable_hook_banner=co.get("enable_hook_banner"),
-            top_hook_banner=co.get("top_hook_banner"),
-            hook_text=hook_text if hook_text is not None else co.get("hook_text"),
-            hook_headline=hook_headline if hook_headline is not None else co.get("hook_headline"),
-            options=co,
-        )
+        eff_show_hook, eff_hook_text = render_plan.show_hook, render_plan.hook_text
         eff_spectrum_enabled = bool(spectrum_enabled or co.get("spectrum_enabled", False))
         eff_spectrum_pos = str(co.get("spectrum_position", spectrum_position) or spectrum_position or "bottom")
         eff_spectrum_color = str(co.get("spectrum_color", spectrum_color) or spectrum_color or "#C6F32F")
@@ -1045,6 +1043,7 @@ def render_exact_preview_frame(
             "render_time_ms": latency_ms,
             "timestamp": timestamp,
             "timeline_fx_summary": tl_plan.timeline_fx_summary,
+            "render_plan_hash": render_plan.render_plan_hash,
         }
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)

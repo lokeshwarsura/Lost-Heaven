@@ -145,6 +145,9 @@ def compute_render_signature(
     )
     clean_opts["framing_template"] = str(raw_tpl)
     clean_opts["frame_layout"] = str(raw_tpl)
+    plan_hash = raw.get("render_plan_hash") or opts_dict.get("render_plan_hash")
+    if plan_hash:
+        clean_opts["render_plan_hash"] = str(plan_hash)
 
     s_t = round(float(start_time or 0.0), 3)
     e_t = round(s_t + max(0.0, float(duration or 0.0)), 3)

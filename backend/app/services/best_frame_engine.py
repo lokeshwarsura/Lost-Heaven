@@ -394,3 +394,68 @@ def extract_best_frames(
         "rejected_counts": rejected,
         "frames": final_frames,
     }
+
+
+def extract_best_frames_batch(
+    video_path: str,
+    clip_windows: List[Dict[str, Any]],
+    video_analysis: Optional[Dict[str, Any]],
+    audio_analysis: Optional[Dict[str, Any]],
+    output_dir: str,
+    *,
+    project_id: int = 0,
+    min_gap: float = 1.2,
+    max_frames: int = 6,
+    max_workers: int = 4,
+    is_cancelled_cb: Optional[Any] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Stage-5 concurrent Best Frames extractor across N clips (e.g. 8 clips x 6 frames = 48 stills < 4s).
+    Pre-warms stat-cached ffprobe once, then extracts per-clip stills concurrently via ThreadPoolExecutor.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.services.proxy import probe_video
+
+    if not clip_windows:
+        return {}
+
+    os.makedirs(output_dir, exist_ok=True)
+    if video_path and os.path.exists(video_path):
+        try:
+            probe_video(video_path)
+        except Exception:
+            pass
+
+    results: Dict[int, Dict[str, Any]] = {}
+    workers = max(1, min(int(max_workers or 4), len(clip_windows)))
+
+    def _run_one(item: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        cid = int(item.get("clip_id") or 0)
+        if is_cancelled_cb and is_cancelled_cb():
+            return cid, {"clip_id": cid, "project_id": int(project_id), "frames": [], "rejected_counts": {}}
+        res = extract_best_frames(
+            video_path=video_path,
+            video_analysis=video_analysis,
+            audio_analysis=audio_analysis,
+            start_time=float(item.get("start_time") or 0.0),
+            end_time=float(item.get("end_time") or 0.0),
+            output_dir=output_dir,
+            clip_id=cid,
+            project_id=int(project_id),
+            min_gap=min_gap,
+            max_frames=max_frames,
+        )
+        return cid, res
+
+    if workers == 1:
+        for cw in clip_windows:
+            cid, res = _run_one(cw)
+            results[cid] = res
+        return results
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_run_one, cw) for cw in clip_windows]
+        for fut in as_completed(futs):
+            cid, res = fut.result()
+            results[cid] = res
+    return results

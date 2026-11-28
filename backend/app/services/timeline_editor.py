@@ -802,9 +802,30 @@ def build_timeline_edit_plan(
       3. `punch_zoom` (up to 6 top vocal peaks >= 3.2s apart shifted cleanly onto the final output timeline)
     """
     from app.services.face_tracker import detect_punch_zoom_peaks
+    from app.services.proxy import probe_video
 
     anchor_s = max(0.0, float(clip_start_time or 0.0))
     span_d = max(0.5, float(clip_duration or 1.0))
+
+    media_ceiling: Optional[float] = None
+    if video_path and os.path.exists(video_path):
+        try:
+            meta = probe_video(video_path)
+            cand_durs = [
+                float(meta.get(k) or 0.0)
+                for k in ("duration", "video_duration")
+                if float(meta.get(k) or 0.0) > 0.25
+            ]
+            if meta.get("has_audio") and float(meta.get("audio_duration") or 0.0) > 0.25:
+                cand_durs.append(float(meta["audio_duration"]))
+            if cand_durs:
+                media_ceiling = max(0.2, round(min(cand_durs) - 0.05, 3))
+                if anchor_s + span_d > media_ceiling:
+                    anchor_s = round(min(anchor_s, max(0.0, media_ceiling - 0.2)), 3)
+                    span_d = round(max(0.2, min(span_d, media_ceiling - anchor_s)), 3)
+        except Exception:
+            media_ceiling = None
+
     src_words = [dict(w) for w in (words or []) if isinstance(w, dict) and not w.get("muted", False)]
 
     eff_cf = (
@@ -867,19 +888,35 @@ def build_timeline_edit_plan(
         auto_trim_dead_air=trim_dead_air,
         video_path=video_path,
     )
-    kept_rel: List[Tuple[float, float]] = list(tl_cuts["kept_segments"])
-    kept_abs: List[Tuple[float, float]] = list(
+    kept_rel: List[Tuple[float, float]] = sanitize_timeline_intervals(
+        list(tl_cuts.get("kept_segments") or []),
+        min_bound=0.0,
+        max_bound=span_d,
+        min_slice_sec=0.12,
+        fallback_interval=(0.0, round(max(0.2, span_d), 3)),
+    )
+    raw_abs = list(
         tl_cuts.get("kept_segments_abs")
         or [(round(anchor_s + s, 3), round(anchor_s + e, 3)) for s, e in kept_rel]
     )
-    has_cuts = bool(tl_cuts.get("has_cuts", False))
-    main_dur = float(tl_cuts.get("effective_duration") or span_d)
+    abs_ceiling = media_ceiling if media_ceiling is not None else round(anchor_s + span_d, 3)
+    kept_abs: List[Tuple[float, float]] = sanitize_timeline_intervals(
+        raw_abs,
+        min_bound=anchor_s,
+        max_bound=abs_ceiling,
+        min_slice_sec=0.12,
+        fallback_interval=(round(anchor_s, 3), round(max(anchor_s + 0.2, min(abs_ceiling, anchor_s + span_d)), 3)),
+    )
+    kept_rel = [(round(max(0.0, s - anchor_s), 3), round(max(0.12, e - anchor_s), 3)) for s, e in kept_abs]
+    has_cuts = len(kept_rel) > 1 or bool(tl_cuts.get("has_cuts", False))
     eff_cf_final = float(tl_cuts.get("crossfade_sec", eff_cf))
+    raw_seg_sum = sum(max(0.0, e - s) for s, e in kept_abs)
+    main_dur = max(0.2, round(raw_seg_sum - max(0, len(kept_abs) - 1) * min(eff_cf_final, 0.08), 3))
     cuts_count = int(tl_cuts.get("dead_air_cuts_count") or 0)
     saved_sec = float(tl_cuts.get("dead_air_saved_sec") or 0.0)
     post_words = [dict(w) for w in (tl_cuts.get("remapped_words") or [])]
 
-    # Cold-Open Climax Teaser (`>= 8.0s` clips): 2.8s climax prepended at t=0.0s with 0.2s white flash
+    # Cold-Open Climax Teaser (`>= 8.0s` clips): teaser prepended at t=0.0s with brief white flash
     co_active = False
     co_window: Optional[Tuple[float, float]] = None
     co_rel_start = 0.0
@@ -894,6 +931,14 @@ def build_timeline_edit_plan(
             cold_open_quote=cold_open_quote,
             window_sec=COLD_OPEN_WINDOW_SEC,
         )
+        if co_window is not None:
+            co_s, co_e = co_window
+            co_s = max(anchor_s, float(co_s))
+            co_e = min(abs_ceiling, anchor_s + span_d, float(co_e))
+            if co_e - co_s >= 0.5:
+                co_window = (round(co_s, 3), round(co_e, 3))
+            else:
+                co_window = None
         if co_window is not None:
             co_s, co_e = co_window
             teaser_dur = max(0.8, round(co_e - co_s, 3))
@@ -1025,6 +1070,51 @@ def build_timeline_edit_plan(
     return plan
 
 
+def sanitize_timeline_intervals(
+    intervals: List[Tuple[float, float]],
+    *,
+    min_bound: float = 0.0,
+    max_bound: Optional[float] = None,
+    min_slice_sec: float = 0.12,
+    fallback_interval: Optional[Tuple[float, float]] = None,
+) -> List[Tuple[float, float]]:
+    """
+    Clamp timeline intervals inside valid media bounds, drop degenerate slices (< 0.12s),
+    sort and merge overlapping windows, and return a non-empty fallback when nothing survives.
+    """
+    cleaned: List[Tuple[float, float]] = []
+    lo = max(0.0, float(min_bound))
+    hi = float(max_bound) if max_bound is not None else None
+    for seg in intervals or []:
+        if not seg or len(seg) < 2:
+            continue
+        s = max(lo, float(seg[0]))
+        e = float(seg[1])
+        if hi is not None:
+            e = min(hi, e)
+        if e - s >= min_slice_sec:
+            cleaned.append((round(s, 3), round(e, 3)))
+    cleaned.sort(key=lambda pair: pair[0])
+    merged: List[Tuple[float, float]] = []
+    for s, e in cleaned:
+        if merged and s <= merged[-1][1] + 0.02:
+            merged[-1] = (merged[-1][0], round(max(merged[-1][1], e), 3))
+        else:
+            merged.append((s, e))
+    if not merged and fallback_interval is not None:
+        fs = max(lo, float(fallback_interval[0]))
+        fe = float(fallback_interval[1])
+        if hi is not None:
+            fe = min(hi, fe)
+        if fe <= fs + 0.05:
+            fe = fs + max(0.2, min_slice_sec)
+            if hi is not None and hi > lo + 0.05:
+                fe = min(hi, fe)
+                fs = max(lo, fe - 0.5)
+        merged = [(round(fs, 3), round(fe, 3))]
+    return merged
+
+
 def build_timeline_trim_concat_filter(
     kept_segments: List[Tuple[float, float]],
     crossfade_sec: float = 0.03,
@@ -1037,6 +1127,17 @@ def build_timeline_trim_concat_filter(
     When `multi_input=True`, expects each segment `i` as separate FFmpeg input `i` already seeked
     with `-ss s_i -t dur_i`. Returns (filter_fragment, video_out_label, audio_out_label_or_None).
     """
+    raw_pairs = [(float(s), float(e)) for s, e in (kept_segments or [])]
+    if multi_input:
+        kept_segments = [(round(max(0.0, s), 3), round(max(s + 0.12, e), 3)) for s, e in raw_pairs if e > s + 0.08] or [(0.0, 0.5)]
+    else:
+        kept_segments = sanitize_timeline_intervals(
+            raw_pairs,
+            min_bound=0.0,
+            min_slice_sec=0.10,
+            fallback_interval=(0.0, 0.5),
+        )
+
     if len(kept_segments) <= 1:
         ks, ke = kept_segments[0]
         if multi_input:
@@ -1072,7 +1173,7 @@ def build_timeline_trim_concat_filter(
         running_dur = kept_segments[0][1] - kept_segments[0][0]
         for i in range(1, len(kept_segments)):
             seg_dur = kept_segments[i][1] - kept_segments[i][0]
-            step_cf = min(cf, running_dur * 0.25, seg_dur * 0.25)
+            step_cf = min(cf, running_dur * 0.20, seg_dur * 0.20)
             offset = max(0.02, running_dur - step_cf)
             next_v = "v_tl" if i == len(kept_segments) - 1 else f"vx{i}"
             parts.append(f"[{curr_v}][tv{i}]xfade=transition=fade:duration={step_cf:.3f}:offset={offset:.3f}[{next_v}]")

@@ -231,3 +231,74 @@ def test_all_10_templates_exact_ratios_and_visually_distinct(tmp_path: Path):
         np.mean(np.abs(rendered["gameplay_webcam_pip"][:int(h_out * 0.45), int(w_out * 0.55):] - rendered["portrait_pip_badge"][:int(h_out * 0.45), int(w_out * 0.55):]))
     )
     assert pip_quad_diff > 18.0, f"4:3 PiP vs 3:4 Portrait PiP top-right region too similar ({pip_quad_diff:.2f})"
+
+
+def test_fit_blur_visible_backdrop_dark_scene_parity(tmp_path: Path):
+    """fit_blur must produce unmistakably visible ambient blurred top/bottom backdrops even on dark scenes."""
+    from app.services.renderer import render_clip_ultra
+
+    ffmpeg_bin = get_ffmpeg_cmd()
+    dark_src = tmp_path / "dark_scene.mp4"
+    # Dark blue/indigo scene with warm center highlight box (RGB ~ (22, 30, 45) + highlight)
+    vf = (
+        "drawbox=x=420:y=120:w=440:h=480:color=0x3B82F6@0.75:t=fill,"
+        "drawbox=x=520:y=220:w=240:h=240:color=0xF59E0B@0.70:t=fill"
+    )
+    res = subprocess.run(
+        [
+            ffmpeg_bin, "-y",
+            "-f", "lavfi", "-i", "color=c=0x1C2438:s=1280x720:r=15:d=1.5",
+            "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000:duration=1.5",
+            "-t", "1.5", "-vf", vf,
+            "-af", "volume=0.05",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-shortest", str(dark_src),
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert res.returncode == 0, f"Dark synthetic video failed: {res.stderr[-300:]}"
+
+    prev = render_exact_preview_frame(
+        video_path=str(dark_src),
+        timestamp=0.6,
+        clip_start_time=0.0,
+        clip_duration=1.5,
+        aspect_ratio="9:16",
+        frame_layout="fit_blur",
+        framing_template="fit_blur",
+        burn_captions=False,
+        clip_size="480p",
+    )
+    prev_rgb = _load_preview_rgb(prev)
+    h, _ = prev_rgb.shape[:2]
+    top_band = prev_rgb[: int(h * 0.28), :, :]
+    bot_band = prev_rgb[int(h * 0.72) :, :, :]
+    assert float(top_band.mean()) > 16.0, f"Preview top fit_blur backdrop crushed dark: mean={top_band.mean():.2f}"
+    assert float(bot_band.mean()) > 16.0, f"Preview bottom fit_blur backdrop crushed dark: mean={bot_band.mean():.2f}"
+
+    out_mp4 = render_clip_ultra(
+        master_video_path=str(dark_src),
+        clip_id=971,
+        start_time=0.0,
+        duration=1.5,
+        words=[],
+        aspect_ratio="9:16",
+        frame_layout="fit_blur",
+        framing_template="fit_blur",
+        burn_captions=False,
+        show_hook_banner=False,
+        clip_size="480p",
+        hardware_mode="cpu",
+        quality_mode="fast_preview",
+        output_path_override=str(tmp_path / "dark_fit_blur_out.mp4"),
+    )
+    cap = cv2.VideoCapture(out_mp4)
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, 500.0)
+        ok, frame_bgr = cap.read()
+        assert ok and frame_bgr is not None
+        mh = frame_bgr.shape[0]
+        assert float(frame_bgr[: int(mh * 0.28)].mean()) > 16.0
+        assert float(frame_bgr[int(mh * 0.72) :].mean()) > 16.0
+    finally:
+        cap.release()

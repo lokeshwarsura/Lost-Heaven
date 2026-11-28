@@ -73,13 +73,17 @@ def probe_video(video_path: str) -> Dict[str, Any]:
         logger.error(f"Error probing video {video_path}: {e}")
         return {
             "duration": 0.0,
+            "video_duration": 0.0,
+            "audio_duration": 0.0,
             "width": 1920,
             "height": 1080,
             "fps": 30.0,
-            "has_audio": True
+            "has_audio": True,
         }
 
-    duration = float(data.get("format", {}).get("duration", 0.0))
+    duration = float(data.get("format", {}).get("duration", 0.0) or 0.0)
+    video_duration = 0.0
+    audio_duration = 0.0
     width, height, fps = 1920, 1080, 30.0
     has_audio = False
 
@@ -96,17 +100,38 @@ def probe_video(video_path: str) -> Dict[str, Any]:
                     fps = float(fps_str)
             except Exception:
                 fps = 30.0
-            if duration == 0.0:
-                duration = float(stream.get("duration", 0.0))
+            try:
+                sd = float(stream.get("duration") or 0.0)
+                if sd > 0.0:
+                    video_duration = sd
+            except Exception:
+                pass
+            if duration == 0.0 and video_duration > 0.0:
+                duration = video_duration
         elif stream.get("codec_type") == "audio":
             has_audio = True
+            try:
+                ad = float(stream.get("duration") or 0.0)
+                if ad > 0.0:
+                    audio_duration = ad
+            except Exception:
+                pass
+
+    if video_duration <= 0.0:
+        video_duration = duration
+    if has_audio and audio_duration <= 0.0:
+        audio_duration = duration
+    if duration <= 0.0:
+        duration = video_duration or audio_duration
 
     res = {
         "duration": duration,
+        "video_duration": video_duration,
+        "audio_duration": audio_duration,
         "width": width,
         "height": height,
         "fps": fps,
-        "has_audio": has_audio
+        "has_audio": has_audio,
     }
     if stat_key is not None and width > 0 and height > 0:
         with _PROBE_CACHE_LOCK:
